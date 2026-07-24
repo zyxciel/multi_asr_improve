@@ -20,7 +20,7 @@ Diarization `(start, end, speaker_id)` stays frozen.
 
 | Topic | Choice |
 | ----- | ------ |
-| Extra ASR | Qwen3-ASR-1.7B + FireRedASR (+ MOSS provisional when present) |
+| Extra ASR | [Qwen3-ASR](https://github.com/QwenLM/Qwen3-ASR) + [FireRedASR2S](https://github.com/FireRedTeam/FireRedASR2S) (**no VAD**; **LID+Punc on**) (+ MOSS provisional when present) |
 | Overlap policy | **Dynamic**: `overlap_ratio > 0.30` → **MOSS-exclusive**; `≤ 0.30` → **MOSS-primary** (base=MOSS; others advisory) |
 | Overlap ratio | `union_overlap_duration(other speakers ∩ unit) / unit_duration` |
 | Concat audio | Timeline crop `[unit_start, unit_end]` **through** overlap; do not excise foreign speech / fill silence |
@@ -31,7 +31,7 @@ Diarization `(start, end, speaker_id)` stays frozen.
 | Short skip | After concat, duration **&lt; 0.35 s** → no ASR; keep turn as timeline placeholder for Pass B |
 | Invalid TS | Discard `end-start &lt; 0.01s`, NaN/Inf; log `skipped_invalid_ts`; no repair |
 | Pass order | Pass A → `mode_c_draft.json` → Pass B → `mode_c_asr_final.json` |
-| Judge | Qwen3.6-27B-class @ **T=0.1**; DeepSeek fallback; invalid JSON retry ≤2 then best hyp (MOSS if overlap) |
+| Judge | [Qwen3.6-27B](https://huggingface.co/Qwen/Qwen3.6-27B) @ **T=0.1**; DeepSeek fallback; invalid JSON retry ≤2 then best hyp (MOSS if overlap) |
 | Eval B0 | **MOSS-from-fusion** (primary). Optional side baseline: single Qwen3-ASR |
 | Ablation | B0 → +concat multi-ASR → +dynamic overlap → +Pass A → +Pass B |
 | max_asr_seconds | Default **30**; config knob **60** pending model-card confirmation |
@@ -187,4 +187,15 @@ Full expanded template (hypotheses/hotwords/neighbors placeholders) lives in the
 
 ## 11. Open knob
 
-- Confirm `max_asr_seconds` default 30 vs 60 after Qwen3-ASR / FireRed model limits — implementation may start with 30.
+- Confirm `max_asr_seconds` default 30 vs 60 after Qwen3-ASR / FireRedASR2S model limits — implementation may start with 30.
+
+## 12. Upstream references
+
+| Role | URL |
+| ---- | --- |
+| Stage-1 fusion | https://github.com/zyxciel/diarizen-moss-fusion |
+| Qwen3-ASR | https://github.com/QwenLM/Qwen3-ASR |
+| FireRedASR2S | https://github.com/FireRedTeam/FireRedASR2S (**ASR+LID+Punc; VAD off**) |
+| Judge LLM | https://huggingface.co/Qwen/Qwen3.6-27B |
+| Dialect eval (future) | https://github.com/ASLP-lab/WenetSpeech-Chuan |
+
