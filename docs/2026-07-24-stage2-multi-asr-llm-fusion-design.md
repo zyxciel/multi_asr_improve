@@ -1,7 +1,7 @@
 # Stage-2 Multi-ASR + LLM Fusion (Architecture)
 
 **Date:** 2026-07-24  
-**Status:** Draft for teammate discussion  
+**Status:** Final for implementation (pending optional 30s/60s ASR knob check)  
 **Scope:** Stage-2 only — consume `diarizen_moss_fusion` (Mode C) outputs; do not re-run Stage-1 diarization fusion.
 
 ## Overview
@@ -9,27 +9,32 @@
 Improve ASR accuracy on top of fused diarization turns by:
 
 1. Validating timestamps and building same-speaker ASR units (concat / split)
-2. Running Qwen3-ASR-1.7B + FireRedASR (plus MOSS provisional text when present)
-3. Skipping the text LLM when hypotheses agree (CER = 0)
-4. Otherwise running Pass A LLM select + Tier A–C repair (±10 min context)
-5. Always running Pass B global consistency
+2. Dynamic overlap gate → Qwen3-ASR + FireRedASR and/or MOSS-only
+3. Skipping Pass A when clean hypotheses agree (CER = 0)
+4. Pass A LLM select + Tier A–C repair (span-local char-count)
+5. Required Pass B global consistency → `asr_status=final`
 
-Diarization `(start, end, speaker_id)` stays frozen. Stage-2 may update `text` and set `asr_status=final`.
+Diarization `(start, end, speaker_id)` stays frozen.
 
 ## Locked decisions
 
 | Topic | Choice |
 | ----- | ------ |
-| Extra ASR | Qwen3-ASR-1.7B + FireRedASR (plus MOSS provisional when present) |
-| Overlap policy | **MOSS-primary**: other ASRs may run but cannot beat MOSS by majority alone; LLM base defaults to MOSS |
-| Concat audio | Same-speaker diarization concat **even if overlap exists** in the timeline crop; sentence completeness preferred over clean single-speaker audio |
-| LLM role | Select + tiered repair capped at **Tier C** (no hotword-only Tier D gate) |
-| Repair license | A select/merge → B exact pinyin → **C fuzzy pinyin + anchor** (hotword *or* ±10 min draft / meeting recurrence). Hotwords help but are **not** required |
-| Context | Pass A: ±10 min neighbor **draft**; on overlap units, mark `OVERLAP` and prefer MOSS; target unit gets full hyps + hotwords |
-| Agreement gate | Clean speech: all hyps CER=0 → skip LLM. **Overlap:** ignore non-MOSS-only consensus; do not skip in a way that drops MOSS |
-| Short skip | Duration **&lt; 0.35 s** → no ASR |
-| Pass B | **Required** global constrained consistency; MOSS-aware on overlap turns |
-| Judge LLM | Qwen3.6-27B-class (DeepSeek swap-in); same contract |
+| Extra ASR | Qwen3-ASR-1.7B + FireRedASR (+ MOSS provisional when present) |
+| Overlap policy | **Dynamic**: `overlap_ratio > 0.30` → **MOSS-exclusive**; `≤ 0.30` → **MOSS-primary** (base=MOSS; others advisory) |
+| Overlap ratio | `union_overlap_duration(other speakers ∩ unit) / unit_duration` |
+| Concat audio | Timeline crop `[unit_start, unit_end]` **through** overlap; do not excise foreign speech / fill silence |
+| LLM role | Tier A/B/C only; **no context-only Tier C**; **no Tier D** |
+| Char-count | **O1b span-local**: each edit `abs(len(span_out)-len(span_asr)) ≤ 1`; no abbreviation expansion (`模型`↛`大语言模型`) |
+| Context window | Prefer ±10 min; **cap** nearest **20 turns** / **4096 tokens** |
+| Agreement gate | Non-overlap CER=0 → skip Pass A; never let non-MOSS majority beat MOSS on overlap |
+| Short skip | After concat, duration **&lt; 0.35 s** → no ASR; keep turn as timeline placeholder for Pass B |
+| Invalid TS | Discard `end-start &lt; 0.01s`, NaN/Inf; log `skipped_invalid_ts`; no repair |
+| Pass order | Pass A → `mode_c_draft.json` → Pass B → `mode_c_asr_final.json` |
+| Judge | Qwen3.6-27B-class @ **T=0.1**; DeepSeek fallback; invalid JSON retry ≤2 then best hyp (MOSS if overlap) |
+| Eval B0 | **MOSS-from-fusion** (primary). Optional side baseline: single Qwen3-ASR |
+| Ablation | B0 → +concat multi-ASR → +dynamic overlap → +Pass A → +Pass B |
+| max_asr_seconds | Default **30**; config knob **60** pending model-card confirmation |
 
 ## Pipeline
 
@@ -37,181 +42,149 @@ Diarization `(start, end, speaker_id)` stays frozen. Stage-2 may update `text` a
 flowchart TD
   inJson[mode_c.json_plus_audio] --> validate[Validate_timestamps]
   validate --> units[Build_ASR_units_concat_or_split]
-  units --> asr[Run_Qwen3ASR_and_FireRed]
-  asr --> hyps[Hypotheses_plus_MOSS_map_to_units]
-  hyps --> agree{All_hyps_CER_eq_0}
-  agree -->|yes| draft[Accept_consensus_text]
-  agree -->|no| passA[PassA_LLM_select_plus_pronunciation_repair]
+  units --> ovGate{overlap_ratio_gt_0.3}
+  ovGate -->|yes| mossOnly[MOSS_exclusive_hyps]
+  ovGate -->|no| asr[Run_Qwen3ASR_and_FireRed_plus_MOSS]
+  mossOnly --> agree{Agree_or_need_PassA}
+  asr --> agree
+  agree -->|CER0_nonOverlap| draft[mode_c_draft]
+  agree -->|else| passA[PassA_LLM_TierABC_spanLocal]
   passA --> draft
-  draft --> passB[PassB_global_consistency]
+  draft --> passB[PassB_global_TierBC]
   passB --> out[mode_c_asr_final.json]
 ```
 
 ## 1. Input validation
 
-Before any audio work, validate each turn:
-
-- `start` / `end` present, numeric, finite
-- `end > start`
-- Skip illegal turns (record in meta: `skipped_invalid_ts`); do not feed ASR
-
-Optional: clamp tiny float noise; do not “repair” inverted times.
+- Finite numeric `start`/`end` with `end > start`
+- Discard `end - start < 0.01s` or NaN/Inf → `skipped_invalid_ts`
+- Do not repair inverted/missing times
 
 ## 2. ASR unit construction (concat / split)
 
-ASR does **not** always run on raw fused turns. Build **ASR units** as follows.
-
 ### 2.1 Concatenation (same speaker only)
 
-Walk turns in time order. Merge into one ASR unit only when **all** hold:
+Merge when all hold:
 
 - Same `speaker_id`
-- **Adjacent** in the validated timeline (no other valid turn between them)
-- Inter-turn gap `next.start - prev.end <= 5.0 s` (if gap **> 5 s**, start a new unit)
-- Merged media duration: use span `unit_end - unit_start` (includes intra-unit silence) **<= 30.0 s**
+- Adjacent in validated timeline
+- Gap `next.start - prev.end <= 5.0 s`
+- Span `unit_end - unit_start <= max_asr_seconds` (default 30)
 
-If adding the next turn would exceed 30 s, close the current unit and start a new one with that turn.
+Different speakers never concatenate. Audio = timeline crop (overlap inside span accepted).
 
-**Different speakers never concatenate.**
-
-Audio for a multi-turn unit: crop `[unit_start, unit_end]` from prepared wav (gaps remain as silence). **Overlap from other speakers inside that span is accepted** — diarization-based concat prioritizes sentence completeness over isolating a single voice. Mark the unit `contains_overlap=true` if any other speaker intersects the unit span; downstream uses MOSS-primary rules.
+```text
+overlap_ratio = measure(union of intersections with all other speakers) / (unit_end - unit_start)
+contains_overlap = overlap_ratio > 0
+heavy_overlap = overlap_ratio > 0.30
+```
 
 ### 2.2 Split long segments
 
-If a **single** turn (or a unit that cannot be split by turn boundaries) has duration **> 30 s**:
+If duration `> max_asr_seconds`: min **RMS** energy (25 ms window, ~10 ms hop), forbidden edge zone = **10%** of segment; recurse.
 
-- Split at the **minimum-energy** point in a search region that yields two pieces each **<= 30 s** (recurse if still too long)
-- Prefer splits not too close to edges (e.g. avoid outer 10% unless necessary)
-- Child pieces become separate ASR units; retain parent turn id(s) for map-back
+### 2.3 Short skip
 
-### 2.3 Duration gate vs concat
-
-- Units (or leftover fragments) with duration **&lt; 0.35 s** → no ASR, no LLM; leave original text/`asr_status`
-- Prefer concatenating short same-speaker turns **before** applying the 0.35 s skip when merge would make a unit ≥ 0.35 s (so brief words in a burst still get ASR)
+Concat first; if still `< 0.35s` → no ASR/LLM content update; retain in timeline for Pass A neighbors / Pass B.
 
 ## 3. Multi-ASR hypotheses
 
-For each eligible ASR unit:
+- `heavy_overlap`: MOSS-only
+- else: Qwen3-ASR + FireRed + MOSS (if any)
+- Multi-turn MOSS: join with space or `。`; set `moss_merged=true`; map-back via timestamps or lightweight aligner
+- Cache ASR under work dir
 
-- Run **Qwen3-ASR-1.7B** and **FireRedASR** on the unit crop
-- Attach **MOSS** text when the unit maps to turns that already have provisional text (if multiple MOSS turns were concatenated: concatenate their texts in order with a separator, or prefer timestamped MOSS fragments if available)
-- Store raw hyps in `asr_hypotheses.json`
+### Map back to original turns
 
-### Map ASR text back to original turns
-
-Priority:
-
-1. If an ASR model returns **word/segment timestamps**, assign tokens to member turns by time overlap
-2. Else keep hypothesis at **unit** level for agreement/LLM; after final text is chosen, split to member turns by token timestamps from a lightweight aligner, or by relative turn durations only as last resort (document as weaker path)
-
-Final JSON still emits **one row per original fused turn** (boundaries/speakers unchanged).
+Prefer ASR word/segment timestamps; else unit-level then aligner / relative duration fallback. Output one row per original fused turn.
 
 ## 4. Agreement gate
 
-- Normalize for compare only: whitespace; light full/half-width punct unify
-- For Chinese, “WER = 0” means **character-level CER = 0** among all non-empty hyps for that unit
-- **Non-overlap:** if all hyps CER=0 → accept, skip Pass A
-- **Overlap (`contains_overlap`):** never treat “Qwen==FireRed ≠ MOSS” as consensus; default draft base = MOSS; still run Pass A when any non-MOSS disagrees with MOSS **or** hotwords may apply (so MOSS can get pronunciation/hotword repair). Skip Pass A only if MOSS equals all others or MOSS-only and no hotword hit
-- Single hyp: skip Pass A unless hotwords / Pass B may apply
+- Chinese CER = 0 among available hyps (light normalize)
+- Non-overlap + CER=0 → skip Pass A
+- Overlap: never treat Qwen==FireRed≠MOSS as consensus; base=MOSS
 
-## 4.1 Overlap handling (MOSS-primary)
+## 4.1 Dynamic overlap handling
 
-For units with `contains_overlap=true`:
+| Condition | ASR | LLM base |
+| --------- | --- | -------- |
+| `overlap_ratio > 0.30` | MOSS only | `moss` |
+| `0 < overlap_ratio ≤ 0.30` | All ASRs | `moss`; others advisory |
+| no overlap | All ASRs | best under Tier A–C |
 
-- Still run Qwen3-ASR + FireRed (concat may include overlap; expected weaker)
-- LLM / selection: **base = MOSS**
-- Other hyps are advisory: a non-MOSS span may be used only if pronunciation-compatible with MOSS (or Tier B/C evidence below) — **not** because two non-MOSS models agree with each other
-- Prompt must include an `OVERLAP=true` flag and the instruction: do not discard MOSS content to follow cleaner-looking single-speaker ASR
+## 5. Pass A — evidence ladder + span-local char-count
 
-## 5. Pass A — evidence ladder (rules + prompt)
+**Context:** nearest ≤20 turns within ±10 min, ≤4096 tokens; optional hotwords; precomputed pinyin; overlap flags.
 
-**When:** disagreement, or overlap+repair path, or hyps look broken but Tier C still applies.
+| Tier | Evidence |
+| ---- | -------- |
+| A | Select/merge spans from hyps |
+| B | Exact tone-insensitive pinyin match |
+| C | Pinyin edit distance ≤2 **and** anchor ∈ {neighbor_draft, meeting_draft, hotword} |
 
-**Context:** target hyps + ±10 min draft neighbors + optional hotwords + `contains_overlap` flag. Precompute **pinyin** for hyp spans and hotwords; do not rely on the LLM to invent pinyin.
+**Forbidden:** context-only fixes (no pinyin link); open-world rewrite; abbreviation expansion.
 
-### Evidence ladder (strict order; **max = Tier C**)
+### Character-count validator (O1b, hard)
 
-Hotwords help but are **not** required — Tier C anchors can be neighbor/meeting draft alone.
+- For each edit: `abs(len(span_out) - len(span_asr)) ≤ 1`
+- Reject extra nouns/numbers that are not length-matched span swaps
+- On fail: retry ≤2; then fallback best hyp (MOSS if overlap)
 
-| Tier | Name | When allowed | Evidence required | Risk |
-| ---- | ---- | ------------ | ----------------- | ---- |
-| A | Select / merge | Normal | Span appears in ≥1 hyp | Lowest |
-| B | Exact pronunciation | Wrong characters, right sound | Tone-insensitive pinyin(candidate) == pinyin(ASR span); prefer hotword canonical if listed | Low |
-| C | Fuzzy pronunciation + context anchor | ASR near-miss **or all hyps wrong but recoverable** | Pinyin edit distance ≤ threshold (default ≤2) to *some* hyp span, **and** at least one anchor: (1) candidate already in ±10 min neighbor draft, **or** (2) candidate appears elsewhere in meeting draft/hyps, **or** (3) candidate ∈ hotword table (optional) | Medium |
+**LLM:** T=0.1; Tier C requires `anchor`; missing `tier`/`anchor` → retry → fallback.
 
-**No Tier D.** No open world-knowledge rewrite without phonetic link + context/hotword anchor.
+**Workflow:** sequential Pass A → `mode_c_draft.json`.
 
-**Still forbidden:**
+## 6. Pass B — required global consistency
 
-- Adding clauses/facts/numbers/names with **no** Tier A–C evidence
-- Changing speakers/timestamps
-- Fluent paraphrase not justified by sound + anchor
-
-### “All ASR wrong” under Tier C
-
-Allowed when the replacement is still **pronunciation-near** some hyp span (fuzzy pinyin) **and** anchored by dialogue/meeting recurrence (hotword optional).  
-If there is **no** phonetic similarity to any hyp and the term never appears in draft/hotwords → keep best hyp (MOSS on overlap).
-
-### Prompt shape (contract)
-
-```text
-You are correcting meeting ASR. Output JSON only.
-Priority: fidelity to speech > fluency.
-
-Flags: OVERLAP={true|false}. If OVERLAP, base_model must be moss unless a Tier B/C span swap is justified.
-
-Hypotheses: ... (raw text + pinyin)
-Hotwords (optional): ... (canonical, aliases, pinyin)
-Neighbor draft (±10 min): ...
-
-For each edit: {span_asr, span_out, tier, pinyin_asr, pinyin_out, anchor?}
-anchor ∈ {hyp, neighbor_draft, meeting_draft, hotword}
-Use the weakest tier that works. Prefer keep ASR if unsure.
-Max tier = C. Never add content without Tier A–C evidence.
-```
-
-Low temperature; reject/retry if edits lack `tier` or Tier C lacks `anchor`.
-
-**Output:** `{ text, base_model, edits[], overlap }` with `tier` ∈ `A|B|C|punct`.
-
-## 6. Pass B — required global consistency (fifth stage)
-
-Always run after a full-meeting draft exists:
-
-- Enforce consistent spelling via recurrence across meeting draft/hyps (hotwords when available)
-- On overlap turns, prefer spellings consistent with **MOSS-derived** draft / accepted Tier B–C edits — do not let non-MOSS majority override MOSS overlap content
-- Pass B edits must still satisfy Tier B/C evidence
-- No free paraphrase; no new facts
+- Input: full `mode_c_draft.json`
+- Tier B/C only; MOSS-aware on overlap turns; same span-local validator
+- Output `mode_c_asr_final.json` + `llm_edits.jsonl`
 
 ## 7. Artifacts
 
 | Artifact | Role |
 | -------- | ---- |
-| `asr_units.json` | Concat/split plan, gaps, skips |
-| `asr_hypotheses.json` | Per-unit hyps + agreement flags |
-| `mode_c_asr_final.json` | Final turns: `text`, `asr_status=final` where processed |
-| `llm_edits.jsonl` | Pass A/B edit audit |
+| `asr_units.json` | Concat/split, overlap_ratio, heavy_overlap, skips |
+| `asr_hypotheses.json` | Per-unit hyps + cache keys |
+| `mode_c_draft.json` | After Pass A |
+| `mode_c_asr_final.json` | After Pass B |
+| `llm_edits.jsonl` | Audits + retry counts |
 
-## 8. Non-goals
+## 8. Evaluation
 
-- Modifying Stage-1 fusion code paths
-- Streaming / production queue
-- Review UI
-- Replacing diarization metrics (DER) as the Stage-2 objective
+- Metrics: CER, **cpCER**
+- Ablation: **B0 = MOSS-from-fusion** → +concat multi-ASR → +dynamic overlap → +Pass A → +Pass B
+- First 5% data for B0 before full runs
+- Monitor invalid-JSON rate; if >5%, consider T=0.2
 
-## 9. Open implementation knobs (defaults stated)
+## 9. Judge prompt (production)
 
-- Energy split: frame RMS / short-time energy; min split distance from edges = 10% of segment
-- Tier B: tone-insensitive exact pinyin; Tier C: pinyin edit distance ≤2 + anchor ∈ {neighbor_draft, meeting_draft, hotword}; **no Tier D**
-- Crop: multi-turn units use exact `[unit_start, unit_end]` even with foreign overlap in span
-- Judge: Qwen3.6-27B-class; low temperature; schema validation rejects edits missing `tier` / Tier C missing `anchor`
+Use structured JSON (not `|...|` wrappers). Core constraints:
 
-## Discussion notes for teammates
+```text
+System: Strict conservative meeting transcript corrector. Fidelity to phonetics > fluency. JSON only.
 
-Open for debate:
+Constraints:
+1. OVERLAP / heavy_overlap flags. If heavy_overlap, base_model=moss; hyps may be MOSS-only.
+2. Evidence ladder Tier A → B → C (C needs pinyin edit distance ≤2 + anchor).
+3. SPAN-LOCAL CHAR COUNT: for every edit, |len(span_out)-len(span_asr)| ≤ 1.
+   Do not expand abbreviations. No context-only fixes without pinyin link.
+4. If unsure, keep base ASR text.
 
-1. Overlap: MOSS-primary vs MOSS-exclusive (skip other ASR entirely on overlap units)
-2. Timeline concat through overlap vs per-turn crops + silence (cleanliness vs sentence completeness)
-3. Whether Tier C should ever allow **context-only** fixes with no pinyin link to any hyp (higher recall, higher hallucination risk)
-4. Judge model choice: Qwen3.6-27B vs DeepSeek
-5. Eval protocol: CER / cpCER ablations on concat, agree-skip, LLM, Pass B, hotwords
+Output schema:
+{ "text", "base_model", "edits": [{ "span_asr", "span_out", "tier", "pinyin_asr", "pinyin_out", "anchor" }], "overlap" }
+```
+
+Few-shots: prefer length-matched repairs (e.g. 产用→采用, 单方接→单框架, 奔至→蹦字). Rewrite any example that inserts unmatched-length tokens (e.g. bare `3`).
+
+Full expanded template (hypotheses/hotwords/neighbors placeholders) lives in the implementation module; Chinese free-form “方言专家” prompts are inspiration only.
+
+## 10. Non-goals
+
+- Modifying Stage-1 fusion
+- Streaming / job queue / review UI
+- Optimizing DER as Stage-2 objective
+
+## 11. Open knob
+
+- Confirm `max_asr_seconds` default 30 vs 60 after Qwen3-ASR / FireRed model limits — implementation may start with 30.
