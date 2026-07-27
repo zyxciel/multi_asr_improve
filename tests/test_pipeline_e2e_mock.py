@@ -34,10 +34,14 @@ def test_pipeline_e2e_mock(tmp_path: Path):
     assert (out / "mode_c_draft.json").exists()
     assert (out / "mode_c_asr_final.json").exists()
     assert (out / "llm_edits.jsonl").exists()
+    assert (out / "pass_stats.json").exists()
 
     final = json.loads((out / "mode_c_asr_final.json").read_text(encoding="utf-8"))
     texts = " ".join(t["text"] for t in final["turns"])
     assert "采用" in texts or "单框架" in texts or "大家好" in texts
+
+    stats = json.loads((out / "pass_stats.json").read_text(encoding="utf-8"))
+    assert "pass_a" in stats and "pass_b" in stats
 
     cache_files = list((out / "asr_cache").glob("*.json"))
     assert cache_files
@@ -56,6 +60,10 @@ def test_prompt_template_renders():
         heavy_overlap_flag=True,
     )
     assert "heavy_overlap" in prompt.lower() or "HEAVY_OVERLAP=true" in prompt
+    assert "产用" in prompt
+    assert "单方接" in prompt
+    assert "奔至" in prompt
+    assert "Few-shots" in prompt
 
 
 def test_stubs_raise_without_weights():

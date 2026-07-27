@@ -50,7 +50,6 @@ def _distribute_text(unit_turn_indices: list[int], text: str, turns: list[Turn])
         return {unit_turn_indices[0]: text}
     durs = [max(1e-6, turns[i].duration) for i in unit_turn_indices]
     total = sum(durs)
-    # Character allocation proportional to duration
     chars = list(text)
     n = len(chars)
     out: dict[int, str] = {}
@@ -65,6 +64,36 @@ def _distribute_text(unit_turn_indices: list[int], text: str, turns: list[Turn])
     return out
 
 
+def _summarize_pass_a(audits: list[dict]) -> dict[str, Any]:
+    n = len(audits)
+    skipped = sum(1 for a in audits if a.get("skipped_llm"))
+    retries_total = sum(int(a.get("retries") or 0) for a in audits)
+    fallback = sum(1 for a in audits if a.get("fallback"))
+    fallback_judge_ok = sum(1 for a in audits if a.get("fallback_judge_ok"))
+    judged = n - skipped
+    invalid_rate = (retries_total / max(judged, 1)) if judged else 0.0
+    return {
+        "n_units_judged_or_skipped": n,
+        "skipped_llm": skipped,
+        "retries_total": retries_total,
+        "fallback_to_best_hyp": fallback,
+        "fallback_judge_success": fallback_judge_ok,
+        "approx_retry_rate": invalid_rate,
+        "suggest_raise_temperature": invalid_rate > 0.05,
+    }
+
+
+def _summarize_pass_b(audits: list[dict]) -> dict[str, Any]:
+    return {
+        "n_audits": len(audits),
+        "hotword_alias": sum(1 for a in audits if a.get("path") == "hotword_alias"),
+        "llm_edits": sum(1 for a in audits if a.get("path") == "llm" and not a.get("fallback")),
+        "llm_fallback": sum(1 for a in audits if a.get("path") == "llm" and a.get("fallback")),
+        "moss_aware_reject": sum(1 for a in audits if a.get("path") == "moss_aware_reject"),
+        "moss_force": sum(1 for a in audits if a.get("path") == "moss_force"),
+    }
+
+
 def run_pipeline(
     *,
     input_json: Path,
@@ -74,6 +103,7 @@ def run_pipeline(
     llm_judge,
     config: PipelineConfig | None = None,
     hotwords: list[str] | None = None,
+    fallback_judge=None,
 ) -> dict[str, Any]:
     cfg = config or PipelineConfig()
     hotwords = hotwords or []
@@ -96,10 +126,15 @@ def run_pipeline(
     hyp_records: list[dict] = []
     draft_texts: dict[int, str] = {i: t.text for i, t in enumerate(turns)}
     pass_a_audits: list[dict] = []
+    overlap_turn_indices: set[int] = set()
+    heavy_overlap_turn_indices: set[int] = set()
+    moss_texts: dict[int, str] = {}
 
     for unit in units:
         if unit.skip_asr:
-            hyp_records.append({"unit_id": unit.unit_id, "skipped": True, "reason": unit.skip_reason, "hyps": []})
+            hyp_records.append(
+                {"unit_id": unit.unit_id, "skipped": True, "reason": unit.skip_reason, "hyps": []}
+            )
             continue
 
         cache = _cache_path(work_dir, unit.unit_id, getattr(asr_runner, "name", "asr"))
@@ -150,6 +185,14 @@ def run_pipeline(
                 encoding="utf-8",
             )
 
+        if unit.contains_overlap:
+            overlap_turn_indices.update(unit.turn_indices)
+        if unit.heavy_overlap:
+            heavy_overlap_turn_indices.update(unit.turn_indices)
+        moss_hyp = next((h for h in hyps if h.model == "moss"), None)
+        if moss_hyp is not None:
+            moss_texts.update(_distribute_text(unit.turn_indices, moss_hyp.text, turns))
+
         hyp_records.append(
             {
                 "unit_id": unit.unit_id,
@@ -166,6 +209,7 @@ def run_pipeline(
             llm_judge=llm_judge,
             hotwords=hotwords,
             config=cfg,
+            fallback_judge=fallback_judge,
         )
         pass_a_audits.append(audit)
         for ti, piece in _distribute_text(unit.turn_indices, text, turns).items():
@@ -195,7 +239,16 @@ def run_pipeline(
     draft_path = work_dir / "mode_c_draft.json"
     draft_path.write_text(json.dumps(draft_doc, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    final_map, pass_b_audits = run_pass_b(turns, draft_texts, hotwords=hotwords)
+    final_map, pass_b_audits = run_pass_b(
+        turns,
+        draft_texts,
+        hotwords=hotwords,
+        llm_judge=llm_judge,
+        config=cfg,
+        overlap_turn_indices=overlap_turn_indices,
+        heavy_overlap_turn_indices=heavy_overlap_turn_indices,
+        moss_texts=moss_texts,
+    )
     final_turns = []
     for i, t in enumerate(turns):
         text = final_map.get(i, t.text)
@@ -225,9 +278,18 @@ def run_pipeline(
         for a in pass_b_audits:
             f.write(json.dumps(a, ensure_ascii=False) + "\n")
 
+    pass_stats = {
+        "pass_a": _summarize_pass_a(pass_a_audits),
+        "pass_b": _summarize_pass_b(pass_b_audits),
+    }
+    stats_path = work_dir / "pass_stats.json"
+    stats_path.write_text(json.dumps(pass_stats, ensure_ascii=False, indent=2), encoding="utf-8")
+
     return {
         "final_path": final_path,
         "draft_path": draft_path,
+        "stats_path": stats_path,
         "n_turns": len(final_turns),
         "n_units": len(units),
+        "pass_stats": pass_stats,
     }

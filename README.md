@@ -1,6 +1,6 @@
 # Stage-2 Multi-ASR + LLM Fusion
 
-Mock-first Stage-2 package on **diarizen_moss_fusion** Mode-C outputs, with optional real adapters for Qwen3-ASR, FireRedASR2S (VAD off / LID+Punc on), and Qwen3.6-27B.
+Mock-first Stage-2 package on **diarizen_moss_fusion** Mode-C outputs, with optional real adapters for Qwen3-ASR, FireRedASR2S (VAD off / LID+Punc on), Qwen3.6-27B (primary judge), and DeepSeek (judge fallback).
 
 ## Docs
 
@@ -38,6 +38,7 @@ stage2-asr run \
   --audio prepared.wav \
   --work-dir out \
   --backend real --enable-real
+# optional: --no-deepseek-fallback
 ```
 
 FireRed system config used by the adapter:
@@ -55,4 +56,4 @@ third_party/         # optional local clones (gitignored)
 
 ## Artifacts
 
-`asr_units.json`, `asr_hypotheses.json`, `mode_c_draft.json`, `mode_c_asr_final.json`, `llm_edits.jsonl`, `asr_cache/`, `crops/`
+`asr_units.json`, `asr_hypotheses.json`, `mode_c_draft.json`, `mode_c_asr_final.json`, `llm_edits.jsonl`, `pass_stats.json`, `asr_cache/`, `crops/`

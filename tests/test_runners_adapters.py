@@ -9,6 +9,7 @@ from stage2_asr.eval_metrics import cer, corpus_cer, cp_cer
 from stage2_asr.runners.base import UnsupportedRunnerError
 from stage2_asr.runners.ensemble import EnsembleAsrRunner
 from stage2_asr.runners.firered_asr2s import FireRedAsr2sConfig, FireRedAsr2sRunner
+from stage2_asr.runners.llm_deepseek import DeepSeekLlmJudge
 from stage2_asr.runners.llm_qwen36 import Qwen36LlmJudge
 from stage2_asr.runners.qwen3_asr import Qwen3AsrRunner
 from stage2_asr.types import AsrStatus, AsrUnit, Turn
@@ -99,6 +100,7 @@ def test_llm_judge_with_generate_fn():
 
     def gen(system, user):
         assert "FIDELITY" in system or "phonetic" in system.lower() or "JSON" in system
+        assert "产用" in user
         return __import__("json").dumps(payload, ensure_ascii=False)
 
     judge = Qwen36LlmJudge(generate_fn=gen)
@@ -111,3 +113,42 @@ def test_llm_judge_with_generate_fn():
         unit_id="u",
     )
     assert out["text"] == "你好"
+
+
+def test_deepseek_judge_disabled_raises():
+    import pytest
+
+    with pytest.raises(UnsupportedRunnerError):
+        DeepSeekLlmJudge().judge(
+            hypotheses=[],
+            neighbor_draft=[],
+            hotwords=[],
+            overlap=False,
+            heavy_overlap=False,
+            unit_id="u",
+        )
+
+
+def test_deepseek_judge_with_generate_fn():
+    payload = {
+        "text": "你好",
+        "base_model": "moss",
+        "edits": [],
+        "overlap": False,
+    }
+
+    def gen(system, user):
+        assert "Few-shots" in user or "产用" in user
+        return __import__("json").dumps(payload, ensure_ascii=False)
+
+    judge = DeepSeekLlmJudge(generate_fn=gen)
+    out = judge.judge(
+        hypotheses=[],
+        neighbor_draft=[],
+        hotwords=[],
+        overlap=False,
+        heavy_overlap=False,
+        unit_id="u",
+    )
+    assert out["text"] == "你好"
+    assert judge.name == "deepseek"

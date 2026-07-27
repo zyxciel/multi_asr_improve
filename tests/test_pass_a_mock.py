@@ -40,3 +40,41 @@ def test_pass_a_repairs_with_tier_c():
     )
     assert "采用" in text
     assert audit.get("skipped_llm") is False
+
+
+def test_pass_a_deepseek_fallback_after_qwen_failures():
+    unit = AsrUnit("u", 0, 1, "s0", [0])
+    turns = [Turn(0, 1, "s0", "你好")]
+    hyps = [Hypothesis("moss", "你好"), Hypothesis("qwen", "您好")]
+
+    class AlwaysBad:
+        name = "qwen36"
+
+        def judge(self, **kwargs):
+            return {"text": "only"}
+
+    class DeepSeekOk:
+        name = "deepseek"
+
+        def judge(self, **kwargs):
+            return {
+                "text": "你好",
+                "base_model": "moss",
+                "edits": [],
+                "overlap": False,
+            }
+
+    text, audit = run_pass_a_for_unit(
+        unit=unit,
+        turns=turns,
+        hyps=hyps,
+        draft_texts={0: "你好"},
+        llm_judge=AlwaysBad(),
+        fallback_judge=DeepSeekOk(),
+        hotwords=[],
+        config=PipelineConfig(llm_max_retries=1),
+    )
+    assert text == "你好"
+    assert audit.get("fallback_judge") == "deepseek"
+    assert audit.get("fallback_judge_ok") is True
+    assert audit.get("fallback") is not True

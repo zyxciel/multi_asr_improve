@@ -23,9 +23,12 @@ def validate_edits_evidence_ladder(
     edits: list[Edit],
     *,
     max_pinyin_edits: int = 2,
+    allowed_tiers: set[str] | None = None,
 ) -> tuple[bool, str | None]:
     """Enforce Tier B exact pinyin / Tier C fuzzy pinyin + anchor (no context-only)."""
     for e in edits:
+        if allowed_tiers is not None and e.tier not in allowed_tiers:
+            return False, f"tier {e.tier!r} not allowed in this pass"
         if e.tier in {"A", "punct"}:
             continue
         if e.tier == "B":

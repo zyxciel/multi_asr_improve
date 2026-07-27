@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Official Pass A judge prompt contract (for real LLM adapters)."""
+"""Official Pass A/B judge prompt contract (for real LLM adapters)."""
 
 SYSTEM_PROMPT = (
     "You are a strict, conservative meeting transcript corrector. "
@@ -46,6 +46,17 @@ Correct the ASR transcription for a meeting turn. Output JSON only.
   ],
   "overlap": true|false
 }}
+
+### Few-shots
+Positive (length-matched phonetic repairs — prefer these patterns):
+1) 产用 → 采用  (Tier C, anchor=hyp|hotword; |Δlen|=0)
+2) 单方接 → 单框架  (Tier C, anchor=hotword|neighbor_draft; |Δlen|=0)
+3) 奔至 → 蹦字  (Tier C, anchor=neighbor_draft; |Δlen|=0)
+
+Negative (must REJECT — span-local violation):
+- Do NOT rewrite a bare digit like inserting unmatched-length tokens
+  (e.g. span_asr="" / span_out="3", or expanding one syllable into a long phrase).
+  If the only fix would break |len(span_out)-len(span_asr)| <= 1, keep the base ASR text.
 
 Now process the following inputs strictly based on the rules above. Output JSON only.
 """
