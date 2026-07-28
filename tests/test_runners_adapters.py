@@ -90,6 +90,16 @@ def test_ensemble_all_models():
     assert {h.model for h in hyps} == {"moss", "qwen", "firered"}
 
 
+def test_ensemble_selected_models():
+    ens = EnsembleAsrRunner(Qwen3AsrRunner(model=_FakeQwenModel()), FireRedAsr2sRunner(system=_FakeFireRedSystem()))
+    turns = [Turn(0, 1, "s0", "来自MOSS", asr_status=AsrStatus.PROVISIONAL)]
+    unit = AsrUnit("u", 0, 1, "s0", [0])
+    hyps = ens.transcribe_unit(
+        unit, turns, "x.wav", moss_exclusive=False, selected_models={"moss", "firered"}
+    )
+    assert {h.model for h in hyps} == {"moss", "firered"}
+
+
 def test_llm_judge_with_generate_fn():
     payload = {
         "text": "你好",

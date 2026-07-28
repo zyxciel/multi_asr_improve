@@ -120,3 +120,74 @@ def test_pass_a_retry_then_fallback():
     )
     assert text == "你好"
     assert audit["retries"] >= 1
+
+
+def _read_hyp_records(path: Path) -> list[dict]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(payload, list):
+        return payload
+    return payload["records"]
+
+
+def test_stage_asr_then_llm_uses_cached_hypotheses(tmp_path: Path):
+    out = tmp_path / "work"
+    # Stage 1: ASR only
+    asr_result = run_pipeline(
+        input_json=FIXTURES / "mode_c.json",
+        audio_path=tmp_path / "missing.wav",
+        work_dir=out,
+        asr_runner=MockAsrRunner(),
+        llm_judge=MockLlmJudge(),
+        config=PipelineConfig(),
+        hotwords=["单框架|单方接"],
+        stage="asr",
+        asr_models=["moss", "qwen"],
+    )
+    assert asr_result["stage"] == "asr"
+    assert (out / "asr_hypotheses.json").exists()
+    assert not (out / "mode_c_draft.json").exists()
+
+    # Stage 2: LLM only from cached ASR results
+    llm_result = run_pipeline(
+        input_json=FIXTURES / "mode_c.json",
+        audio_path=tmp_path / "missing.wav",
+        work_dir=out,
+        asr_runner=MockAsrRunner(),  # should not be used in llm stage
+        llm_judge=MockLlmJudge(),
+        config=PipelineConfig(),
+        hotwords=["单框架|单方接"],
+        stage="llm",
+    )
+    assert llm_result["stage"] == "llm"
+    assert (out / "mode_c_draft.json").exists()
+    assert (out / "mode_c_asr_final.json").exists()
+
+
+def test_stage_asr_can_accumulate_different_models(tmp_path: Path):
+    out = tmp_path / "work"
+    run_pipeline(
+        input_json=FIXTURES / "mode_c.json",
+        audio_path=tmp_path / "missing.wav",
+        work_dir=out,
+        asr_runner=MockAsrRunner(),
+        llm_judge=MockLlmJudge(),
+        config=PipelineConfig(),
+        stage="asr",
+        asr_models=["qwen"],
+    )
+    run_pipeline(
+        input_json=FIXTURES / "mode_c.json",
+        audio_path=tmp_path / "missing.wav",
+        work_dir=out,
+        asr_runner=MockAsrRunner(),
+        llm_judge=MockLlmJudge(),
+        config=PipelineConfig(),
+        stage="asr",
+        asr_models=["firered"],
+    )
+    records = _read_hyp_records(out / "asr_hypotheses.json")
+    non_skipped = [r for r in records if not r.get("skipped")]
+    assert non_skipped
+    models = {h["model"] for r in non_skipped for h in r.get("hyps", [])}
+    assert "qwen" in models
+    assert "firered" in models

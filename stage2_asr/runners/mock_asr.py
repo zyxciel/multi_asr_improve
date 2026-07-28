@@ -50,7 +50,9 @@ class MockAsrRunner:
         *,
         moss_exclusive: bool = False,
         crop_path: str | None = None,
+        selected_models: set[str] | None = None,
     ) -> list[Hypothesis]:
+        selected = selected_models or {"moss", "qwen", "firered"}
         _ = crop_path  # mock ignores audio; real runners use crop_path
         entry = self._data.get("by_unit_id", {}).get(unit.unit_id) or dict(self._data.get("default", {}))
         moss_text, moss_merged = self._moss_text(unit, turns)
@@ -58,7 +60,7 @@ class MockAsrRunner:
             moss_text = entry["moss"]
 
         hyps: list[Hypothesis] = []
-        if moss_text:
+        if moss_text and "moss" in selected:
             hyps.append(Hypothesis(model="moss", text=moss_text, meta={"moss_merged": moss_merged}))
         if moss_exclusive:
             return hyps
@@ -67,9 +69,9 @@ class MockAsrRunner:
         qwen = entry.get("qwen", qwen_default)
         firered = entry.get("firered", firered_default)
         lid = entry.get("lid", "zh")
-        if qwen:
+        if qwen and "qwen" in selected:
             hyps.append(Hypothesis(model="qwen", text=qwen))
-        if firered:
+        if firered and "firered" in selected:
             hyps.append(
                 Hypothesis(
                     model="firered",

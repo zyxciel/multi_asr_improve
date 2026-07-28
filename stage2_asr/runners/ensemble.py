@@ -31,29 +31,37 @@ class EnsembleAsrRunner:
         *,
         moss_exclusive: bool = False,
         crop_path: str | None = None,
+        selected_models: set[str] | None = None,
     ) -> list[Hypothesis]:
+        selected = selected_models or {"moss", "qwen", "firered"}
         hyps: list[Hypothesis] = []
         moss = self._moss(unit, turns)
-        if moss:
+        if moss and "moss" in selected:
             hyps.append(moss)
         if moss_exclusive:
             return hyps
         kwargs = {"crop_path": crop_path} if crop_path is not None else {}
         # Prefer calling with crop_path if runners accept it
-        try:
-            hyps.extend(
-                self.qwen_runner.transcribe_unit(
-                    unit, turns, audio_path, moss_exclusive=False, crop_path=crop_path
+        if "qwen" in selected:
+            try:
+                hyps.extend(
+                    self.qwen_runner.transcribe_unit(
+                        unit, turns, audio_path, moss_exclusive=False, crop_path=crop_path
+                    )
                 )
-            )
-        except TypeError:
-            hyps.extend(self.qwen_runner.transcribe_unit(unit, turns, audio_path, moss_exclusive=False))
-        try:
-            hyps.extend(
-                self.firered_runner.transcribe_unit(
-                    unit, turns, audio_path, moss_exclusive=False, crop_path=crop_path
+            except TypeError:
+                hyps.extend(
+                    self.qwen_runner.transcribe_unit(unit, turns, audio_path, moss_exclusive=False)
                 )
-            )
-        except TypeError:
-            hyps.extend(self.firered_runner.transcribe_unit(unit, turns, audio_path, moss_exclusive=False))
+        if "firered" in selected:
+            try:
+                hyps.extend(
+                    self.firered_runner.transcribe_unit(
+                        unit, turns, audio_path, moss_exclusive=False, crop_path=crop_path
+                    )
+                )
+            except TypeError:
+                hyps.extend(
+                    self.firered_runner.transcribe_unit(unit, turns, audio_path, moss_exclusive=False)
+                )
         return hyps

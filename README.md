@@ -41,6 +41,22 @@ stage2-asr run \
 # optional: --no-deepseek-fallback
 ```
 
+## Staged mode (low-resource / step-by-step)
+
+You can run ASR and LLM in separate stages and reuse artifacts in `--work-dir`.
+
+```bash
+# 1) ASR only (save per-unit hyps/cache; no LLM)
+stage2-asr run --input mode_c.json --audio prepared.wav --work-dir out --backend real --enable-real --stage asr --asr-models qwen
+stage2-asr run --input mode_c.json --audio prepared.wav --work-dir out --backend real --enable-real --stage asr --asr-models firered
+
+# 2) LLM only (reads out/asr_hypotheses.json; no ASR inference)
+stage2-asr run --input mode_c.json --audio prepared.wav --work-dir out --backend real --enable-real --stage llm
+```
+
+Available stages: `all` (default), `asr`, `pass_a`, `pass_b`, `llm`  
+ASR model subsets: `moss`, `qwen`, `firered` (comma-separated via `--asr-models`)
+
 FireRed system config used by the adapter:
 
 `enable_vad=False`, `enable_lid=True`, `enable_punc=True`

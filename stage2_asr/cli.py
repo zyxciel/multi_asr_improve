@@ -33,6 +33,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     run_p.add_argument("--mock-hyps", default=None, help="Optional mock hypothesis fixture JSON")
     run_p.add_argument("--hotwords", default=None, help="Optional hotword list JSON")
+    run_p.add_argument(
+        "--stage",
+        default="all",
+        choices=["all", "asr", "pass_a", "pass_b", "llm"],
+        help="Execution stage: all | asr | pass_a | pass_b | llm",
+    )
+    run_p.add_argument(
+        "--asr-models",
+        default="moss,qwen,firered",
+        help="Comma-separated ASR models for ASR stage/cache: moss,qwen,firered",
+    )
     run_p.add_argument("--max-asr-seconds", type=float, default=30.0)
     run_p.add_argument("--qwen-model-id", default="Qwen/Qwen3-ASR-1.7B")
     run_p.add_argument("--llm-model-id", default="Qwen/Qwen3.6-27B")
@@ -61,23 +72,34 @@ def main(argv: list[str] | None = None) -> int:
     work_dir.mkdir(parents=True, exist_ok=True)
     cfg = PipelineConfig(max_asr_seconds=float(args.max_asr_seconds))
 
+    stage = str(args.stage).lower()
+    asr_models = [m.strip().lower() for m in str(args.asr_models).split(",") if m.strip()]
+    needs_asr = stage in {"all", "asr"}
+    needs_llm = stage in {"all", "pass_a", "pass_b", "llm"}
+
     fallback_judge = None
+    asr = MockAsrRunner()  # lightweight default when stage does not need ASR.
+    llm = MockLlmJudge()   # lightweight default when stage does not need LLM.
     if backend == "mock":
-        hyp_path = Path(args.mock_hyps) if args.mock_hyps else None
-        asr = MockAsrRunner(fixture_path=hyp_path)
-        llm = MockLlmJudge()
+        if needs_asr:
+            hyp_path = Path(args.mock_hyps) if args.mock_hyps else None
+            asr = MockAsrRunner(fixture_path=hyp_path)
+        if needs_llm:
+            llm = MockLlmJudge()
     else:
-        asr = EnsembleAsrRunner(
-            Qwen3AsrRunner(enabled=True, model_id=args.qwen_model_id, work_dir=work_dir),
-            FireRedAsr2sRunner(enabled=True, config=FireRedAsr2sConfig(vad=False, lid=True, punc=True)),
-        )
-        llm = Qwen36LlmJudge(enabled=True, model_id=args.llm_model_id, temperature=0.1)
-        if not args.no_deepseek_fallback:
-            fallback_judge = DeepSeekLlmJudge(
-                enabled=True,
-                model_id=args.deepseek_model_id,
-                temperature=0.1,
+        if needs_asr:
+            asr = EnsembleAsrRunner(
+                Qwen3AsrRunner(enabled=True, model_id=args.qwen_model_id, work_dir=work_dir),
+                FireRedAsr2sRunner(enabled=True, config=FireRedAsr2sConfig(vad=False, lid=True, punc=True)),
             )
+        if needs_llm:
+            llm = Qwen36LlmJudge(enabled=True, model_id=args.llm_model_id, temperature=0.1)
+            if not args.no_deepseek_fallback:
+                fallback_judge = DeepSeekLlmJudge(
+                    enabled=True,
+                    model_id=args.deepseek_model_id,
+                    temperature=0.1,
+                )
 
     hotwords: list[str] = []
     if args.hotwords:
@@ -92,19 +114,27 @@ def main(argv: list[str] | None = None) -> int:
         config=cfg,
         hotwords=hotwords,
         fallback_judge=fallback_judge,
+        stage=stage,
+        asr_models=asr_models,
     )
-    print(
-        json.dumps(
-            {
-                "ok": True,
-                "backend": backend,
-                "final": str(result["final_path"]),
-                "n_turns": result["n_turns"],
-                "pass_stats": str(result.get("stats_path")),
-            },
-            ensure_ascii=False,
-        )
-    )
+    payload = {
+        "ok": True,
+        "backend": backend,
+        "stage": stage,
+        "n_turns": result.get("n_turns"),
+        "n_units": result.get("n_units"),
+    }
+    if result.get("final_path") is not None:
+        payload["final"] = str(result["final_path"])
+    if result.get("draft_path") is not None:
+        payload["draft"] = str(result["draft_path"])
+    if result.get("stats_path") is not None:
+        payload["pass_stats"] = str(result["stats_path"])
+    if result.get("asr_hypotheses_path") is not None:
+        payload["asr_hypotheses"] = str(result["asr_hypotheses_path"])
+    if result.get("asr_models") is not None:
+        payload["asr_models"] = result["asr_models"]
+    print(json.dumps(payload, ensure_ascii=False))
     return 0
 
 
