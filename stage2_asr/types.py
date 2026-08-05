@@ -98,6 +98,22 @@ class AsrUnit:
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "AsrUnit":
+        return cls(
+            unit_id=str(d["unit_id"]),
+            start=float(d["start"]),
+            end=float(d["end"]),
+            speaker_id=str(d["speaker_id"]),
+            turn_indices=[int(i) for i in d.get("turn_indices", [])],
+            overlap_ratio=float(d.get("overlap_ratio", 0.0)),
+            contains_overlap=bool(d.get("contains_overlap", False)),
+            heavy_overlap=bool(d.get("heavy_overlap", False)),
+            skip_asr=bool(d.get("skip_asr", False)),
+            skip_reason=d.get("skip_reason"),
+            moss_merged=bool(d.get("moss_merged", False)),
+        )
+
 
 @dataclass
 class PipelineConfig:

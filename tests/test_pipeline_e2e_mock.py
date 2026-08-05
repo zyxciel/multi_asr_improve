@@ -191,3 +191,108 @@ def test_stage_asr_can_accumulate_different_models(tmp_path: Path):
     models = {h["model"] for r in non_skipped for h in r.get("hyps", [])}
     assert "qwen" in models
     assert "firered" in models
+
+
+def test_stage_all_merges_prior_hyps(tmp_path: Path):
+    out = tmp_path / "work"
+    run_pipeline(
+        input_json=FIXTURES / "mode_c.json",
+        audio_path=tmp_path / "missing.wav",
+        work_dir=out,
+        asr_runner=MockAsrRunner(),
+        llm_judge=MockLlmJudge(),
+        config=PipelineConfig(),
+        stage="asr",
+        asr_models=["qwen"],
+    )
+    run_pipeline(
+        input_json=FIXTURES / "mode_c.json",
+        audio_path=tmp_path / "missing.wav",
+        work_dir=out,
+        asr_runner=MockAsrRunner(),
+        llm_judge=MockLlmJudge(),
+        config=PipelineConfig(),
+        stage="all",
+        asr_models=["moss"],
+        hotwords=["单框架|单方接"],
+    )
+    records = _read_hyp_records(out / "asr_hypotheses.json")
+    models = {h["model"] for r in records if not r.get("skipped") for h in r.get("hyps", [])}
+    assert "qwen" in models
+    assert "moss" in models
+
+
+def test_llm_stage_reloads_persisted_units(tmp_path: Path):
+    out = tmp_path / "work"
+    run_pipeline(
+        input_json=FIXTURES / "mode_c.json",
+        audio_path=tmp_path / "missing.wav",
+        work_dir=out,
+        asr_runner=MockAsrRunner(),
+        llm_judge=MockLlmJudge(),
+        config=PipelineConfig(),
+        stage="asr",
+        asr_models=["moss", "qwen"],
+    )
+    units_before = json.loads((out / "asr_units.json").read_text(encoding="utf-8"))["units"]
+    # Corrupt unit_ids would break Pass A if rebuilt differently; pin by reloading.
+    run_pipeline(
+        input_json=FIXTURES / "mode_c.json",
+        audio_path=tmp_path / "missing.wav",
+        work_dir=out,
+        asr_runner=MockAsrRunner(),
+        llm_judge=MockLlmJudge(),
+        config=PipelineConfig(),
+        stage="llm",
+        hotwords=["单框架|单方接"],
+    )
+    units_after = json.loads((out / "asr_units.json").read_text(encoding="utf-8"))["units"]
+    assert [u["unit_id"] for u in units_before] == [u["unit_id"] for u in units_after]
+    assert (out / "mode_c_asr_final.json").exists()
+
+
+def test_pass_b_stage_preserves_pass_a_artifacts(tmp_path: Path):
+    out = tmp_path / "work"
+    run_pipeline(
+        input_json=FIXTURES / "mode_c.json",
+        audio_path=tmp_path / "missing.wav",
+        work_dir=out,
+        asr_runner=MockAsrRunner(),
+        llm_judge=MockLlmJudge(),
+        config=PipelineConfig(),
+        stage="asr",
+        asr_models=["moss", "qwen"],
+    )
+    run_pipeline(
+        input_json=FIXTURES / "mode_c.json",
+        audio_path=tmp_path / "missing.wav",
+        work_dir=out,
+        asr_runner=MockAsrRunner(),
+        llm_judge=MockLlmJudge(),
+        config=PipelineConfig(),
+        stage="pass_a",
+        hotwords=["单框架|单方接"],
+    )
+    edits_a = (out / "llm_edits.jsonl").read_text(encoding="utf-8")
+    assert '"pass": "A"' in edits_a or '"pass":"A"' in edits_a
+    stats_a = json.loads((out / "pass_stats.json").read_text(encoding="utf-8"))
+    assert "pass_a" in stats_a
+
+    run_pipeline(
+        input_json=FIXTURES / "mode_c.json",
+        audio_path=tmp_path / "missing.wav",
+        work_dir=out,
+        asr_runner=MockAsrRunner(),
+        llm_judge=MockLlmJudge(),
+        config=PipelineConfig(),
+        stage="pass_b",
+        hotwords=["单框架|单方接"],
+    )
+    edits = [
+        json.loads(line)
+        for line in (out / "llm_edits.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert any(e.get("pass") == "A" for e in edits)
+    stats = json.loads((out / "pass_stats.json").read_text(encoding="utf-8"))
+    assert "pass_a" in stats and "pass_b" in stats

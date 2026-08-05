@@ -6,10 +6,10 @@ from typing import Any
 
 import numpy as np
 
-from stage2_asr.audio_io import crop_unit_wav
+from stage2_asr.audio_io import crop_unit_wav, load_wav_mono16k
 from stage2_asr.pass_a import run_pass_a_for_unit
 from stage2_asr.pass_b import run_pass_b
-from stage2_asr.types import AsrStatus, Hypothesis, PipelineConfig, Turn
+from stage2_asr.types import AsrStatus, AsrUnit, Hypothesis, PipelineConfig, Turn
 from stage2_asr.units import build_asr_units
 from stage2_asr.validate import validate_turns
 
@@ -21,19 +21,72 @@ def load_mode_c(path: Path) -> tuple[list[Turn], dict[str, Any]]:
 
 
 def _load_audio_optional(audio_path: Path, sr: int) -> np.ndarray | None:
-    # v0 mock: do not require real wav decode; return silence if file missing
+    """Load mono 16 kHz float32 via audio_io; None if missing/unreadable (mock-friendly)."""
     if not audio_path.exists():
         return None
     try:
-        import wave
-
-        with wave.open(str(audio_path), "rb") as wf:
-            n = wf.getnframes()
-            raw = wf.readframes(n)
-            audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-            return audio
+        audio, _ = load_wav_mono16k(audio_path, target_sr=sr)
+        return audio
     except Exception:
         return None
+
+
+def _load_units(path: Path) -> list[AsrUnit] | None:
+    if not path.exists():
+        return None
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    raw = payload.get("units") if isinstance(payload, dict) else payload
+    if not isinstance(raw, list) or not raw:
+        return None
+    return [AsrUnit.from_dict(u) for u in raw]
+
+
+def _save_units(path: Path, units: list[AsrUnit], skipped: list[Any]) -> None:
+    path.write_text(
+        json.dumps(
+            {"units": [u.to_dict() for u in units], "skipped_invalid_ts": skipped},
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def _load_pass_stats(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _merge_pass_stats(path: Path, updates: dict[str, Any]) -> dict[str, Any]:
+    merged = _load_pass_stats(path)
+    merged.update(updates)
+    path.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+    return merged
+
+
+def _rewrite_edits_pass_b(edits_path: Path, pass_b_audits: list[dict]) -> None:
+    """Keep Pass A lines; replace any prior Pass B lines with this run's audits."""
+    pass_a: list[dict] = []
+    if edits_path.exists():
+        for line in edits_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict) and obj.get("pass") == "A":
+                pass_a.append(obj)
+    with edits_path.open("w", encoding="utf-8") as f:
+        for a in pass_a:
+            f.write(json.dumps(a, ensure_ascii=False) + "\n")
+        for a in pass_b_audits:
+            f.write(json.dumps(a, ensure_ascii=False) + "\n")
 
 
 def _cache_path(work_dir: Path, unit_id: str, runner_name: str) -> Path:
@@ -89,6 +142,7 @@ def _summarize_pass_b(audits: list[dict]) -> dict[str, Any]:
         "hotword_alias": sum(1 for a in audits if a.get("path") == "hotword_alias"),
         "llm_edits": sum(1 for a in audits if a.get("path") == "llm" and not a.get("fallback")),
         "llm_fallback": sum(1 for a in audits if a.get("path") == "llm" and a.get("fallback")),
+        "fallback_judge_success": sum(1 for a in audits if a.get("fallback_judge_ok")),
         "moss_aware_reject": sum(1 for a in audits if a.get("path") == "moss_aware_reject"),
         "moss_force": sum(1 for a in audits if a.get("path") == "moss_force"),
     }
@@ -217,16 +271,19 @@ def run_pipeline(
     raw_turns, raw_doc = load_mode_c(input_json)
     turns, skipped = validate_turns(raw_turns, cfg)
     audio = _load_audio_optional(audio_path, cfg.sample_rate)
-    units = build_asr_units(turns, cfg, audio=audio, sample_rate=cfg.sample_rate)
+    units_path = work_dir / "asr_units.json"
 
-    (work_dir / "asr_units.json").write_text(
-        json.dumps(
-            {"units": [u.to_dict() for u in units], "skipped_invalid_ts": skipped},
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
+    # LLM-only stages reload persisted units so unit_id stays aligned with asr_hypotheses.
+    if stage in {"pass_a", "pass_b", "llm"}:
+        loaded = _load_units(units_path)
+        if loaded is not None:
+            units = loaded
+        else:
+            units = build_asr_units(turns, cfg, audio=audio, sample_rate=cfg.sample_rate)
+            _save_units(units_path, units, skipped)
+    else:
+        units = build_asr_units(turns, cfg, audio=audio, sample_rate=cfg.sample_rate)
+        _save_units(units_path, units, skipped)
 
     asr_runner_name = f"{getattr(asr_runner, 'name', 'asr')}__{'-'.join(sorted(normalized_models))}"
     hyp_path = work_dir / "asr_hypotheses.json"
@@ -308,11 +365,8 @@ def run_pipeline(
                 )
 
             new_hyps = [h.to_dict() for h in hyps]
-            prior_hyps = (
-                existing_by_unit.get(unit.unit_id, {}).get("hyps")
-                if stage == "asr"
-                else None
-            )
+            # Accumulate hyps across staged ASR runs and re-runs of stage=all.
+            prior_hyps = existing_by_unit.get(unit.unit_id, {}).get("hyps")
             merged_hyps = _merge_hyps(prior_hyps or [], new_hyps)
             built_records.append(
                 {
@@ -366,6 +420,7 @@ def run_pipeline(
             draft_texts,
             hotwords=hotwords,
             llm_judge=llm_judge,
+            fallback_judge=fallback_judge,
             config=cfg,
             overlap_turn_indices=overlap_turn_indices,
             heavy_overlap_turn_indices=heavy_overlap_turn_indices,
@@ -392,12 +447,9 @@ def run_pipeline(
         final_path = work_dir / "mode_c_asr_final.json"
         final_path.write_text(json.dumps(final_doc, ensure_ascii=False, indent=2), encoding="utf-8")
         edits_path = work_dir / "llm_edits.jsonl"
-        with edits_path.open("a", encoding="utf-8") as f:
-            for a in pass_b_audits:
-                f.write(json.dumps(a, ensure_ascii=False) + "\n")
-        pass_stats = {"pass_b": _summarize_pass_b(pass_b_audits)}
+        _rewrite_edits_pass_b(edits_path, pass_b_audits)
         stats_path = work_dir / "pass_stats.json"
-        stats_path.write_text(json.dumps(pass_stats, ensure_ascii=False, indent=2), encoding="utf-8")
+        pass_stats = _merge_pass_stats(stats_path, {"pass_b": _summarize_pass_b(pass_b_audits)})
         return {
             "stage": "pass_b",
             "final_path": final_path,
@@ -474,9 +526,8 @@ def run_pipeline(
         with edits_path.open("w", encoding="utf-8") as f:
             for a in pass_a_audits:
                 f.write(json.dumps({"pass": "A", **a}, ensure_ascii=False) + "\n")
-        pass_stats = {"pass_a": _summarize_pass_a(pass_a_audits)}
         stats_path = work_dir / "pass_stats.json"
-        stats_path.write_text(json.dumps(pass_stats, ensure_ascii=False, indent=2), encoding="utf-8")
+        pass_stats = _merge_pass_stats(stats_path, {"pass_a": _summarize_pass_a(pass_a_audits)})
         return {
             "stage": "pass_a",
             "draft_path": draft_path,
@@ -491,6 +542,7 @@ def run_pipeline(
         draft_texts,
         hotwords=hotwords,
         llm_judge=llm_judge,
+        fallback_judge=fallback_judge,
         config=cfg,
         overlap_turn_indices=overlap_turn_indices,
         heavy_overlap_turn_indices=heavy_overlap_turn_indices,

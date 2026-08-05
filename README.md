@@ -61,10 +61,19 @@ FireRed system config used by the adapter:
 
 `enable_vad=False`, `enable_lid=True`, `enable_punc=True`
 
+## Eval B0 (MOSS-from-fusion baseline)
+
+```bash
+python scripts/eval_b0.py --hyp mode_c.json --ref ref.json --json-out out/b0.json
+```
+
+Compares Mode-C provisional turn texts to a same-order reference; reports corpus CER and mean cpCER.
+
 ## Layout
 
 ```text
 stage2_asr/          # pipeline + runners
+scripts/             # eval helpers (e.g. eval_b0.py)
 tests/               # unit + e2e mocks (fake injected models)
 docs/                # design + references
 third_party/         # optional local clones (gitignored)
@@ -72,4 +81,4 @@ third_party/         # optional local clones (gitignored)
 
 ## Artifacts
 
-`asr_units.json`, `asr_hypotheses.json`, `mode_c_draft.json`, `mode_c_asr_final.json`, `llm_edits.jsonl`, `pass_stats.json`, `asr_cache/`, `crops/`
+`asr_units.json` (reloaded on `pass_a`/`pass_b`/`llm` so unit_ids stay stable), `asr_hypotheses.json` (hyps merge across `asr` and `all` re-runs), `mode_c_draft.json`, `mode_c_asr_final.json`, `llm_edits.jsonl` (Pass A preserved when re-running `pass_b`), `pass_stats.json` (merged across staged passes), `asr_cache/`, `crops/`

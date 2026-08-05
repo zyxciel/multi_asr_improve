@@ -144,6 +144,7 @@ def run_pass_b(
     hotwords: list[str] | None = None,
     *,
     llm_judge=None,
+    fallback_judge=None,
     config: PipelineConfig | None = None,
     overlap_turn_indices: set[int] | None = None,
     heavy_overlap_turn_indices: set[int] | None = None,
@@ -154,6 +155,7 @@ def run_pass_b(
     1) Hotword alias fast path (span-local + Tier C)
     2) Optional LLM Tier B/C scan with full meeting_draft as neighbors
     3) MOSS-aware: overlap turns prefer / force moss provisional text
+    4) Optional fallback_judge (e.g. DeepSeek) after primary retries fail
     """
     cfg = config or PipelineConfig()
     hotwords = hotwords or []
@@ -211,6 +213,7 @@ def run_pass_b(
         unit_id = f"pass_b_t{i}"
         accepted = None
         last_err = None
+        used_fallback = False
         for attempt in range(cfg.llm_max_retries + 1):
             raw, err = _try_pass_b_judge(
                 llm_judge,
@@ -227,6 +230,22 @@ def run_pass_b(
             accepted = raw
             break
 
+        if accepted is None and fallback_judge is not None:
+            used_fallback = True
+            raw, err = _try_pass_b_judge(
+                fallback_judge,
+                hyps=hyps,
+                neighbors=capped,
+                hotwords=hotwords,
+                overlap=overlap,
+                heavy_overlap=heavy,
+                unit_id=unit_id,
+            )
+            if raw is None:
+                last_err = err or last_err
+            else:
+                accepted = raw
+
         if accepted is None:
             audits.append(
                 {
@@ -234,6 +253,9 @@ def run_pass_b(
                     "pass": "B",
                     "path": "llm",
                     "fallback": True,
+                    "fallback_judge": getattr(fallback_judge, "name", None)
+                    if used_fallback
+                    else None,
                     "last_error": last_err,
                 }
             )
@@ -268,6 +290,7 @@ def run_pass_b(
                         "span_out": e.span_out,
                         "tier": e.tier,
                         "anchor": e.anchor,
+                        "fallback_judge_ok": used_fallback or None,
                     }
                 )
             if not judgment.edits:
@@ -280,6 +303,7 @@ def run_pass_b(
                         "anchor": "meeting_draft",
                         "span_asr": text,
                         "span_out": new_text,
+                        "fallback_judge_ok": used_fallback or None,
                     }
                 )
             # Refresh meeting draft for subsequent turns

@@ -124,3 +124,45 @@ def test_pass_b_with_mock_llm_smoke():
         config=PipelineConfig(),
     )
     assert "账号" in out[0] or out[0] == "帐号异常"
+
+
+def test_pass_b_fallback_judge_after_primary_fails():
+    turns = [Turn(0, 2, "s0", "系统奔至了")]
+    draft = {0: "系统奔至了"}
+
+    class AlwaysBad:
+        name = "qwen"
+
+        def judge(self, **kwargs):
+            return {"text": "broken"}  # missing required fields
+
+    class DeepSeekOk:
+        name = "deepseek"
+
+        def judge(self, **kwargs):
+            text = kwargs["hypotheses"][0].text
+            return {
+                "text": text.replace("奔至", "蹦字"),
+                "base_model": "draft",
+                "edits": [
+                    {
+                        "span_asr": "奔至",
+                        "span_out": "蹦字",
+                        "tier": "C",
+                        "pinyin_asr": "benzhi",
+                        "pinyin_out": "bengzi",
+                        "anchor": "meeting_draft",
+                    }
+                ],
+                "overlap": False,
+            }
+
+    out, audits = run_pass_b(
+        turns,
+        draft,
+        llm_judge=AlwaysBad(),
+        fallback_judge=DeepSeekOk(),
+        config=PipelineConfig(llm_max_retries=1),
+    )
+    assert "蹦字" in out[0]
+    assert any(a.get("fallback_judge_ok") for a in audits)
