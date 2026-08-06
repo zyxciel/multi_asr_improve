@@ -5,60 +5,45 @@ import json
 import sys
 from pathlib import Path
 
+from stage2_asr.batch import build_runners, run_batch
 from stage2_asr.pipeline import run_pipeline
-from stage2_asr.runners.ensemble import EnsembleAsrRunner
-from stage2_asr.runners.firered_asr2s import FireRedAsr2sConfig, FireRedAsr2sRunner
-from stage2_asr.runners.llm_deepseek import DeepSeekLlmJudge
-from stage2_asr.runners.llm_qwen36 import Qwen36LlmJudge
-from stage2_asr.runners.mock_asr import MockAsrRunner
-from stage2_asr.runners.mock_llm import MockLlmJudge
-from stage2_asr.runners.qwen3_asr import Qwen3AsrRunner
 from stage2_asr.types import PipelineConfig
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="stage2-asr", description="Stage-2 multi-ASR + LLM fusion")
-    sub = parser.add_subparsers(dest="cmd", required=True)
-
-    run_p = sub.add_parser("run", help="Run Stage-2 on a Mode-C fusion JSON")
-    run_p.add_argument("--input", required=True, help="Path to mode_c.json")
-    run_p.add_argument("--audio", required=True, help="Path to prepared wav")
-    run_p.add_argument("--work-dir", required=True, help="Output / cache directory")
-    run_p.add_argument("--mock", action="store_true", help="Use mock ASR/LLM (no model weights)")
-    run_p.add_argument(
+def _add_common_run_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--mock", action="store_true", help="Use mock ASR/LLM (no model weights)")
+    p.add_argument(
         "--backend",
         choices=["mock", "real"],
         default=None,
         help="Backend selection (default: mock if --mock else real)",
     )
-    run_p.add_argument("--mock-hyps", default=None, help="Optional mock hypothesis fixture JSON")
-    run_p.add_argument("--hotwords", default=None, help="Optional hotword list JSON")
-    run_p.add_argument(
+    p.add_argument("--mock-hyps", default=None, help="Optional mock hypothesis fixture JSON")
+    p.add_argument("--hotwords", default=None, help="Optional hotword list JSON")
+    p.add_argument(
         "--stage",
         default="all",
         choices=["all", "asr", "pass_a", "pass_b", "llm"],
         help="Execution stage: all | asr | pass_a | pass_b | llm",
     )
-    run_p.add_argument(
+    p.add_argument(
         "--asr-models",
         default="moss,qwen,firered",
         help="Comma-separated ASR models for ASR stage/cache: moss,qwen,firered",
     )
-    run_p.add_argument("--max-asr-seconds", type=float, default=30.0)
-    run_p.add_argument("--qwen-model-id", default="Qwen/Qwen3-ASR-1.7B")
-    run_p.add_argument("--llm-model-id", default="Qwen/Qwen3.6-27B")
-    run_p.add_argument("--deepseek-model-id", default="deepseek-ai/DeepSeek-V2.5")
-    run_p.add_argument(
+    p.add_argument("--max-asr-seconds", type=float, default=30.0)
+    p.add_argument("--qwen-model-id", default="Qwen/Qwen3-ASR-1.7B")
+    p.add_argument("--llm-model-id", default="Qwen/Qwen3.6-27B")
+    p.add_argument("--deepseek-model-id", default="deepseek-ai/DeepSeek-V2.5")
+    p.add_argument(
         "--no-deepseek-fallback",
         action="store_true",
         help="Disable DeepSeek judge fallback after Qwen retries",
     )
-    run_p.add_argument("--enable-real", action="store_true", help="Allow real runners to load models")
+    p.add_argument("--enable-real", action="store_true", help="Allow real runners to load models")
 
-    args = parser.parse_args(argv)
-    if args.cmd != "run":
-        parser.error(f"unknown command {args.cmd}")
 
+def _resolve_backend(args: argparse.Namespace) -> str | None:
     backend = args.backend or ("mock" if args.mock or not args.enable_real else "real")
     if backend == "real" and not args.enable_real:
         print(
@@ -66,44 +51,39 @@ def main(argv: list[str] | None = None) -> int:
             "Use --mock for offline tests.",
             file=sys.stderr,
         )
+        return None
+    return backend
+
+
+def _load_hotwords(path: str | None) -> list[str]:
+    if not path:
+        return []
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def _cmd_run(args: argparse.Namespace) -> int:
+    backend = _resolve_backend(args)
+    if backend is None:
         return 2
 
     work_dir = Path(args.work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
     cfg = PipelineConfig(max_asr_seconds=float(args.max_asr_seconds))
-
     stage = str(args.stage).lower()
     asr_models = [m.strip().lower() for m in str(args.asr_models).split(",") if m.strip()]
-    needs_asr = stage in {"all", "asr"}
-    needs_llm = stage in {"all", "pass_a", "pass_b", "llm"}
+    mock_hyps = Path(args.mock_hyps) if args.mock_hyps else None
 
-    fallback_judge = None
-    asr = MockAsrRunner()  # lightweight default when stage does not need ASR.
-    llm = MockLlmJudge()   # lightweight default when stage does not need LLM.
-    if backend == "mock":
-        if needs_asr:
-            hyp_path = Path(args.mock_hyps) if args.mock_hyps else None
-            asr = MockAsrRunner(fixture_path=hyp_path)
-        if needs_llm:
-            llm = MockLlmJudge()
-    else:
-        if needs_asr:
-            asr = EnsembleAsrRunner(
-                Qwen3AsrRunner(enabled=True, model_id=args.qwen_model_id, work_dir=work_dir),
-                FireRedAsr2sRunner(enabled=True, config=FireRedAsr2sConfig(vad=False, lid=True, punc=True)),
-            )
-        if needs_llm:
-            llm = Qwen36LlmJudge(enabled=True, model_id=args.llm_model_id, temperature=0.1)
-            if not args.no_deepseek_fallback:
-                fallback_judge = DeepSeekLlmJudge(
-                    enabled=True,
-                    model_id=args.deepseek_model_id,
-                    temperature=0.1,
-                )
-
-    hotwords: list[str] = []
-    if args.hotwords:
-        hotwords = json.loads(Path(args.hotwords).read_text(encoding="utf-8"))
+    asr, llm, fallback_judge = build_runners(
+        backend=backend,
+        stage=stage,
+        work_dir=work_dir,
+        enable_real=bool(args.enable_real),
+        mock_hyps=mock_hyps,
+        qwen_model_id=args.qwen_model_id,
+        llm_model_id=args.llm_model_id,
+        deepseek_model_id=args.deepseek_model_id,
+        no_deepseek_fallback=bool(args.no_deepseek_fallback),
+    )
 
     result = run_pipeline(
         input_json=Path(args.input),
@@ -112,7 +92,7 @@ def main(argv: list[str] | None = None) -> int:
         asr_runner=asr,
         llm_judge=llm,
         config=cfg,
-        hotwords=hotwords,
+        hotwords=_load_hotwords(args.hotwords),
         fallback_judge=fallback_judge,
         stage=stage,
         asr_models=asr_models,
@@ -136,6 +116,112 @@ def main(argv: list[str] | None = None) -> int:
         payload["asr_models"] = result["asr_models"]
     print(json.dumps(payload, ensure_ascii=False))
     return 0
+
+
+def _cmd_run_batch(args: argparse.Namespace) -> int:
+    backend = _resolve_backend(args)
+    if backend is None:
+        return 2
+
+    datasets = None
+    if args.datasets:
+        datasets = [d.strip() for d in str(args.datasets).split(",") if d.strip()]
+    asr_models = [m.strip().lower() for m in str(args.asr_models).split(",") if m.strip()]
+    cfg = PipelineConfig(max_asr_seconds=float(args.max_asr_seconds))
+    mock_hyps = Path(args.mock_hyps) if args.mock_hyps else None
+
+    summary = run_batch(
+        wav_benchmark=Path(args.wav_benchmark),
+        mode_c_benchmark=Path(args.mode_c_benchmark),
+        work_root=Path(args.work_root),
+        backend=backend,
+        stage=str(args.stage).lower(),
+        asr_models=asr_models,
+        hotwords=_load_hotwords(args.hotwords),
+        datasets=datasets,
+        limit=args.limit,
+        dry_run=bool(args.dry_run),
+        enable_real=bool(args.enable_real),
+        mock_hyps=mock_hyps,
+        config=cfg,
+        qwen_model_id=args.qwen_model_id,
+        llm_model_id=args.llm_model_id,
+        deepseek_model_id=args.deepseek_model_id,
+        no_deepseek_fallback=bool(args.no_deepseek_fallback),
+        continue_on_error=not bool(args.fail_fast),
+    )
+    print(
+        json.dumps(
+            {
+                "ok": summary["n_error"] == 0,
+                "backend": summary["backend"],
+                "stage": summary["stage"],
+                "n_paired": summary["n_paired"],
+                "n_ok": summary["n_ok"],
+                "n_skip": summary["n_skip"],
+                "n_error": summary["n_error"],
+                "summary": str(Path(args.work_root) / "batch_summary.json"),
+            },
+            ensure_ascii=False,
+        )
+    )
+    return 1 if summary["n_error"] else 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="stage2-asr", description="Stage-2 multi-ASR + LLM fusion")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    run_p = sub.add_parser("run", help="Run Stage-2 on a single Mode-C + wav pair")
+    run_p.add_argument("--input", required=True, help="Path to mode_c.json")
+    run_p.add_argument("--audio", required=True, help="Path to prepared wav")
+    run_p.add_argument("--work-dir", required=True, help="Output / cache directory")
+    _add_common_run_args(run_p)
+
+    batch_p = sub.add_parser(
+        "run-batch",
+        help="Run Stage-2 over benchmark/*/Audio wavs paired with Mode-C JSONs",
+    )
+    batch_p.add_argument(
+        "--wav-benchmark",
+        required=True,
+        help="Root .../benchmark containing {dataset}/Audio/*.wav",
+    )
+    batch_p.add_argument(
+        "--mode-c-benchmark",
+        required=True,
+        help="Root .../benchmark containing {dataset}/Audio/{stem}/mode_c.json",
+    )
+    batch_p.add_argument(
+        "--work-root",
+        required=True,
+        help="Output root; writes work-root/{dataset}/{stem}/ plus batch_summary.json",
+    )
+    batch_p.add_argument(
+        "--datasets",
+        default=None,
+        help="Optional comma-separated dataset names under benchmark (default: all)",
+    )
+    batch_p.add_argument("--limit", type=int, default=None, help="Optional max number of paired samples")
+    batch_p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Only discover pairs and write batch_summary.json (no inference)",
+    )
+    batch_p.add_argument(
+        "--fail-fast",
+        action="store_true",
+        help="Stop on first sample error (default: continue and record errors)",
+    )
+    _add_common_run_args(batch_p)
+
+    args = parser.parse_args(argv)
+    if args.cmd == "run":
+        return _cmd_run(args)
+    if args.cmd == "run-batch":
+        return _cmd_run_batch(args)
+    parser.error(f"unknown command {args.cmd}")
+    return 2
 
 
 if __name__ == "__main__":

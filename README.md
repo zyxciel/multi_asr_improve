@@ -61,6 +61,52 @@ FireRed system config used by the adapter:
 
 `enable_vad=False`, `enable_lid=True`, `enable_punc=True`
 
+## Dataset batch mode
+
+Pairs wavs and Mode-C JSONs under parallel `benchmark/` trees:
+
+```text
+{wav-benchmark}/{dataset}/Audio/{stem}.wav
+{mode-c-benchmark}/{dataset}/Audio/{stem}/mode_c.json
+→ work-root/{dataset}/{stem}/
+```
+
+Example (your layout):
+
+```bash
+# dry-run: list pairs / missing mode_c without loading models
+stage2-asr run-batch \
+  --wav-benchmark /home/ma-user/work/dataset/audio_process_ulan_obs/zyx/test_datasets/benchmark \
+  --mode-c-benchmark /home/ma-user/work/dataset/audio_process_ulan_obs/zyx/DiarizenMossFusion/benchmark \
+  --work-root /home/ma-user/work/dataset/audio_process_ulan_obs/zyx/stage2_out \
+  --dry-run
+
+# staged ASR then LLM on one dataset
+stage2-asr run-batch \
+  --wav-benchmark .../test_datasets/benchmark \
+  --mode-c-benchmark .../DiarizenMossFusion/benchmark \
+  --work-root .../stage2_out \
+  --datasets some_dataset_name \
+  --backend real --enable-real --stage asr --asr-models qwen
+
+stage2-asr run-batch \
+  --wav-benchmark .../test_datasets/benchmark \
+  --mode-c-benchmark .../DiarizenMossFusion/benchmark \
+  --work-root .../stage2_out \
+  --datasets some_dataset_name \
+  --backend real --enable-real --stage asr --asr-models firered
+
+stage2-asr run-batch \
+  --wav-benchmark .../test_datasets/benchmark \
+  --mode-c-benchmark .../DiarizenMossFusion/benchmark \
+  --work-root .../stage2_out \
+  --datasets some_dataset_name \
+  --backend real --enable-real --stage llm
+```
+
+Useful flags: `--limit N`, `--fail-fast`, `--hotwords path.json`.  
+Summary + skips/errors: `work-root/batch_summary.json`.
+
 ## Eval B0 (MOSS-from-fusion baseline)
 
 ```bash
