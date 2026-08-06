@@ -15,9 +15,26 @@ from stage2_asr.validate import validate_turns
 
 
 def load_mode_c(path: Path) -> tuple[list[Turn], dict[str, Any]]:
+    """
+    Load Mode-C fusion JSON.
+
+    Supported shapes:
+    - {"meta": {...}, "turns": [{start, end, text, speaker_id, ...}, ...]}
+    - [{start, end, text, speaker_id}, ...]  (plain turn list)
+    """
     data = json.loads(path.read_text(encoding="utf-8"))
-    turns = [Turn.from_dict(t) for t in data.get("turns", [])]
-    return turns, data
+    if isinstance(data, list):
+        raw_doc: dict[str, Any] = {"turns": data}
+        turn_dicts = data
+    elif isinstance(data, dict):
+        raw_doc = data
+        turn_dicts = data.get("turns", [])
+    else:
+        raise ValueError(f"unsupported mode_c JSON root type: {type(data).__name__}")
+    if not isinstance(turn_dicts, list):
+        raise ValueError("mode_c turns must be a JSON array")
+    turns = [Turn.from_dict(t) for t in turn_dicts if isinstance(t, dict)]
+    return turns, raw_doc
 
 
 def _load_audio_optional(audio_path: Path, sr: int) -> np.ndarray | None:
