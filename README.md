@@ -127,4 +127,6 @@ third_party/         # optional local clones (gitignored)
 
 ## Artifacts
 
-`asr_units.json` (reloaded on `pass_a`/`pass_b`/`llm` so unit_ids stay stable), `asr_hypotheses.json` (hyps merge across `asr` and `all` re-runs), `mode_c_draft.json`, `mode_c_asr_final.json`, `llm_edits.jsonl` (Pass A preserved when re-running `pass_b`), `pass_stats.json` (merged across staged passes), `asr_cache/`, `crops/`
+`asr_units.json` (reloaded on `pass_a`/`pass_b`/`llm` so unit_ids stay stable), `asr_hypotheses.json` (hyps merge across `asr` and `all` re-runs), `mode_c_draft.json`, `mode_c_asr_final.json`, `llm_edits.jsonl` (Pass A preserved when re-running `pass_b`), `pass_stats.json` (merged across staged passes), `asr_cache/`, `crops/` (reused across ASR model runs; not rewritten if present)
+
+Progress logs go to **stderr** (`[asr]`, `[pass_a]`, `[pass_b]`, `[batch]`); the final JSON summary stays on **stdout**.

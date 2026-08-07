@@ -51,13 +51,20 @@ def crop_unit_wav(
     work_dir: Path,
     unit_id: str,
     sr: int = 16000,
+    reuse_existing: bool = True,
 ) -> Path:
-    """Crop [start, end] from prepared wav into work_dir/crops/{unit_id}.wav."""
+    """Crop [start, end] from prepared wav into work_dir/crops/{unit_id}.wav.
+
+    When reuse_existing is True and the crop file already exists, return it
+    without re-decoding the full meeting wav (important for staged ASR re-runs).
+    """
+    out = work_dir / "crops" / f"{unit_id}.wav"
+    if reuse_existing and out.is_file() and out.stat().st_size > 0:
+        return out
     audio, file_sr = load_wav_mono16k(audio_path, target_sr=sr)
     s = max(0, int(start * file_sr))
     e = min(len(audio), max(s + 1, int(end * file_sr)))
     crop = audio[s:e]
-    out = work_dir / "crops" / f"{unit_id}.wav"
     write_wav_mono16k(out, crop, sr=file_sr)
     return out
 

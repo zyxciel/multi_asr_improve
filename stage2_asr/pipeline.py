@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,11 @@ from stage2_asr.pass_b import run_pass_b
 from stage2_asr.types import AsrStatus, AsrUnit, Hypothesis, PipelineConfig, Turn
 from stage2_asr.units import build_asr_units
 from stage2_asr.validate import validate_turns
+
+
+def _log(msg: str) -> None:
+    """Progress to stderr so stdout stays machine-readable JSON."""
+    print(msg, file=sys.stderr, flush=True)
 
 
 def load_mode_c(path: Path) -> tuple[list[Turn], dict[str, Any]]:
@@ -309,7 +315,14 @@ def run_pipeline(
     units_by_id = _unit_by_id(units)
 
     if stage in {"all", "asr"}:
+        asr_units = [u for u in units if not u.skip_asr]
+        n_asr = len(asr_units)
+        _log(
+            f"[stage={stage}] ASR start: {n_asr} units "
+            f"(models={sorted(normalized_models)}, work_dir={work_dir})"
+        )
         built_records: list[dict] = []
+        asr_i = 0
         for unit in units:
             if unit.skip_asr:
                 prior = existing_by_unit.get(unit.unit_id, {})
@@ -326,8 +339,10 @@ def run_pipeline(
                 )
                 continue
 
+            asr_i += 1
             cache = _cache_path(work_dir, unit.unit_id, asr_runner_name)
             if cache.exists():
+                _log(f"[asr] {asr_i}/{n_asr} {unit.unit_id} cache-hit")
                 cached = json.loads(cache.read_text(encoding="utf-8"))
                 hyps = [
                     Hypothesis(
@@ -340,24 +355,33 @@ def run_pipeline(
                 ]
             else:
                 crop_path = None
+                crop_note = "no-crop"
                 if audio_path.exists():
                     try:
-                        crop_path = str(
-                            crop_unit_wav(
-                                audio_path,
-                                unit.start,
-                                unit.end,
-                                work_dir=work_dir,
-                                unit_id=unit.unit_id,
-                                sr=cfg.sample_rate,
-                            )
+                        crop_file = work_dir / "crops" / f"{unit.unit_id}.wav"
+                        reused = crop_file.is_file() and crop_file.stat().st_size > 0
+                        crop = crop_unit_wav(
+                            audio_path,
+                            unit.start,
+                            unit.end,
+                            work_dir=work_dir,
+                            unit_id=unit.unit_id,
+                            sr=cfg.sample_rate,
+                            reuse_existing=True,
                         )
-                    except Exception:
+                        crop_path = str(crop)
+                        crop_note = "reuse-crop" if reused else "new-crop"
+                    except Exception as exc:  # noqa: BLE001
                         crop_path = None
+                        crop_note = f"crop-failed:{exc}"
                 selected_for_call = set(normalized_models)
                 if unit.heavy_overlap and "moss" not in selected_for_call:
                     # Heavy overlap still needs an anchor hypothesis; moss is CPU-cheap.
                     selected_for_call = set(selected_for_call) | {"moss"}
+                _log(
+                    f"[asr] {asr_i}/{n_asr} {unit.unit_id} transcribe "
+                    f"({crop_note}) models={sorted(selected_for_call)}"
+                )
                 try:
                     hyps = asr_runner.transcribe_unit(
                         unit,
@@ -396,6 +420,7 @@ def run_pipeline(
                 }
             )
 
+        _log(f"[stage={stage}] ASR done: wrote {hyp_path}")
         _save_hyp_records(
             hyp_path,
             built_records,
@@ -418,6 +443,7 @@ def run_pipeline(
             raise FileNotFoundError(
                 f"{hyp_path} missing; run stage=asr first to prepare ASR hypotheses."
             )
+        _log(f"[stage={stage}] loaded {len(hyp_records)} ASR hyp records from {hyp_path}")
 
     overlap_turn_indices, heavy_overlap_turn_indices, moss_texts = _rebuild_overlap_metadata(
         hyp_records, turns
@@ -432,6 +458,7 @@ def run_pipeline(
         draft_doc = json.loads(draft_path.read_text(encoding="utf-8"))
         draft_turns = [Turn.from_dict(t) for t in draft_doc.get("turns", [])]
         draft_texts = {i: t.text for i, t in enumerate(draft_turns)}
+        _log(f"[pass_b] start: {len(draft_turns)} turns work_dir={work_dir}")
         final_map, pass_b_audits = run_pass_b(
             turns,
             draft_texts,
@@ -443,6 +470,7 @@ def run_pipeline(
             heavy_overlap_turn_indices=heavy_overlap_turn_indices,
             moss_texts=moss_texts,
         )
+        _log(f"[pass_b] done: {len(pass_b_audits)} audits")
         final_turns = []
         for i, t in enumerate(turns):
             text = final_map.get(i, t.text)
@@ -467,6 +495,7 @@ def run_pipeline(
         _rewrite_edits_pass_b(edits_path, pass_b_audits)
         stats_path = work_dir / "pass_stats.json"
         pass_stats = _merge_pass_stats(stats_path, {"pass_b": _summarize_pass_b(pass_b_audits)})
+        _log(f"[pass_b] wrote {final_path}")
         return {
             "stage": "pass_b",
             "final_path": final_path,
@@ -478,13 +507,18 @@ def run_pipeline(
 
     draft_texts: dict[int, str] = {i: t.text for i, t in enumerate(turns)}
     pass_a_audits: list[dict] = []
-    for record in hyp_records:
+    pass_a_records = [
+        r
+        for r in hyp_records
+        if str(r.get("unit_id", "")) in units_by_id
+        and not bool(r.get("skipped"))
+        and any(isinstance(h, dict) for h in (r.get("hyps") or []))
+    ]
+    n_pass_a = len(pass_a_records)
+    _log(f"[pass_a] start: {n_pass_a} units work_dir={work_dir}")
+    for ai, record in enumerate(pass_a_records, start=1):
         unit_id = str(record.get("unit_id", ""))
-        if not unit_id or unit_id not in units_by_id:
-            continue
         unit = units_by_id[unit_id]
-        if bool(record.get("skipped")):
-            continue
         hyps = [
             Hypothesis(
                 model=h["model"],
@@ -498,6 +532,7 @@ def run_pipeline(
         if not hyps:
             continue
 
+        _log(f"[pass_a] {ai}/{n_pass_a} {unit_id}")
         text, audit = run_pass_a_for_unit(
             unit=unit,
             turns=turns,
@@ -511,6 +546,7 @@ def run_pipeline(
         pass_a_audits.append(audit)
         for ti, piece in _distribute_text(unit.turn_indices, text, turns).items():
             draft_texts[ti] = piece
+    _log(f"[pass_a] done: {len(pass_a_audits)} judged/skipped")
 
     _save_hyp_records(
         hyp_path,
@@ -538,6 +574,7 @@ def run_pipeline(
     }
     draft_path = work_dir / "mode_c_draft.json"
     draft_path.write_text(json.dumps(draft_doc, ensure_ascii=False, indent=2), encoding="utf-8")
+    _log(f"[pass_a] wrote {draft_path}")
     if stage == "pass_a":
         edits_path = work_dir / "llm_edits.jsonl"
         with edits_path.open("w", encoding="utf-8") as f:
@@ -554,6 +591,7 @@ def run_pipeline(
             "pass_stats": pass_stats,
         }
 
+    _log(f"[pass_b] start: {len(turns)} turns work_dir={work_dir}")
     final_map, pass_b_audits = run_pass_b(
         turns,
         draft_texts,
@@ -565,6 +603,7 @@ def run_pipeline(
         heavy_overlap_turn_indices=heavy_overlap_turn_indices,
         moss_texts=moss_texts,
     )
+    _log(f"[pass_b] done: {len(pass_b_audits)} audits")
     final_turns = []
     for i, t in enumerate(turns):
         text = final_map.get(i, t.text)
@@ -600,6 +639,7 @@ def run_pipeline(
     }
     stats_path = work_dir / "pass_stats.json"
     stats_path.write_text(json.dumps(pass_stats, ensure_ascii=False, indent=2), encoding="utf-8")
+    _log(f"[stage={stage}] done: final={final_path} draft={draft_path}")
 
     return {
         "stage": stage,

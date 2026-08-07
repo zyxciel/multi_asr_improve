@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,6 +11,10 @@ from typing import Any, Iterable
 
 from stage2_asr.pipeline import run_pipeline
 from stage2_asr.types import PipelineConfig
+
+
+def _log(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)
 
 
 @dataclass(frozen=True)
@@ -206,6 +211,7 @@ def run_batch(
             for p in pairs
         ]
         _write_summary(work_root, summary)
+        _log(f"[batch] dry-run: paired={len(pairs)} skipped={len(skips)}")
         return summary
 
     # Load runners once; work_dir on Qwen is only used for optional cache hints.
@@ -221,13 +227,19 @@ def run_batch(
         no_deepseek_fallback=no_deepseek_fallback,
     )
 
-    for pair in pairs:
+    n_pairs = len(pairs)
+    _log(
+        f"[batch] start stage={stage} paired={n_pairs} skipped={len(skips)} "
+        f"models={asr_models} work_root={work_root}"
+    )
+    for bi, pair in enumerate(pairs, start=1):
         sample_work = pair.work_dir(work_root)
         sample_work.mkdir(parents=True, exist_ok=True)
         row: dict[str, Any] = {
             **pair.to_dict(),
             "work_dir": str(sample_work),
         }
+        _log(f"[batch] {bi}/{n_pairs} {pair.sample_id} begin")
         try:
             result = run_pipeline(
                 input_json=pair.mode_c,
@@ -251,11 +263,13 @@ def run_batch(
             if result.get("asr_hypotheses_path") is not None:
                 row["asr_hypotheses"] = str(result["asr_hypotheses_path"])
             summary["n_ok"] += 1
+            _log(f"[batch] {bi}/{n_pairs} {pair.sample_id} ok")
         except Exception as exc:  # noqa: BLE001
             row["status"] = "error"
             row["error"] = str(exc)
             row["traceback"] = traceback.format_exc(limit=5)
             summary["n_error"] += 1
+            _log(f"[batch] {bi}/{n_pairs} {pair.sample_id} error: {exc}")
             if not continue_on_error:
                 summary["results"].append(row)
                 _write_summary(work_root, summary)
@@ -263,6 +277,10 @@ def run_batch(
         summary["results"].append(row)
 
     _write_summary(work_root, summary)
+    _log(
+        f"[batch] done ok={summary['n_ok']} error={summary['n_error']} "
+        f"skip={summary['n_skip']} summary={work_root / 'batch_summary.json'}"
+    )
     return summary
 
 
