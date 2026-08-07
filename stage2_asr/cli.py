@@ -41,6 +41,39 @@ def _add_common_run_args(p: argparse.ArgumentParser) -> None:
         help="Disable DeepSeek judge fallback after Qwen retries",
     )
     p.add_argument("--enable-real", action="store_true", help="Allow real runners to load models")
+    p.add_argument(
+        "--llm-backend",
+        choices=["transformers", "vllm"],
+        default="transformers",
+        help="LLM serving backend: local transformers or OpenAI-compat vLLM/vLLM-Ascend HTTP",
+    )
+    p.add_argument(
+        "--llm-base-url",
+        default=None,
+        help="OpenAI-compat base URL for --llm-backend vllm (e.g. http://127.0.0.1:8000 or .../v1)",
+    )
+    p.add_argument(
+        "--llm-api-key",
+        default=None,
+        help="Optional Bearer token for OpenAI-compat server",
+    )
+    p.add_argument(
+        "--llm-timeout-s",
+        type=float,
+        default=300.0,
+        help="HTTP timeout seconds for vLLM chat completions",
+    )
+    p.add_argument(
+        "--deepseek-base-url",
+        default=None,
+        help="Optional separate OpenAI-compat URL for DeepSeek fallback (else reuse --llm-base-url)",
+    )
+    p.add_argument(
+        "--pass-a-batch-size",
+        type=int,
+        default=1,
+        help="Concurrent Pass A LLM calls (use >1 with --llm-backend vllm; Ascend continuous batching)",
+    )
 
 
 def _resolve_backend(args: argparse.Namespace) -> str | None:
@@ -52,6 +85,14 @@ def _resolve_backend(args: argparse.Namespace) -> str | None:
             file=sys.stderr,
         )
         return None
+    if getattr(args, "llm_backend", "transformers") == "vllm" and not getattr(args, "llm_base_url", None):
+        if backend == "real" and str(args.stage).lower() in {"all", "pass_a", "pass_b", "llm"}:
+            print(
+                "--llm-backend vllm requires --llm-base-url "
+                "(OpenAI-compatible server, e.g. vLLM-Ascend on Ascend 910B).",
+                file=sys.stderr,
+            )
+            return None
     return backend
 
 
@@ -61,6 +102,13 @@ def _load_hotwords(path: str | None) -> list[str]:
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
+def _pipeline_config(args: argparse.Namespace) -> PipelineConfig:
+    return PipelineConfig(
+        max_asr_seconds=float(args.max_asr_seconds),
+        pass_a_batch_size=max(1, int(args.pass_a_batch_size)),
+    )
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
     backend = _resolve_backend(args)
     if backend is None:
@@ -68,7 +116,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
     work_dir = Path(args.work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
-    cfg = PipelineConfig(max_asr_seconds=float(args.max_asr_seconds))
+    cfg = _pipeline_config(args)
     stage = str(args.stage).lower()
     asr_models = [m.strip().lower() for m in str(args.asr_models).split(",") if m.strip()]
     mock_hyps = Path(args.mock_hyps) if args.mock_hyps else None
@@ -83,6 +131,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
         llm_model_id=args.llm_model_id,
         deepseek_model_id=args.deepseek_model_id,
         no_deepseek_fallback=bool(args.no_deepseek_fallback),
+        llm_backend=args.llm_backend,
+        llm_base_url=args.llm_base_url,
+        llm_api_key=args.llm_api_key,
+        llm_timeout_s=float(args.llm_timeout_s),
+        deepseek_base_url=args.deepseek_base_url,
     )
 
     result = run_pipeline(
@@ -101,6 +154,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         "ok": True,
         "backend": backend,
         "stage": stage,
+        "llm_backend": args.llm_backend,
         "n_turns": result.get("n_turns"),
         "n_units": result.get("n_units"),
     }
@@ -110,6 +164,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
         payload["draft"] = str(result["draft_path"])
     if result.get("stats_path") is not None:
         payload["pass_stats"] = str(result["stats_path"])
+    if result.get("llm_log_path") is not None:
+        payload["llm_log"] = str(result["llm_log_path"])
     if result.get("asr_hypotheses_path") is not None:
         payload["asr_hypotheses"] = str(result["asr_hypotheses_path"])
     if result.get("asr_models") is not None:
@@ -127,7 +183,7 @@ def _cmd_run_batch(args: argparse.Namespace) -> int:
     if args.datasets:
         datasets = [d.strip() for d in str(args.datasets).split(",") if d.strip()]
     asr_models = [m.strip().lower() for m in str(args.asr_models).split(",") if m.strip()]
-    cfg = PipelineConfig(max_asr_seconds=float(args.max_asr_seconds))
+    cfg = _pipeline_config(args)
     mock_hyps = Path(args.mock_hyps) if args.mock_hyps else None
 
     summary = run_batch(
@@ -149,6 +205,11 @@ def _cmd_run_batch(args: argparse.Namespace) -> int:
         deepseek_model_id=args.deepseek_model_id,
         no_deepseek_fallback=bool(args.no_deepseek_fallback),
         continue_on_error=not bool(args.fail_fast),
+        llm_backend=args.llm_backend,
+        llm_base_url=args.llm_base_url,
+        llm_api_key=args.llm_api_key,
+        llm_timeout_s=float(args.llm_timeout_s),
+        deepseek_base_url=args.deepseek_base_url,
     )
     print(
         json.dumps(
@@ -156,6 +217,7 @@ def _cmd_run_batch(args: argparse.Namespace) -> int:
                 "ok": summary["n_error"] == 0,
                 "backend": summary["backend"],
                 "stage": summary["stage"],
+                "llm_backend": summary.get("llm_backend"),
                 "n_paired": summary["n_paired"],
                 "n_ok": summary["n_ok"],
                 "n_skip": summary["n_skip"],

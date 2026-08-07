@@ -8,7 +8,8 @@ from typing import Any
 import numpy as np
 
 from stage2_asr.audio_io import crop_unit_wav, load_wav_mono16k
-from stage2_asr.pass_a import run_pass_a_for_unit
+from stage2_asr.llm_log import LlmInferLogger
+from stage2_asr.pass_a import run_pass_a_batch, run_pass_a_for_unit
 from stage2_asr.pass_b import run_pass_b
 from stage2_asr.types import AsrStatus, AsrUnit, Hypothesis, PipelineConfig, Turn
 from stage2_asr.units import build_asr_units
@@ -18,6 +19,14 @@ from stage2_asr.validate import validate_turns
 def _log(msg: str) -> None:
     """Progress to stderr so stdout stays machine-readable JSON."""
     print(msg, file=sys.stderr, flush=True)
+
+
+def _attach_llm_logger(judge, logger: LlmInferLogger | None) -> None:
+    if judge is None or logger is None:
+        return
+    if hasattr(judge, "log_fn"):
+        judge.log_fn = logger.log
+
 
 
 def load_mode_c(path: Path) -> tuple[list[Turn], dict[str, Any]]:
@@ -291,6 +300,48 @@ def run_pipeline(
 
     work_dir.mkdir(parents=True, exist_ok=True)
 
+    llm_logger: LlmInferLogger | None = None
+    llm_log_path: Path | None = None
+    if stage in {"all", "pass_a", "pass_b", "llm"}:
+        llm_log_path = work_dir / "llm_infer.jsonl"
+        llm_logger = LlmInferLogger(llm_log_path)
+        _attach_llm_logger(llm_judge, llm_logger)
+        _attach_llm_logger(fallback_judge, llm_logger)
+        _log(f"[llm] infer log -> {llm_log_path}")
+
+    try:
+        return _run_pipeline_body(
+            input_json=input_json,
+            audio_path=audio_path,
+            work_dir=work_dir,
+            asr_runner=asr_runner,
+            llm_judge=llm_judge,
+            cfg=cfg,
+            hotwords=hotwords,
+            fallback_judge=fallback_judge,
+            stage=stage,
+            normalized_models=normalized_models,
+            llm_log_path=llm_log_path,
+        )
+    finally:
+        if llm_logger is not None:
+            llm_logger.close()
+
+
+def _run_pipeline_body(
+    *,
+    input_json: Path,
+    audio_path: Path,
+    work_dir: Path,
+    asr_runner,
+    llm_judge,
+    cfg: PipelineConfig,
+    hotwords: list[str],
+    fallback_judge,
+    stage: str,
+    normalized_models: list[str],
+    llm_log_path: Path | None,
+) -> dict[str, Any]:
     raw_turns, raw_doc = load_mode_c(input_json)
     turns, skipped = validate_turns(raw_turns, cfg)
     audio = _load_audio_optional(audio_path, cfg.sample_rate)
@@ -313,6 +364,7 @@ def run_pipeline(
     existing_records = _load_hyp_records(hyp_path)
     existing_by_unit = _record_index(existing_records)
     units_by_id = _unit_by_id(units)
+
 
     if stage in {"all", "asr"}:
         asr_units = [u for u in units if not u.skip_asr]
@@ -500,25 +552,20 @@ def run_pipeline(
             "stage": "pass_b",
             "final_path": final_path,
             "stats_path": stats_path,
+            "llm_log_path": llm_log_path,
             "n_turns": len(final_turns),
             "n_units": len(units),
             "pass_stats": pass_stats,
         }
 
     draft_texts: dict[int, str] = {i: t.text for i, t in enumerate(turns)}
-    pass_a_audits: list[dict] = []
-    pass_a_records = [
-        r
-        for r in hyp_records
-        if str(r.get("unit_id", "")) in units_by_id
-        and not bool(r.get("skipped"))
-        and any(isinstance(h, dict) for h in (r.get("hyps") or []))
-    ]
-    n_pass_a = len(pass_a_records)
-    _log(f"[pass_a] start: {n_pass_a} units work_dir={work_dir}")
-    for ai, record in enumerate(pass_a_records, start=1):
+    pass_a_items: list[dict] = []
+    for record in hyp_records:
         unit_id = str(record.get("unit_id", ""))
-        unit = units_by_id[unit_id]
+        if not unit_id or unit_id not in units_by_id:
+            continue
+        if bool(record.get("skipped")):
+            continue
         hyps = [
             Hypothesis(
                 model=h["model"],
@@ -531,21 +578,28 @@ def run_pipeline(
         ]
         if not hyps:
             continue
+        pass_a_items.append({"unit": units_by_id[unit_id], "hyps": hyps})
 
-        _log(f"[pass_a] {ai}/{n_pass_a} {unit_id}")
-        text, audit = run_pass_a_for_unit(
-            unit=unit,
-            turns=turns,
-            hyps=hyps,
-            draft_texts=draft_texts,
-            llm_judge=llm_judge,
-            hotwords=hotwords,
-            config=cfg,
-            fallback_judge=fallback_judge,
+    n_pass_a = len(pass_a_items)
+    _log(
+        f"[pass_a] start: {n_pass_a} units "
+        f"batch_size={cfg.pass_a_batch_size} work_dir={work_dir}"
+    )
+    pass_a_results = run_pass_a_batch(
+        items=pass_a_items,
+        turns=turns,
+        draft_texts=draft_texts,
+        llm_judge=llm_judge,
+        hotwords=hotwords,
+        config=cfg,
+        fallback_judge=fallback_judge,
+    )
+    pass_a_audits = [audit for _, audit in pass_a_results]
+    for ai, (item, (text, audit)) in enumerate(zip(pass_a_items, pass_a_results), start=1):
+        _log(
+            f"[pass_a] {ai}/{n_pass_a} {item['unit'].unit_id} "
+            f"skipped={bool(audit.get('skipped_llm'))} fallback={bool(audit.get('fallback'))}"
         )
-        pass_a_audits.append(audit)
-        for ti, piece in _distribute_text(unit.turn_indices, text, turns).items():
-            draft_texts[ti] = piece
     _log(f"[pass_a] done: {len(pass_a_audits)} judged/skipped")
 
     _save_hyp_records(
@@ -586,6 +640,7 @@ def run_pipeline(
             "stage": "pass_a",
             "draft_path": draft_path,
             "stats_path": stats_path,
+            "llm_log_path": llm_log_path,
             "n_turns": len(draft_turns),
             "n_units": len(units),
             "pass_stats": pass_stats,
@@ -646,6 +701,7 @@ def run_pipeline(
         "final_path": final_path,
         "draft_path": draft_path,
         "stats_path": stats_path,
+        "llm_log_path": llm_log_path,
         "n_turns": len(final_turns),
         "n_units": len(units),
         "pass_stats": pass_stats,

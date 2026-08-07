@@ -130,6 +130,8 @@ class PipelineConfig:
     energy_window_ms: float = 25.0
     energy_hop_ms: float = 10.0
     edge_zone_ratio: float = 0.10
+    # Concurrent Pass A HTTP calls against vLLM/vLLM-Ascend (1 = sequential).
+    pass_a_batch_size: int = 1
 
 
 @dataclass

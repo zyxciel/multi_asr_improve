@@ -107,6 +107,28 @@ stage2-asr run-batch \
 Useful flags: `--limit N`, `--fail-fast`, `--hotwords path.json`.  
 Summary + skips/errors: `work-root/batch_summary.json`.
 
+## LLM backend (vLLM / Ascend 910B)
+
+The judge can call a remote **OpenAI-compatible** server instead of in-process `transformers`.
+On Ascend 910B, serve the model with **vLLM-Ascend** (or MindIE) and point Stage-2 at it — the client is pure HTTP (no NPU binding in this process).
+
+```bash
+# Example: start OpenAI-compat server on the Ascend node (adjust to your vLLM-Ascend launch)
+# vllm serve Qwen/Qwen3.6-27B --host 0.0.0.0 --port 8000 ...
+
+python -m stage2_asr.cli run \
+  --input mode_c.json --audio prepared.wav --work-dir out \
+  --backend real --enable-real --stage llm \
+  --llm-backend vllm \
+  --llm-base-url http://127.0.0.1:8000 \
+  --llm-model-id Qwen/Qwen3.6-27B \
+  --pass-a-batch-size 8
+```
+
+- `--pass-a-batch-size N` (>1): concurrent Pass A HTTP calls (server continuous-batches).
+- LLM inference traces: `work-dir/llm_infer.jsonl` (unit_id, latency, response snippet, errors).
+- Stderr still shows `[pass_a]` / `[pass_b]` progress; stdout remains the final JSON summary.
+
 ## Eval B0 (MOSS-from-fusion baseline)
 
 ```bash
@@ -127,6 +149,6 @@ third_party/         # optional local clones (gitignored)
 
 ## Artifacts
 
-`asr_units.json` (reloaded on `pass_a`/`pass_b`/`llm` so unit_ids stay stable), `asr_hypotheses.json` (hyps merge across `asr` and `all` re-runs), `mode_c_draft.json`, `mode_c_asr_final.json`, `llm_edits.jsonl` (Pass A preserved when re-running `pass_b`), `pass_stats.json` (merged across staged passes), `asr_cache/`, `crops/` (reused across ASR model runs; not rewritten if present)
+`asr_units.json` (reloaded on `pass_a`/`pass_b`/`llm` so unit_ids stay stable), `asr_hypotheses.json` (hyps merge across `asr` and `all` re-runs), `mode_c_draft.json`, `mode_c_asr_final.json`, `llm_edits.jsonl` (Pass A preserved when re-running `pass_b`), `pass_stats.json` (merged across staged passes), `llm_infer.jsonl` (LLM request/response traces for Pass A/B), `asr_cache/`, `crops/` (reused across ASR model runs; not rewritten if present)
 
 Progress logs go to **stderr** (`[asr]`, `[pass_a]`, `[pass_b]`, `[batch]`); the final JSON summary stays on **stdout**.

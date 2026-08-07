@@ -108,6 +108,11 @@ def build_runners(
     llm_model_id: str,
     deepseek_model_id: str,
     no_deepseek_fallback: bool,
+    llm_backend: str = "transformers",
+    llm_base_url: str | None = None,
+    llm_api_key: str | None = None,
+    llm_timeout_s: float = 300.0,
+    deepseek_base_url: str | None = None,
 ):
     """Construct ASR/LLM runners once for a batch (reuse across samples)."""
     from stage2_asr.runners.ensemble import EnsembleAsrRunner
@@ -143,12 +148,29 @@ def build_runners(
             ),
         )
     if needs_llm:
-        llm = Qwen36LlmJudge(enabled=True, model_id=llm_model_id, temperature=0.1)
+        llm = Qwen36LlmJudge(
+            enabled=True,
+            model_id=llm_model_id,
+            temperature=0.1,
+            backend=llm_backend,
+            base_url=llm_base_url,
+            api_key=llm_api_key,
+            timeout_s=llm_timeout_s,
+        )
         if not no_deepseek_fallback:
+            # Prefer a dedicated DeepSeek URL; else reuse primary vLLM URL if set.
+            fb_url = deepseek_base_url or (
+                llm_base_url if llm_backend == "vllm" else None
+            )
+            fb_backend = "vllm" if fb_url else llm_backend
             fallback_judge = DeepSeekLlmJudge(
                 enabled=True,
                 model_id=deepseek_model_id,
                 temperature=0.1,
+                backend=fb_backend,
+                base_url=fb_url,
+                api_key=llm_api_key,
+                timeout_s=llm_timeout_s,
             )
     return asr, llm, fallback_judge
 
@@ -173,6 +195,11 @@ def run_batch(
     deepseek_model_id: str = "deepseek-ai/DeepSeek-V2.5",
     no_deepseek_fallback: bool = False,
     continue_on_error: bool = True,
+    llm_backend: str = "transformers",
+    llm_base_url: str | None = None,
+    llm_api_key: str | None = None,
+    llm_timeout_s: float = 300.0,
+    deepseek_base_url: str | None = None,
 ) -> dict[str, Any]:
     """Discover pairs and run Stage-2 per sample under work_root/{dataset}/{stem}/."""
     cfg = config or PipelineConfig()
@@ -193,6 +220,8 @@ def run_batch(
         "backend": backend,
         "stage": stage,
         "asr_models": asr_models,
+        "llm_backend": llm_backend,
+        "llm_base_url": llm_base_url,
         "wav_benchmark": str(wav_benchmark),
         "mode_c_benchmark": str(mode_c_benchmark),
         "work_root": str(work_root),
@@ -225,6 +254,11 @@ def run_batch(
         llm_model_id=llm_model_id,
         deepseek_model_id=deepseek_model_id,
         no_deepseek_fallback=no_deepseek_fallback,
+        llm_backend=llm_backend,
+        llm_base_url=llm_base_url,
+        llm_api_key=llm_api_key,
+        llm_timeout_s=llm_timeout_s,
+        deepseek_base_url=deepseek_base_url,
     )
 
     n_pairs = len(pairs)
