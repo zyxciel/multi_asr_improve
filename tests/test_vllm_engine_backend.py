@@ -58,6 +58,8 @@ def test_prepare_vllm_process_env_sets_defaults(monkeypatch):
     assert os.environ["VLLM_USE_V1"] == "0"
     assert os.environ["VLLM_HOST_IP"] == "127.0.0.1"
 
+
+def test_vllm_engine_single_and_batch():
     engine = _FakeEngine()
     logs: list[dict] = []
     judge = Qwen36LlmJudge(
