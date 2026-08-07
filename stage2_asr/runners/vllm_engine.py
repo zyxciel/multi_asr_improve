@@ -51,6 +51,28 @@ def format_chat_prompt(tokenizer, system: str, user: str) -> str:
     return f"System: {system}\n\nUser: {user}\n\nAssistant:"
 
 
+def normalize_vllm_dtype(dtype: str | None) -> str:
+    """Map user aliases to vLLM dtype strings."""
+    if not dtype:
+        return "auto"
+    d = str(dtype).strip().lower()
+    aliases = {
+        "bf16": "bfloat16",
+        "bfloat16": "bfloat16",
+        "fp16": "float16",
+        "float16": "float16",
+        "half": "float16",
+        "fp32": "float32",
+        "float32": "float32",
+        "auto": "auto",
+    }
+    if d not in aliases:
+        raise ValueError(
+            f"unsupported vllm dtype {dtype!r}; expected one of {sorted(set(aliases))}"
+        )
+    return aliases[d]
+
+
 def load_vllm_engine(
     model_id: str,
     *,
@@ -68,6 +90,8 @@ def load_vllm_engine(
     Defaults tuned for stability on Ascend + vLLM 0.18:
     - prepare_vllm_process_env(use_v1=False) → avoid V1 SyncMPClient OpenMP crash
     - enforce_eager=True → skip CUDA/NPU graph capture issues during bring-up
+
+    For 2 NPUs: tensor_parallel_size=2 and ASCEND_RT_VISIBLE_DEVICES=0,1
     """
     if engine is not None:
         return engine
@@ -82,12 +106,13 @@ def load_vllm_engine(
             "--llm-backend vllm_engine."
         ) from e
 
+    dtype_norm = normalize_vllm_dtype(dtype)
     kwargs: dict[str, Any] = {
         "model": model_id,
         "tensor_parallel_size": max(1, int(tensor_parallel_size)),
         "gpu_memory_utilization": float(gpu_memory_utilization),
         "trust_remote_code": bool(trust_remote_code),
-        "dtype": dtype,
+        "dtype": dtype_norm,
     }
     if max_model_len is not None:
         kwargs["max_model_len"] = int(max_model_len)

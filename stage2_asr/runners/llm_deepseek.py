@@ -46,6 +46,7 @@ class DeepSeekLlmJudge:
         tensor_parallel_size: int = 1,
         gpu_memory_utilization: float = 0.90,
         max_model_len: int | None = None,
+        dtype: str = "auto",
         enforce_eager: bool = True,
         use_v1: bool | None = False,
     ):
@@ -64,6 +65,7 @@ class DeepSeekLlmJudge:
         self.tensor_parallel_size = tensor_parallel_size
         self.gpu_memory_utilization = gpu_memory_utilization
         self.max_model_len = max_model_len
+        self.dtype = dtype
         self.enforce_eager = enforce_eager
         self.use_v1 = use_v1
         if self.backend not in _BACKENDS:
@@ -118,6 +120,7 @@ class DeepSeekLlmJudge:
                         tensor_parallel_size=self.tensor_parallel_size,
                         gpu_memory_utilization=self.gpu_memory_utilization,
                         max_model_len=self.max_model_len,
+                        dtype=self.dtype,
                         enforce_eager=self.enforce_eager,
                         use_v1=self.use_v1,
                     )

@@ -82,19 +82,24 @@ def _add_common_run_args(p: argparse.ArgumentParser) -> None:
         "--vllm-tp-size",
         type=int,
         default=1,
-        help="tensor_parallel_size for --llm-backend vllm_engine",
+        help="tensor_parallel_size for vllm_engine (use 2 for two NPUs)",
     )
     p.add_argument(
         "--vllm-gpu-memory-utilization",
         type=float,
         default=0.90,
-        help="gpu_memory_utilization for vllm_engine (vLLM-Ascend uses the same flag name)",
+        help="gpu_memory_utilization for vllm_engine (lower if KV cache OOM, e.g. 0.85)",
     )
     p.add_argument(
         "--vllm-max-model-len",
         type=int,
         default=None,
-        help="Optional max_model_len for vllm_engine",
+        help="Optional max_model_len (lower e.g. 4096/8192 frees KV cache memory)",
+    )
+    p.add_argument(
+        "--vllm-dtype",
+        default="auto",
+        help="vllm_engine dtype: auto|bf16|bfloat16|fp16|float16|fp32 (bf16 recommended on 910B)",
     )
     p.add_argument(
         "--vllm-enforce-eager",
@@ -151,6 +156,7 @@ def _vllm_flags(args: argparse.Namespace) -> dict:
         "vllm_tp_size": int(args.vllm_tp_size),
         "vllm_gpu_memory_utilization": float(args.vllm_gpu_memory_utilization),
         "vllm_max_model_len": args.vllm_max_model_len,
+        "vllm_dtype": str(args.vllm_dtype),
         "vllm_enforce_eager": enforce,
         "vllm_use_v1": use_v1,
     }

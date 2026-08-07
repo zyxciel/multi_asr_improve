@@ -116,6 +116,7 @@ def build_runners(
     vllm_tp_size: int = 1,
     vllm_gpu_memory_utilization: float = 0.90,
     vllm_max_model_len: int | None = None,
+    vllm_dtype: str = "auto",
     vllm_enforce_eager: bool = True,
     vllm_use_v1: bool | None = False,
 ):
@@ -164,6 +165,7 @@ def build_runners(
             tensor_parallel_size=vllm_tp_size,
             gpu_memory_utilization=vllm_gpu_memory_utilization,
             max_model_len=vllm_max_model_len,
+            dtype=vllm_dtype,
             enforce_eager=vllm_enforce_eager,
             use_v1=vllm_use_v1,
         )
@@ -188,6 +190,7 @@ def build_runners(
                     tensor_parallel_size=vllm_tp_size,
                     gpu_memory_utilization=vllm_gpu_memory_utilization,
                     max_model_len=vllm_max_model_len,
+                    dtype=vllm_dtype,
                     enforce_eager=vllm_enforce_eager,
                     use_v1=vllm_use_v1,
                 )
@@ -222,6 +225,7 @@ def run_batch(
     vllm_tp_size: int = 1,
     vllm_gpu_memory_utilization: float = 0.90,
     vllm_max_model_len: int | None = None,
+    vllm_dtype: str = "auto",
     vllm_enforce_eager: bool = True,
     vllm_use_v1: bool | None = False,
 ) -> dict[str, Any]:
@@ -286,6 +290,7 @@ def run_batch(
         vllm_tp_size=vllm_tp_size,
         vllm_gpu_memory_utilization=vllm_gpu_memory_utilization,
         vllm_max_model_len=vllm_max_model_len,
+        vllm_dtype=vllm_dtype,
         vllm_enforce_eager=vllm_enforce_eager,
         vllm_use_v1=vllm_use_v1,
     )

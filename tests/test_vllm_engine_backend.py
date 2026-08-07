@@ -37,6 +37,14 @@ class _FakeEngine:
         return outs
 
 
+def test_normalize_vllm_dtype():
+    from stage2_asr.runners.vllm_engine import normalize_vllm_dtype
+
+    assert normalize_vllm_dtype("bf16") == "bfloat16"
+    assert normalize_vllm_dtype("bfloat16") == "bfloat16"
+    assert normalize_vllm_dtype("fp16") == "float16"
+
+
 def test_prepare_vllm_process_env_sets_defaults(monkeypatch):
     import os
 
