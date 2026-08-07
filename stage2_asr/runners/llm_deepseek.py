@@ -15,9 +15,15 @@ from stage2_asr.pinyin_util import to_pinyin
 from stage2_asr.prompt import SYSTEM_PROMPT, render_user_prompt
 from stage2_asr.runners.base import UnsupportedRunnerError
 from stage2_asr.runners.openai_compat import chat_completion
+from stage2_asr.runners.vllm_engine import (
+    format_chat_prompt,
+    load_vllm_engine,
+    vllm_generate_texts,
+)
 from stage2_asr.types import Hypothesis
 
 LogFn = Callable[[dict[str, Any]], None]
+_BACKENDS = {"transformers", "vllm", "vllm_engine"}
 
 
 class DeepSeekLlmJudge:
@@ -36,6 +42,10 @@ class DeepSeekLlmJudge:
         timeout_s: float = 300.0,
         max_tokens: int = 1024,
         log_fn: LogFn | None = None,
+        engine=None,
+        tensor_parallel_size: int = 1,
+        gpu_memory_utilization: float = 0.90,
+        max_model_len: int | None = None,
     ):
         self.enabled = enabled
         self.generate_fn = generate_fn
@@ -48,9 +58,14 @@ class DeepSeekLlmJudge:
         self.max_tokens = max_tokens
         self.log_fn = log_fn
         self._pipe = None
-        if self.backend not in {"transformers", "vllm"}:
-            raise ValueError(f"unsupported llm backend {backend!r}; expected transformers|vllm")
-
+        self._engine = engine
+        self.tensor_parallel_size = tensor_parallel_size
+        self.gpu_memory_utilization = gpu_memory_utilization
+        self.max_model_len = max_model_len
+        if self.backend not in _BACKENDS:
+            raise ValueError(
+                f"unsupported llm backend {backend!r}; expected {sorted(_BACKENDS)}"
+            )
     def _format_hyps(self, hypotheses: list[Hypothesis]) -> str:
         lines = []
         for h in hypotheses:
@@ -92,10 +107,34 @@ class DeepSeekLlmJudge:
                 raise UnsupportedRunnerError(
                     "DeepSeekLlmJudge disabled. Use MockLlmJudge, generate_fn=..., or enabled=True."
                 )
+            elif self.backend == "vllm_engine":
+                if self._engine is None:
+                    self._engine = load_vllm_engine(
+                        self.model_id,
+                        tensor_parallel_size=self.tensor_parallel_size,
+                        gpu_memory_utilization=self.gpu_memory_utilization,
+                        max_model_len=self.max_model_len,
+                    )
+                tokenizer = (
+                    self._engine.get_tokenizer()
+                    if hasattr(self._engine, "get_tokenizer")
+                    else None
+                )
+                if tokenizer is not None:
+                    prompt = format_chat_prompt(tokenizer, system, user)
+                else:
+                    prompt = f"System: {system}\n\nUser: {user}\n\nAssistant:"
+                text = vllm_generate_texts(
+                    self._engine,
+                    [prompt],
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                )[0]
             elif self.backend == "vllm":
                 if not self.base_url:
                     raise UnsupportedRunnerError(
-                        "vllm backend requires base_url (OpenAI-compatible server)"
+                        "vllm (HTTP) backend requires base_url; "
+                        "or use --llm-backend vllm_engine"
                     )
                 text = chat_completion(
                     base_url=self.base_url,

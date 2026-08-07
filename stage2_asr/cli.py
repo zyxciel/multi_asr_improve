@@ -43,14 +43,18 @@ def _add_common_run_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--enable-real", action="store_true", help="Allow real runners to load models")
     p.add_argument(
         "--llm-backend",
-        choices=["transformers", "vllm"],
+        choices=["transformers", "vllm", "vllm_engine"],
         default="transformers",
-        help="LLM serving backend: local transformers or OpenAI-compat vLLM/vLLM-Ascend HTTP",
+        help=(
+            "LLM backend: transformers (slow HF generate); "
+            "vllm (OpenAI HTTP server); "
+            "vllm_engine (in-process vllm.LLM — recommended on Ascend 910B)"
+        ),
     )
     p.add_argument(
         "--llm-base-url",
         default=None,
-        help="OpenAI-compat base URL for --llm-backend vllm (e.g. http://127.0.0.1:8000 or .../v1)",
+        help="Required for --llm-backend vllm (HTTP). Unused for vllm_engine.",
     )
     p.add_argument(
         "--llm-api-key",
@@ -61,7 +65,7 @@ def _add_common_run_args(p: argparse.ArgumentParser) -> None:
         "--llm-timeout-s",
         type=float,
         default=300.0,
-        help="HTTP timeout seconds for vLLM chat completions",
+        help="HTTP timeout seconds for --llm-backend vllm",
     )
     p.add_argument(
         "--deepseek-base-url",
@@ -72,7 +76,25 @@ def _add_common_run_args(p: argparse.ArgumentParser) -> None:
         "--pass-a-batch-size",
         type=int,
         default=1,
-        help="Concurrent Pass A LLM calls (use >1 with --llm-backend vllm; Ascend continuous batching)",
+        help="Pass A micro-batch size (>1 enables batched vllm_engine.generate / HTTP concurrency)",
+    )
+    p.add_argument(
+        "--vllm-tp-size",
+        type=int,
+        default=1,
+        help="tensor_parallel_size for --llm-backend vllm_engine",
+    )
+    p.add_argument(
+        "--vllm-gpu-memory-utilization",
+        type=float,
+        default=0.90,
+        help="gpu_memory_utilization for vllm_engine (vLLM-Ascend uses the same flag name)",
+    )
+    p.add_argument(
+        "--vllm-max-model-len",
+        type=int,
+        default=None,
+        help="Optional max_model_len for vllm_engine",
     )
 
 
@@ -88,8 +110,8 @@ def _resolve_backend(args: argparse.Namespace) -> str | None:
     if getattr(args, "llm_backend", "transformers") == "vllm" and not getattr(args, "llm_base_url", None):
         if backend == "real" and str(args.stage).lower() in {"all", "pass_a", "pass_b", "llm"}:
             print(
-                "--llm-backend vllm requires --llm-base-url "
-                "(OpenAI-compatible server, e.g. vLLM-Ascend on Ascend 910B).",
+                "--llm-backend vllm (HTTP) requires --llm-base-url. "
+                "For in-process vllm.LLM on Ascend, use --llm-backend vllm_engine instead.",
                 file=sys.stderr,
             )
             return None
@@ -136,6 +158,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
         llm_api_key=args.llm_api_key,
         llm_timeout_s=float(args.llm_timeout_s),
         deepseek_base_url=args.deepseek_base_url,
+        vllm_tp_size=int(args.vllm_tp_size),
+        vllm_gpu_memory_utilization=float(args.vllm_gpu_memory_utilization),
+        vllm_max_model_len=args.vllm_max_model_len,
     )
 
     result = run_pipeline(
@@ -210,6 +235,9 @@ def _cmd_run_batch(args: argparse.Namespace) -> int:
         llm_api_key=args.llm_api_key,
         llm_timeout_s=float(args.llm_timeout_s),
         deepseek_base_url=args.deepseek_base_url,
+        vllm_tp_size=int(args.vllm_tp_size),
+        vllm_gpu_memory_utilization=float(args.vllm_gpu_memory_utilization),
+        vllm_max_model_len=args.vllm_max_model_len,
     )
     print(
         json.dumps(

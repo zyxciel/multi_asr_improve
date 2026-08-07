@@ -5,8 +5,9 @@ Qwen3.6-27B text LLM judge adapter.
 
 Upstream weights: https://huggingface.co/Qwen/Qwen3.6-27B
 Backends:
-  - transformers: local AutoModelForCausalLM (device_map=auto)
-  - vllm: OpenAI-compatible HTTP (vLLM / vLLM-Ascend on Ascend 910B)
+  - transformers: local AutoModelForCausalLM (device_map=auto) — slow
+  - vllm: OpenAI-compatible HTTP server
+  - vllm_engine: in-process vllm.LLM (recommended on Ascend 910B / vLLM-Ascend)
   - generate_fn: injected for tests
 """
 
@@ -19,9 +20,15 @@ from stage2_asr.pinyin_util import to_pinyin
 from stage2_asr.prompt import SYSTEM_PROMPT, render_user_prompt
 from stage2_asr.runners.base import UnsupportedRunnerError
 from stage2_asr.runners.openai_compat import chat_completion, chat_completion_many
+from stage2_asr.runners.vllm_engine import (
+    format_chat_prompt,
+    load_vllm_engine,
+    vllm_generate_texts,
+)
 from stage2_asr.types import Hypothesis
 
 LogFn = Callable[[dict[str, Any]], None]
+_BACKENDS = {"transformers", "vllm", "vllm_engine"}
 
 
 class Qwen36LlmJudge:
@@ -40,6 +47,11 @@ class Qwen36LlmJudge:
         timeout_s: float = 300.0,
         max_tokens: int = 1024,
         log_fn: LogFn | None = None,
+        # vllm_engine options
+        engine=None,
+        tensor_parallel_size: int = 1,
+        gpu_memory_utilization: float = 0.90,
+        max_model_len: int | None = None,
     ):
         self.enabled = enabled
         self.generate_fn = generate_fn
@@ -52,8 +64,14 @@ class Qwen36LlmJudge:
         self.max_tokens = max_tokens
         self.log_fn = log_fn
         self._pipe = None
-        if self.backend not in {"transformers", "vllm"}:
-            raise ValueError(f"unsupported llm backend {backend!r}; expected transformers|vllm")
+        self._engine = engine
+        self.tensor_parallel_size = tensor_parallel_size
+        self.gpu_memory_utilization = gpu_memory_utilization
+        self.max_model_len = max_model_len
+        if self.backend not in _BACKENDS:
+            raise ValueError(
+                f"unsupported llm backend {backend!r}; expected {sorted(_BACKENDS)}"
+            )
 
     def _format_hyps(self, hypotheses: list[Hypothesis]) -> str:
         lines = []
@@ -105,23 +123,16 @@ class Qwen36LlmJudge:
         max_workers: int = 8,
     ) -> list[dict | BaseException]:
         """
-        Concurrent judges for Pass A batching (vLLM continuous batching on server).
+        Batched judges for Pass A.
 
-        Each job keys: hypotheses, neighbor_draft, hotwords, overlap, heavy_overlap, unit_id.
+        - vllm_engine: one ``LLM.generate`` call (true continuous batching)
+        - vllm (HTTP): concurrent OpenAI calls
+        - transformers: sequential
         """
         if not jobs:
             return []
-        if self.backend != "vllm" and self.generate_fn is None:
-            # transformers: fall back to sequential
-            out: list[dict | BaseException] = []
-            for job in jobs:
-                try:
-                    out.append(self.judge(**job))
-                except BaseException as exc:  # noqa: BLE001
-                    out.append(exc)
-            return out
 
-        prompts = []
+        prompts_meta: list[tuple[str, str]] = []
         for job in jobs:
             user = self.build_user_prompt(
                 hypotheses=job["hypotheses"],
@@ -130,74 +141,162 @@ class Qwen36LlmJudge:
                 overlap=job["overlap"],
                 heavy_overlap=job["heavy_overlap"],
             )
-            prompts.append((job.get("unit_id", ""), user))
+            prompts_meta.append((str(job.get("unit_id", "")), user))
 
         if self.generate_fn is not None:
             texts: list[str | BaseException] = []
-            for unit_id, user in prompts:
+            for unit_id, user in prompts_meta:
                 try:
-                    texts.append(self._generate(SYSTEM_PROMPT, user, unit_id=unit_id, pass_name="judge_many"))
+                    texts.append(
+                        self._generate(
+                            SYSTEM_PROMPT, user, unit_id=unit_id, pass_name="judge_many"
+                        )
+                    )
                 except BaseException as exc:  # noqa: BLE001
                     texts.append(exc)
-        else:
-            http_jobs = [
-                {
-                    "base_url": self.base_url or "",
-                    "model": self.model_id,
-                    "messages": [
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": user},
-                    ],
-                    "temperature": self.temperature,
-                    "max_tokens": self.max_tokens,
-                    "api_key": self.api_key,
-                    "timeout_s": self.timeout_s,
-                }
-                for _, user in prompts
-            ]
-            t0 = time.time()
-            raw_list = chat_completion_many(http_jobs, max_workers=max_workers)
-            for (unit_id, user), raw in zip(prompts, raw_list):
-                self._emit_log(
-                    {
-                        "judge": self.name,
-                        "backend": self.backend,
-                        "pass": "judge_many",
-                        "unit_id": unit_id,
-                        "ok": not isinstance(raw, BaseException),
-                        "latency_s": None,
-                        "user_chars": len(user),
-                        "response_chars": 0 if isinstance(raw, BaseException) else len(str(raw)),
-                        "error": str(raw) if isinstance(raw, BaseException) else None,
-                        "response": None if isinstance(raw, BaseException) else str(raw)[:4000],
-                    }
-                )
-            texts = raw_list
+            return self._parse_many(texts)
+
+        if self.backend == "vllm_engine":
+            return self._judge_many_engine(prompts_meta)
+
+        if self.backend == "vllm":
+            return self._judge_many_http(prompts_meta, max_workers=max_workers)
+
+        # transformers / other: sequential
+        out: list[dict | BaseException] = []
+        for job in jobs:
+            try:
+                out.append(self.judge(**job))
+            except BaseException as exc:  # noqa: BLE001
+                out.append(exc)
+        return out
+
+    def _judge_many_engine(
+        self, prompts_meta: list[tuple[str, str]]
+    ) -> list[dict | BaseException]:
+        t0 = time.time()
+        engine = self._ensure_engine()
+        tokenizer = engine.get_tokenizer() if hasattr(engine, "get_tokenizer") else None
+        rendered: list[str] = []
+        for _, user in prompts_meta:
+            if tokenizer is not None:
+                rendered.append(format_chat_prompt(tokenizer, SYSTEM_PROMPT, user))
+            else:
+                rendered.append(f"System: {SYSTEM_PROMPT}\n\nUser: {user}\n\nAssistant:")
+        try:
+            texts = vllm_generate_texts(
+                engine,
+                rendered,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return [exc] * len(prompts_meta)
+
+        for (unit_id, user), text in zip(prompts_meta, texts):
             self._emit_log(
                 {
                     "judge": self.name,
                     "backend": self.backend,
-                    "pass": "judge_many_batch",
-                    "n": len(jobs),
-                    "latency_s": time.time() - t0,
-                    "max_workers": max_workers,
+                    "pass": "judge_many",
+                    "unit_id": unit_id,
+                    "ok": True,
+                    "latency_s": None,
+                    "user_chars": len(user),
+                    "response_chars": len(text),
+                    "error": None,
+                    "response": text[:4000],
                 }
             )
+        self._emit_log(
+            {
+                "judge": self.name,
+                "backend": self.backend,
+                "pass": "judge_many_batch",
+                "n": len(prompts_meta),
+                "latency_s": time.time() - t0,
+            }
+        )
+        return self._parse_many(list(texts))
 
-        out2: list[dict | BaseException] = []
+    def _judge_many_http(
+        self, prompts_meta: list[tuple[str, str]], *, max_workers: int
+    ) -> list[dict | BaseException]:
+        http_jobs = [
+            {
+                "base_url": self.base_url or "",
+                "model": self.model_id,
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user},
+                ],
+                "temperature": self.temperature,
+                "max_tokens": self.max_tokens,
+                "api_key": self.api_key,
+                "timeout_s": self.timeout_s,
+            }
+            for _, user in prompts_meta
+        ]
+        t0 = time.time()
+        raw_list = chat_completion_many(http_jobs, max_workers=max_workers)
+        for (unit_id, user), raw in zip(prompts_meta, raw_list):
+            self._emit_log(
+                {
+                    "judge": self.name,
+                    "backend": self.backend,
+                    "pass": "judge_many",
+                    "unit_id": unit_id,
+                    "ok": not isinstance(raw, BaseException),
+                    "latency_s": None,
+                    "user_chars": len(user),
+                    "response_chars": 0 if isinstance(raw, BaseException) else len(str(raw)),
+                    "error": str(raw) if isinstance(raw, BaseException) else None,
+                    "response": None if isinstance(raw, BaseException) else str(raw)[:4000],
+                }
+            )
+        self._emit_log(
+            {
+                "judge": self.name,
+                "backend": self.backend,
+                "pass": "judge_many_batch",
+                "n": len(prompts_meta),
+                "latency_s": time.time() - t0,
+                "max_workers": max_workers,
+            }
+        )
+        return self._parse_many(raw_list)
+
+    def _parse_many(
+        self, texts: list[str | BaseException]
+    ) -> list[dict | BaseException]:
+        out: list[dict | BaseException] = []
         for raw in texts:
             if isinstance(raw, BaseException):
-                out2.append(raw)
+                out.append(raw)
                 continue
             try:
-                out2.append(self._parse_json(raw))
+                out.append(self._parse_json(raw))
             except BaseException as exc:  # noqa: BLE001
-                out2.append(exc)
-        return out2
+                out.append(exc)
+        return out
 
     def _emit_log(self, event: dict[str, Any]) -> None:
         if self.log_fn is not None:
             self.log_fn(event)
+
+    def _ensure_engine(self):
+        if self._engine is None:
+            if not self.enabled:
+                raise UnsupportedRunnerError(
+                    "Qwen36LlmJudge disabled. Use enabled=True for vllm_engine."
+                )
+            self._engine = load_vllm_engine(
+                self.model_id,
+                tensor_parallel_size=self.tensor_parallel_size,
+                gpu_memory_utilization=self.gpu_memory_utilization,
+                max_model_len=self.max_model_len,
+            )
+        return self._engine
 
     def _generate(self, system: str, user: str, *, unit_id: str = "", pass_name: str = "generate") -> str:
         t0 = time.time()
@@ -210,10 +309,24 @@ class Qwen36LlmJudge:
                 raise UnsupportedRunnerError(
                     "Qwen36LlmJudge disabled. Use MockLlmJudge or enabled=True / generate_fn=..."
                 )
+            elif self.backend == "vllm_engine":
+                engine = self._ensure_engine()
+                tokenizer = engine.get_tokenizer() if hasattr(engine, "get_tokenizer") else None
+                if tokenizer is not None:
+                    prompt = format_chat_prompt(tokenizer, system, user)
+                else:
+                    prompt = f"System: {system}\n\nUser: {user}\n\nAssistant:"
+                text = vllm_generate_texts(
+                    engine,
+                    [prompt],
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                )[0]
             elif self.backend == "vllm":
                 if not self.base_url:
                     raise UnsupportedRunnerError(
-                        "vllm backend requires base_url (OpenAI-compatible server, e.g. vLLM-Ascend on 910B)"
+                        "vllm (HTTP) backend requires base_url; "
+                        "or use --llm-backend vllm_engine for in-process vllm.LLM"
                     )
                 text = chat_completion(
                     base_url=self.base_url,

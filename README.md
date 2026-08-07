@@ -109,25 +109,37 @@ Summary + skips/errors: `work-root/batch_summary.json`.
 
 ## LLM backend (vLLM / Ascend 910B)
 
-The judge can call a remote **OpenAI-compatible** server instead of in-process `transformers`.
-On Ascend 910B, serve the model with **vLLM-Ascend** (or MindIE) and point Stage-2 at it — the client is pure HTTP (no NPU binding in this process).
+Three options:
+
+| `--llm-backend` | How it runs | When to use |
+|---|---|---|
+| `vllm_engine` | **In-process `vllm.LLM`** (loads once, batched `generate`) | **Recommended on Ascend 910B** (vLLM-Ascend installed) |
+| `vllm` | OpenAI HTTP client → external server | Separate long-lived `vllm serve` |
+| `transformers` | HF `generate` one-by-one | Debug only (very slow) |
+
+### Recommended: in-process engine (no separate server)
 
 ```bash
-# Example: start OpenAI-compat server on the Ascend node (adjust to your vLLM-Ascend launch)
-# vllm serve Qwen/Qwen3.6-27B --host 0.0.0.0 --port 8000 ...
-
-python -m stage2_asr.cli run \
-  --input mode_c.json --audio prepared.wav --work-dir out \
+# Requires vLLM-Ascend (or vLLM) importable in the same Python env as Stage-2.
+python -m stage2_asr.cli run-batch \
+  --wav-benchmark ... --mode-c-benchmark ... --work-root ... \
   --backend real --enable-real --stage llm \
-  --llm-backend vllm \
-  --llm-base-url http://127.0.0.1:8000 \
-  --llm-model-id Qwen/Qwen3.6-27B \
-  --pass-a-batch-size 8
+  --llm-backend vllm_engine \
+  --llm-model-id /path/or/hf/id/to/Qwen3.6-27B \
+  --pass-a-batch-size 16 \
+  --vllm-tp-size 1 \
+  --vllm-gpu-memory-utilization 0.90 \
+  --no-deepseek-fallback
 ```
 
-- `--pass-a-batch-size N` (>1): concurrent Pass A HTTP calls (server continuous-batches).
-- LLM inference traces: `work-dir/llm_infer.jsonl` (unit_id, latency, response snippet, errors).
-- Stderr still shows `[pass_a]` / `[pass_b]` progress; stdout remains the final JSON summary.
+- First call loads the model into NPU; later units reuse the same engine.
+- `--pass-a-batch-size N` runs Pass A as one `LLM.generate([N prompts])` (true batching).
+- DeepSeek fallback is **disabled automatically** for `vllm_engine` (avoids loading a second engine / OOM). Prefer `--no-deepseek-fallback`.
+- Traces: `work-dir/llm_infer.jsonl`
+
+### Alternative: HTTP server (`--llm-backend vllm`)
+
+Start vLLM-Ascend yourself, then `--llm-base-url http://127.0.0.1:8000`.
 
 ## Eval B0 (MOSS-from-fusion baseline)
 
