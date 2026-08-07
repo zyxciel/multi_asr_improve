@@ -37,7 +37,27 @@ class _FakeEngine:
         return outs
 
 
-def test_vllm_engine_single_and_batch():
+def test_prepare_vllm_process_env_sets_defaults(monkeypatch):
+    import os
+
+    from stage2_asr.runners.vllm_engine import prepare_vllm_process_env
+
+    for key in (
+        "VLLM_WORKER_MULTIPROC_METHOD",
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "VLLM_HOST_IP",
+        "VLLM_USE_V1",
+        "HOST_IP",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    prepare_vllm_process_env(use_v1=False)
+    assert os.environ["VLLM_WORKER_MULTIPROC_METHOD"] == "spawn"
+    assert os.environ["OMP_NUM_THREADS"] == "1"
+    assert os.environ["VLLM_USE_V1"] == "0"
+    assert os.environ["VLLM_HOST_IP"] == "127.0.0.1"
+
     engine = _FakeEngine()
     logs: list[dict] = []
     judge = Qwen36LlmJudge(

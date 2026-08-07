@@ -6,9 +6,37 @@ when you do not want a separate OpenAI HTTP server.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from stage2_asr.runners.base import UnsupportedRunnerError
+
+
+def prepare_vllm_process_env(*, use_v1: bool | None = None) -> None:
+    """
+    Mitigate PyTorch OpenMP + vLLM V1 multiprocess crashes.
+
+    Root cause seen on Ascend / vLLM 0.18:
+      c10::Error Invalid thread pool! at ParallelOpenMP.cpp
+    during EngineCore SyncMPClient startup (fork/thread conflict).
+
+    Must run *before* ``from vllm import LLM``.
+    """
+    # Prefer spawn over fork after torch/OpenMP has been initialized.
+    os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    # Avoid nested OpenMP pools in engine worker processes.
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+    # HOST_IP is ignored; vLLM wants VLLM_HOST_IP for multi-proc.
+    if "HOST_IP" in os.environ and "VLLM_HOST_IP" not in os.environ:
+        os.environ["VLLM_HOST_IP"] = os.environ["HOST_IP"]
+    os.environ.setdefault("VLLM_HOST_IP", "127.0.0.1")
+    if use_v1 is False:
+        os.environ["VLLM_USE_V1"] = "0"
+    elif use_v1 is True:
+        os.environ["VLLM_USE_V1"] = "1"
 
 
 def format_chat_prompt(tokenizer, system: str, user: str) -> str:
@@ -31,11 +59,21 @@ def load_vllm_engine(
     max_model_len: int | None = None,
     trust_remote_code: bool = True,
     dtype: str = "auto",
+    enforce_eager: bool = True,
+    use_v1: bool | None = False,
     engine: Any | None = None,
 ) -> Any:
-    """Return a vllm.LLM instance (or injected test double)."""
+    """Return a vllm.LLM instance (or injected test double).
+
+    Defaults tuned for stability on Ascend + vLLM 0.18:
+    - prepare_vllm_process_env(use_v1=False) → avoid V1 SyncMPClient OpenMP crash
+    - enforce_eager=True → skip CUDA/NPU graph capture issues during bring-up
+    """
     if engine is not None:
         return engine
+
+    prepare_vllm_process_env(use_v1=use_v1)
+
     try:
         from vllm import LLM  # type: ignore
     except ImportError as e:
@@ -43,6 +81,7 @@ def load_vllm_engine(
             "vllm not installed. On Ascend 910B install/use vLLM-Ascend, then "
             "--llm-backend vllm_engine."
         ) from e
+
     kwargs: dict[str, Any] = {
         "model": model_id,
         "tensor_parallel_size": max(1, int(tensor_parallel_size)),
@@ -52,7 +91,15 @@ def load_vllm_engine(
     }
     if max_model_len is not None:
         kwargs["max_model_len"] = int(max_model_len)
-    return LLM(**kwargs)
+    if enforce_eager:
+        kwargs["enforce_eager"] = True
+
+    try:
+        return LLM(**kwargs)
+    except TypeError:
+        # Older vLLM without enforce_eager
+        kwargs.pop("enforce_eager", None)
+        return LLM(**kwargs)
 
 
 def vllm_generate_texts(

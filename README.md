@@ -137,6 +137,18 @@ python -m stage2_asr.cli run-batch \
 - DeepSeek fallback is **disabled automatically** for `vllm_engine` (avoids loading a second engine / OOM). Prefer `--no-deepseek-fallback`.
 - Traces: `work-dir/llm_infer.jsonl`
 
+**If you see `Invalid thread pool` / `Engine core initialization failed` (vLLM 0.18 V1):** this is a PyTorch OpenMP + V1 multiprocess bug, not Stage-2 logic. Pull latest (defaults `VLLM_USE_V1=0`, `enforce_eager`, `spawn`) or set before running:
+
+```bash
+export VLLM_USE_V1=0
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export VLLM_HOST_IP=127.0.0.1
+```
+
+Also confirm `from vllm import LLM` is **vLLM-Ascend** (NPU), not a CUDA-only build (`Device:-1` in logs is a red flag).
+
 ### Alternative: HTTP server (`--llm-backend vllm`)
 
 Start vLLM-Ascend yourself, then `--llm-base-url http://127.0.0.1:8000`.

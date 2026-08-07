@@ -52,6 +52,8 @@ class Qwen36LlmJudge:
         tensor_parallel_size: int = 1,
         gpu_memory_utilization: float = 0.90,
         max_model_len: int | None = None,
+        enforce_eager: bool = True,
+        use_v1: bool | None = False,
     ):
         self.enabled = enabled
         self.generate_fn = generate_fn
@@ -68,6 +70,8 @@ class Qwen36LlmJudge:
         self.tensor_parallel_size = tensor_parallel_size
         self.gpu_memory_utilization = gpu_memory_utilization
         self.max_model_len = max_model_len
+        self.enforce_eager = enforce_eager
+        self.use_v1 = use_v1
         if self.backend not in _BACKENDS:
             raise ValueError(
                 f"unsupported llm backend {backend!r}; expected {sorted(_BACKENDS)}"
@@ -295,6 +299,8 @@ class Qwen36LlmJudge:
                 tensor_parallel_size=self.tensor_parallel_size,
                 gpu_memory_utilization=self.gpu_memory_utilization,
                 max_model_len=self.max_model_len,
+                enforce_eager=self.enforce_eager,
+                use_v1=self.use_v1,
             )
         return self._engine
 

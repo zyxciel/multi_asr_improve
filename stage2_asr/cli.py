@@ -96,6 +96,22 @@ def _add_common_run_args(p: argparse.ArgumentParser) -> None:
         default=None,
         help="Optional max_model_len for vllm_engine",
     )
+    p.add_argument(
+        "--vllm-enforce-eager",
+        action="store_true",
+        default=True,
+        help="Pass enforce_eager=True to vllm.LLM (default on; stabilizes Ascend bring-up)",
+    )
+    p.add_argument(
+        "--no-vllm-enforce-eager",
+        action="store_true",
+        help="Disable enforce_eager for vllm_engine",
+    )
+    p.add_argument(
+        "--vllm-use-v1",
+        action="store_true",
+        help="Use vLLM V1 engine (default off: VLLM_USE_V1=0 avoids OpenMP Invalid thread pool crash)",
+    )
 
 
 def _resolve_backend(args: argparse.Namespace) -> str | None:
@@ -122,6 +138,22 @@ def _load_hotwords(path: str | None) -> list[str]:
     if not path:
         return []
     return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def _vllm_flags(args: argparse.Namespace) -> dict:
+    enforce = True
+    if getattr(args, "no_vllm_enforce_eager", False):
+        enforce = False
+    use_v1: bool | None = False
+    if getattr(args, "vllm_use_v1", False):
+        use_v1 = True
+    return {
+        "vllm_tp_size": int(args.vllm_tp_size),
+        "vllm_gpu_memory_utilization": float(args.vllm_gpu_memory_utilization),
+        "vllm_max_model_len": args.vllm_max_model_len,
+        "vllm_enforce_eager": enforce,
+        "vllm_use_v1": use_v1,
+    }
 
 
 def _pipeline_config(args: argparse.Namespace) -> PipelineConfig:
@@ -158,9 +190,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         llm_api_key=args.llm_api_key,
         llm_timeout_s=float(args.llm_timeout_s),
         deepseek_base_url=args.deepseek_base_url,
-        vllm_tp_size=int(args.vllm_tp_size),
-        vllm_gpu_memory_utilization=float(args.vllm_gpu_memory_utilization),
-        vllm_max_model_len=args.vllm_max_model_len,
+        **_vllm_flags(args),
     )
 
     result = run_pipeline(
@@ -235,9 +265,7 @@ def _cmd_run_batch(args: argparse.Namespace) -> int:
         llm_api_key=args.llm_api_key,
         llm_timeout_s=float(args.llm_timeout_s),
         deepseek_base_url=args.deepseek_base_url,
-        vllm_tp_size=int(args.vllm_tp_size),
-        vllm_gpu_memory_utilization=float(args.vllm_gpu_memory_utilization),
-        vllm_max_model_len=args.vllm_max_model_len,
+        **_vllm_flags(args),
     )
     print(
         json.dumps(

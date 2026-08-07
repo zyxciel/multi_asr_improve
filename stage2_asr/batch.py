@@ -116,6 +116,8 @@ def build_runners(
     vllm_tp_size: int = 1,
     vllm_gpu_memory_utilization: float = 0.90,
     vllm_max_model_len: int | None = None,
+    vllm_enforce_eager: bool = True,
+    vllm_use_v1: bool | None = False,
 ):
     """Construct ASR/LLM runners once for a batch (reuse across samples)."""
     from stage2_asr.runners.ensemble import EnsembleAsrRunner
@@ -162,6 +164,8 @@ def build_runners(
             tensor_parallel_size=vllm_tp_size,
             gpu_memory_utilization=vllm_gpu_memory_utilization,
             max_model_len=vllm_max_model_len,
+            enforce_eager=vllm_enforce_eager,
+            use_v1=vllm_use_v1,
         )
         if not no_deepseek_fallback:
             # Prefer a dedicated DeepSeek URL; else reuse primary vLLM HTTP URL if set.
@@ -184,6 +188,8 @@ def build_runners(
                     tensor_parallel_size=vllm_tp_size,
                     gpu_memory_utilization=vllm_gpu_memory_utilization,
                     max_model_len=vllm_max_model_len,
+                    enforce_eager=vllm_enforce_eager,
+                    use_v1=vllm_use_v1,
                 )
     return asr, llm, fallback_judge
 
@@ -216,6 +222,8 @@ def run_batch(
     vllm_tp_size: int = 1,
     vllm_gpu_memory_utilization: float = 0.90,
     vllm_max_model_len: int | None = None,
+    vllm_enforce_eager: bool = True,
+    vllm_use_v1: bool | None = False,
 ) -> dict[str, Any]:
     """Discover pairs and run Stage-2 per sample under work_root/{dataset}/{stem}/."""
     cfg = config or PipelineConfig()
@@ -278,6 +286,8 @@ def run_batch(
         vllm_tp_size=vllm_tp_size,
         vllm_gpu_memory_utilization=vllm_gpu_memory_utilization,
         vllm_max_model_len=vllm_max_model_len,
+        vllm_enforce_eager=vllm_enforce_eager,
+        vllm_use_v1=vllm_use_v1,
     )
 
     n_pairs = len(pairs)
