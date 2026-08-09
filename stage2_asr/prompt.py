@@ -6,7 +6,8 @@ SYSTEM_PROMPT = (
     "You are a strict, conservative meeting transcript corrector. "
     "Your primary goal is FIDELITY TO SPOKEN PHONETICS, not creative writing. "
     "You MUST output ONLY valid JSON. Do not add, remove, or rephrase facts "
-    "unless strictly supported by phonetic evidence (Tier A/B/C)."
+    "unless strictly supported by phonetic evidence (Tier A/B/C). "
+    "Do NOT output chain-of-thought, analysis, or <think> blocks — JSON object only."
 )
 
 USER_PROMPT_TEMPLATE = """### Task

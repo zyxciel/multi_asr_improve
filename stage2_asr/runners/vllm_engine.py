@@ -39,16 +39,41 @@ def prepare_vllm_process_env(*, use_v1: bool | None = None) -> None:
         os.environ["VLLM_USE_V1"] = "1"
 
 
-def format_chat_prompt(tokenizer, system: str, user: str) -> str:
+def format_chat_prompt(
+    tokenizer,
+    system: str,
+    user: str,
+    *,
+    enable_thinking: bool = False,
+) -> str:
+    """Apply chat template; disable Qwen3-style thinking by default."""
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": user},
     ]
     if hasattr(tokenizer, "apply_chat_template"):
-        return tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
+        # Qwen3 / Qwen3.6: enable_thinking=False keeps CoT out of the decode path.
+        kwargs = {
+            "tokenize": False,
+            "add_generation_prompt": True,
+        }
+        try:
+            return tokenizer.apply_chat_template(
+                messages,
+                enable_thinking=bool(enable_thinking),
+                **kwargs,
+            )
+        except TypeError:
+            try:
+                return tokenizer.apply_chat_template(
+                    messages,
+                    chat_template_kwargs={"enable_thinking": bool(enable_thinking)},
+                    **kwargs,
+                )
+            except TypeError:
+                return tokenizer.apply_chat_template(messages, **kwargs)
     return f"System: {system}\n\nUser: {user}\n\nAssistant:"
+
 
 
 def normalize_vllm_dtype(dtype: str | None) -> str:

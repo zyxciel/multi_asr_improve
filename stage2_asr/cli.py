@@ -117,6 +117,11 @@ def _add_common_run_args(p: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Use vLLM V1 engine (default off: VLLM_USE_V1=0 avoids OpenMP Invalid thread pool crash)",
     )
+    p.add_argument(
+        "--llm-enable-thinking",
+        action="store_true",
+        help="Allow Qwen3-style thinking/CoT (default: off — JSON-only for ASR judge speed/validity)",
+    )
 
 
 def _resolve_backend(args: argparse.Namespace) -> str | None:
@@ -159,6 +164,7 @@ def _vllm_flags(args: argparse.Namespace) -> dict:
         "vllm_dtype": str(args.vllm_dtype),
         "vllm_enforce_eager": enforce,
         "vllm_use_v1": use_v1,
+        "llm_enable_thinking": bool(getattr(args, "llm_enable_thinking", False)),
     }
 
 

@@ -12,12 +12,12 @@ Backends:
 """
 
 import json
-import re
 import time
 from typing import Any, Callable
 
 from stage2_asr.pinyin_util import to_pinyin
 from stage2_asr.prompt import SYSTEM_PROMPT, render_user_prompt
+from stage2_asr.llm_parse import parse_judgment_json
 from stage2_asr.runners.base import UnsupportedRunnerError
 from stage2_asr.runners.openai_compat import chat_completion, chat_completion_many
 from stage2_asr.runners.vllm_engine import (
@@ -55,6 +55,7 @@ class Qwen36LlmJudge:
         dtype: str = "auto",
         enforce_eager: bool = True,
         use_v1: bool | None = False,
+        enable_thinking: bool = False,
     ):
         self.enabled = enabled
         self.generate_fn = generate_fn
@@ -74,6 +75,7 @@ class Qwen36LlmJudge:
         self.dtype = dtype
         self.enforce_eager = enforce_eager
         self.use_v1 = use_v1
+        self.enable_thinking = bool(enable_thinking)
         if self.backend not in _BACKENDS:
             raise ValueError(
                 f"unsupported llm backend {backend!r}; expected {sorted(_BACKENDS)}"
@@ -186,7 +188,14 @@ class Qwen36LlmJudge:
         rendered: list[str] = []
         for _, user in prompts_meta:
             if tokenizer is not None:
-                rendered.append(format_chat_prompt(tokenizer, SYSTEM_PROMPT, user))
+                rendered.append(
+                    format_chat_prompt(
+                        tokenizer,
+                        SYSTEM_PROMPT,
+                        user,
+                        enable_thinking=self.enable_thinking,
+                    )
+                )
             else:
                 rendered.append(f"System: {SYSTEM_PROMPT}\n\nUser: {user}\n\nAssistant:")
         try:
@@ -200,6 +209,11 @@ class Qwen36LlmJudge:
             return [exc] * len(prompts_meta)
 
         for (unit_id, user), text in zip(prompts_meta, texts):
+            reasoning = None
+            try:
+                _, reasoning = parse_judgment_json(text)
+            except Exception:  # noqa: BLE001
+                pass
             self._emit_log(
                 {
                     "judge": self.name,
@@ -212,6 +226,8 @@ class Qwen36LlmJudge:
                     "response_chars": len(text),
                     "error": None,
                     "response": text[:4000],
+                    "reasoning": (reasoning[:4000] if reasoning else None),
+                    "enable_thinking": self.enable_thinking,
                 }
             )
         self._emit_log(
@@ -322,7 +338,12 @@ class Qwen36LlmJudge:
                 engine = self._ensure_engine()
                 tokenizer = engine.get_tokenizer() if hasattr(engine, "get_tokenizer") else None
                 if tokenizer is not None:
-                    prompt = format_chat_prompt(tokenizer, system, user)
+                    prompt = format_chat_prompt(
+                        tokenizer,
+                        system,
+                        user,
+                        enable_thinking=self.enable_thinking,
+                    )
                 else:
                     prompt = f"System: {system}\n\nUser: {user}\n\nAssistant:"
                 text = vllm_generate_texts(
@@ -384,7 +405,17 @@ class Qwen36LlmJudge:
             self._pipe = (tok, model)
         tok, model = self._pipe
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
-        prompt = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        try:
+            prompt = tok.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=self.enable_thinking,
+            )
+        except TypeError:
+            prompt = tok.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
         inputs = tok([prompt], return_tensors="pt").to(model.device)
         out = model.generate(
             **inputs,
@@ -395,13 +426,17 @@ class Qwen36LlmJudge:
         gen = out[0][inputs["input_ids"].shape[-1] :]
         return tok.decode(gen, skip_special_tokens=True)
 
-    @staticmethod
-    def _parse_json(text: str) -> dict:
-        text = text.strip()
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            m = re.search(r"\{.*\}", text, flags=re.S)
-            if not m:
-                raise UnsupportedRunnerError(f"LLM did not return JSON: {text[:200]}")
-            return json.loads(m.group(0))
+    def _parse_json(self, text: str) -> dict:
+        payload, reasoning = parse_judgment_json(text)
+        if reasoning and self.log_fn is not None:
+            self._emit_log(
+                {
+                    "judge": self.name,
+                    "backend": self.backend,
+                    "pass": "parse_reasoning",
+                    "ok": True,
+                    "reasoning": reasoning[:4000],
+                    "enable_thinking": self.enable_thinking,
+                }
+            )
+        return payload

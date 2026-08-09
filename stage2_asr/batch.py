@@ -119,6 +119,7 @@ def build_runners(
     vllm_dtype: str = "auto",
     vllm_enforce_eager: bool = True,
     vllm_use_v1: bool | None = False,
+    llm_enable_thinking: bool = False,
 ):
     """Construct ASR/LLM runners once for a batch (reuse across samples)."""
     from stage2_asr.runners.ensemble import EnsembleAsrRunner
@@ -168,6 +169,7 @@ def build_runners(
             dtype=vllm_dtype,
             enforce_eager=vllm_enforce_eager,
             use_v1=vllm_use_v1,
+            enable_thinking=llm_enable_thinking,
         )
         if not no_deepseek_fallback:
             # Prefer a dedicated DeepSeek URL; else reuse primary vLLM HTTP URL if set.
@@ -193,6 +195,7 @@ def build_runners(
                     dtype=vllm_dtype,
                     enforce_eager=vllm_enforce_eager,
                     use_v1=vllm_use_v1,
+                    enable_thinking=llm_enable_thinking,
                 )
     return asr, llm, fallback_judge
 
@@ -228,6 +231,7 @@ def run_batch(
     vllm_dtype: str = "auto",
     vllm_enforce_eager: bool = True,
     vllm_use_v1: bool | None = False,
+    llm_enable_thinking: bool = False,
 ) -> dict[str, Any]:
     """Discover pairs and run Stage-2 per sample under work_root/{dataset}/{stem}/."""
     cfg = config or PipelineConfig()
@@ -293,6 +297,7 @@ def run_batch(
         vllm_dtype=vllm_dtype,
         vllm_enforce_eager=vllm_enforce_eager,
         vllm_use_v1=vllm_use_v1,
+        llm_enable_thinking=llm_enable_thinking,
     )
 
     n_pairs = len(pairs)
