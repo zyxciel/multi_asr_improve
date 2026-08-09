@@ -24,6 +24,7 @@ from stage2_asr.types import Hypothesis
 
 LogFn = Callable[[dict[str, Any]], None]
 _BACKENDS = {"transformers", "vllm", "vllm_engine"}
+_LOG_TEXT_MAX = 16000
 
 
 class DeepSeekLlmJudge:
@@ -182,7 +183,9 @@ class DeepSeekLlmJudge:
                     "user_chars": len(user),
                     "response_chars": len(text),
                     "error": err,
-                    "response": text[:4000] if text else None,
+                    "user": user[:_LOG_TEXT_MAX],
+                    "response": text[:_LOG_TEXT_MAX] if text else None,
+                    "enable_thinking": self.enable_thinking,
                 }
             )
 
@@ -237,7 +240,7 @@ class DeepSeekLlmJudge:
                     "backend": self.backend,
                     "pass": "parse_reasoning",
                     "ok": True,
-                    "reasoning": reasoning[:4000],
+                    "reasoning": reasoning[:_LOG_TEXT_MAX],
                     "enable_thinking": self.enable_thinking,
                 }
             )

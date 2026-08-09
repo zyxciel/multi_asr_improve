@@ -29,6 +29,8 @@ from stage2_asr.types import Hypothesis
 
 LogFn = Callable[[dict[str, Any]], None]
 _BACKENDS = {"transformers", "vllm", "vllm_engine"}
+# Cap stored prompt/response text in llm_infer.jsonl (full length still in *_chars).
+_LOG_TEXT_MAX = 16000
 
 
 class Qwen36LlmJudge:
@@ -225,8 +227,9 @@ class Qwen36LlmJudge:
                     "user_chars": len(user),
                     "response_chars": len(text),
                     "error": None,
-                    "response": text[:4000],
-                    "reasoning": (reasoning[:4000] if reasoning else None),
+                    "user": user[:_LOG_TEXT_MAX],
+                    "response": text[:_LOG_TEXT_MAX],
+                    "reasoning": (reasoning[:_LOG_TEXT_MAX] if reasoning else None),
                     "enable_thinking": self.enable_thinking,
                 }
             )
@@ -273,7 +276,10 @@ class Qwen36LlmJudge:
                     "user_chars": len(user),
                     "response_chars": 0 if isinstance(raw, BaseException) else len(str(raw)),
                     "error": str(raw) if isinstance(raw, BaseException) else None,
-                    "response": None if isinstance(raw, BaseException) else str(raw)[:4000],
+                    "user": user[:_LOG_TEXT_MAX],
+                    "response": None
+                    if isinstance(raw, BaseException)
+                    else str(raw)[:_LOG_TEXT_MAX],
                 }
             )
         self._emit_log(
@@ -388,7 +394,9 @@ class Qwen36LlmJudge:
                     "user_chars": len(user),
                     "response_chars": len(text),
                     "error": err,
-                    "response": text[:4000] if text else None,
+                    "user": user[:_LOG_TEXT_MAX],
+                    "response": text[:_LOG_TEXT_MAX] if text else None,
+                    "enable_thinking": self.enable_thinking,
                 }
             )
 
@@ -435,7 +443,7 @@ class Qwen36LlmJudge:
                     "backend": self.backend,
                     "pass": "parse_reasoning",
                     "ok": True,
-                    "reasoning": reasoning[:4000],
+                    "reasoning": reasoning[:_LOG_TEXT_MAX],
                     "enable_thinking": self.enable_thinking,
                 }
             )
