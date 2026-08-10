@@ -133,7 +133,7 @@ python -m stage2_asr.cli run-batch \
 ```
 
 - First call loads the model into NPU; later units reuse the same engine.
-- `--pass-a-batch-size N` runs Pass A as one `LLM.generate([N prompts])` (true batching).
+- `--pass-a-batch-size N` runs Pass A as `LLM.generate([N prompts])` (true batching), including validation retries (avoids a serial `1/1` tail).
 - Thinking/CoT is **off by default** (`enable_thinking=False` in chat template). Use `--llm-enable-thinking` only if you need it; leaked `<think>` blocks are stripped and logged to `llm_infer.jsonl`, JSON only drives Pass A/B.
 - DeepSeek fallback is **disabled automatically** for `vllm_engine` (avoids loading a second engine / OOM). Prefer `--no-deepseek-fallback`.
 - Traces: `work-dir/llm_infer.jsonl` (includes `user` prompt + `response`, each capped at 16k chars)

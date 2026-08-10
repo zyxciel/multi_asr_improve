@@ -200,7 +200,7 @@ def run_pass_a_batch(
 
     items: [{unit, hyps}, ...]
     When config.pass_a_batch_size > 1 and judge exposes judge_many (vLLM),
-    first-attempt LLM calls are issued concurrently.
+    first-attempt and retry LLM calls are issued via judge_many (batched).
     """
     batch_size = max(1, int(getattr(config, "pass_a_batch_size", 1) or 1))
     # Fast path: sequential (preserves per-unit draft updates between units).
@@ -255,12 +255,8 @@ def run_pass_a_batch(
             }
         )
 
-    # Chunk concurrent first attempts.
-    pending = list(prepared)
-    while pending:
-        chunk = pending[:batch_size]
-        pending = pending[batch_size:]
-        chunk_jobs = [
+    def _jobs_for(chunk: list[dict]) -> list[dict]:
+        return [
             {
                 "hypotheses": p["hyps"],
                 "neighbor_draft": p["neighbors"],
@@ -271,34 +267,41 @@ def run_pass_a_batch(
             }
             for p in chunk
         ]
-        raws = llm_judge.judge_many(chunk_jobs, max_workers=batch_size)
-        retry_items: list[dict] = []
+
+    def _accept_or_defer(
+        chunk: list[dict],
+        raws: list,
+        *,
+        attempt: int,
+    ) -> list[dict]:
+        """Finalize valid judgments; return items that still need another try."""
+        deferred: list[dict] = []
         for p, raw in zip(chunk, raws):
             i = p["index"]
             audit = p["audit"]
             if isinstance(raw, BaseException):
-                audit["retries"] = 1
+                audit["retries"] = attempt
                 audit["last_error"] = str(raw)
-                retry_items.append(p)
+                deferred.append(p)
                 continue
             ok, err = validate_judgment_schema(raw)
             if not ok:
-                audit["retries"] = 1
+                audit["retries"] = attempt
                 audit["last_error"] = err
-                retry_items.append(p)
+                deferred.append(p)
                 continue
             judgment = judgment_from_payload(raw)
             ok2, err2 = validate_edits_span_local(judgment.edits)
             if not ok2:
-                audit["retries"] = 1
+                audit["retries"] = attempt
                 audit["last_error"] = err2
-                retry_items.append(p)
+                deferred.append(p)
                 continue
             ok3, err3 = validate_edits_evidence_ladder(judgment.edits)
             if not ok3:
-                audit["retries"] = 1
+                audit["retries"] = attempt
                 audit["last_error"] = err3
-                retry_items.append(p)
+                deferred.append(p)
                 continue
             text, audit2 = _finalize_from_raw(
                 raw=raw,
@@ -308,21 +311,75 @@ def run_pass_a_batch(
                 audit=audit,
             )
             results[i] = (text, audit2)
+        return deferred
 
-        # Retries / fallback sequential for failed chunk members.
-        for p in retry_items:
-            text, audit = run_pass_a_for_unit(
-                unit=p["unit"],
-                turns=turns,
-                hyps=p["hyps"],
-                draft_texts=draft_texts,
-                llm_judge=llm_judge,
-                hotwords=hotwords,
-                config=config,
-                fallback_judge=fallback_judge,
+    # Chunked first attempt + re-batched retries (avoid serial 1/1 tail).
+    pending = list(prepared)
+    while pending:
+        chunk = pending[:batch_size]
+        pending = pending[batch_size:]
+        still = _accept_or_defer(
+            chunk,
+            llm_judge.judge_many(_jobs_for(chunk), max_workers=batch_size),
+            attempt=1,
+        )
+        # attempt 0 was the first batch; remaining retries are 2..llm_max_retries+1
+        for attempt in range(2, config.llm_max_retries + 2):
+            if not still:
+                break
+            still = _accept_or_defer(
+                still,
+                llm_judge.judge_many(_jobs_for(still), max_workers=batch_size),
+                attempt=attempt,
             )
+
+        if still and fallback_judge is not None and hasattr(fallback_judge, "judge_many"):
+            before = list(still)
+            for p in before:
+                p["audit"]["fallback_judge"] = getattr(fallback_judge, "name", "fallback")
+            still = _accept_or_defer(
+                before,
+                fallback_judge.judge_many(_jobs_for(before), max_workers=batch_size),
+                attempt=max(int(before[0]["audit"].get("retries") or 0), 1),
+            )
+            recovered = {p["index"] for p in before} - {p["index"] for p in still}
+            for idx in recovered:
+                text, audit = results[idx]  # type: ignore[misc]
+                audit["fallback_judge_ok"] = True
+                results[idx] = (text, audit)
+        elif still and fallback_judge is not None:
+            next_still: list[dict] = []
+            for p in still:
+                audit = p["audit"]
+                audit["fallback_judge"] = getattr(fallback_judge, "name", "fallback")
+                raw, err = _try_judge(
+                    fallback_judge,
+                    hyps=p["hyps"],
+                    neighbors=p["neighbors"],
+                    hotwords=hotwords,
+                    unit=p["unit"],
+                )
+                if raw is None:
+                    audit["last_error"] = err or audit.get("last_error")
+                    next_still.append(p)
+                    continue
+                text, audit2 = _finalize_from_raw(
+                    raw=raw,
+                    unit=p["unit"],
+                    hyps=p["hyps"],
+                    prefer_moss=p["prefer_moss"],
+                    audit=audit,
+                )
+                audit2["fallback_judge_ok"] = True
+                results[p["index"]] = (text, audit2)
+            still = next_still
+
+        for p in still:
+            best = pick_best_hyp(p["hyps"], prefer_moss_on_overlap=p["prefer_moss"])
+            audit = p["audit"]
+            audit["fallback"] = True
             audit["batched"] = True
-            results[p["index"]] = (text, audit)
+            results[p["index"]] = ((best.text if best else ""), audit)
 
     # Apply draft updates in original order.
     out: list[tuple[str, dict]] = []
