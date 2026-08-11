@@ -5,7 +5,9 @@ Mock-first Stage-2 package on **diarizen_moss_fusion** Mode-C outputs, with opti
 ## Docs
 
 - [Design](docs/2026-07-24-stage2-multi-asr-llm-fusion-design.md)
+- [Status & next steps (2026-08-11 handoff)](docs/2026-08-11-stage2-status-and-next-steps.md)
 - [Upstream references](docs/references.md)
+- [Hotwords](docs/hotwords.txt)
 
 ## Install
 
