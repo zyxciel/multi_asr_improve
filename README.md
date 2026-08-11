@@ -104,7 +104,13 @@ stage2-asr run-batch \
   --backend real --enable-real --stage llm
 ```
 
-Useful flags: `--limit N`, `--fail-fast`, `--hotwords path.json`.  
+Useful flags: `--limit N`, `--fail-fast`, `--hotwords docs/hotwords.txt`.
+
+**Hotwords file formats** (any of these work with `--hotwords`):
+- Plaintext one term per line (repo default: `docs/hotwords.txt`)
+- JSON array: `["单框架", "账号|帐号"]`
+- Alias form `正确词|错误写法` enables Pass B deterministic rewrite when `|Δlen|≤1`
+
 Summary + skips/errors: `work-root/batch_summary.json`.
 
 ## LLM backend (vLLM / Ascend 910B)

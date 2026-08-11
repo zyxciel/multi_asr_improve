@@ -457,9 +457,7 @@ BIM技术
 朝辉
 凌雪
 醛固酮
-曦沫
 镓和锗
-槐昱
 嘌呤
 酰胺
 庚辛壬癸
@@ -470,7 +468,6 @@ BIM技术
 砷化镓
 氢氨醇
 鬼灭之刃
-昇腾
 宏鹤
 千问
 辜博
@@ -504,27 +501,10 @@ TCP
 源相控阵
 语谱图
 4mic
-XMAGE
-小艺慧记
 micin
 micout
-练秋湖
-歼10C
-NPU
 X86
 MR版本
-UX
-凯盛
-小艺
-小艺看世界
-TR4
-AITO
-RAT
-TCP
-频谱
-源相控阵
-语谱图
-4mic
 LLM
 大语言模型
 基础模型
@@ -603,7 +583,6 @@ GLM-4.5
 ChatGLM
 智谱
 智谱清言
-Kimi
 Kimi K2
 Moonshot
 月之暗面
@@ -658,7 +637,6 @@ PaliGemma
 NVIDIA Nemotron
 DBRX
 Jamba
-ASR
 自动语音识别
 语音识别
 TTS
@@ -726,7 +704,6 @@ domain-specific vocabulary
 hotword
 热词
 hotword biasing
-Agent
 AI Agent
 智能体
 Multi-Agent
@@ -743,7 +720,6 @@ Prompt
 System Prompt
 Function Calling
 Tool Calling
-MCP
 Model Context Protocol
 微调
 Fine-tuning

@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 from stage2_asr.batch import build_runners, run_batch
+from stage2_asr.hotwords import load_hotwords
 from stage2_asr.pipeline import run_pipeline
 from stage2_asr.types import PipelineConfig
 
@@ -19,7 +20,11 @@ def _add_common_run_args(p: argparse.ArgumentParser) -> None:
         help="Backend selection (default: mock if --mock else real)",
     )
     p.add_argument("--mock-hyps", default=None, help="Optional mock hypothesis fixture JSON")
-    p.add_argument("--hotwords", default=None, help="Optional hotword list JSON")
+    p.add_argument(
+        "--hotwords",
+        default=None,
+        help="Hotword list path: JSON array/object or plaintext one-term-per-line (e.g. docs/hotwords.txt)",
+    )
     p.add_argument(
         "--stage",
         default="all",
@@ -144,12 +149,6 @@ def _resolve_backend(args: argparse.Namespace) -> str | None:
     return backend
 
 
-def _load_hotwords(path: str | None) -> list[str]:
-    if not path:
-        return []
-    return json.loads(Path(path).read_text(encoding="utf-8"))
-
-
 def _vllm_flags(args: argparse.Namespace) -> dict:
     enforce = True
     if getattr(args, "no_vllm_enforce_eager", False):
@@ -212,7 +211,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         asr_runner=asr,
         llm_judge=llm,
         config=cfg,
-        hotwords=_load_hotwords(args.hotwords),
+        hotwords=load_hotwords(args.hotwords),
         fallback_judge=fallback_judge,
         stage=stage,
         asr_models=asr_models,
@@ -260,7 +259,7 @@ def _cmd_run_batch(args: argparse.Namespace) -> int:
         backend=backend,
         stage=str(args.stage).lower(),
         asr_models=asr_models,
-        hotwords=_load_hotwords(args.hotwords),
+        hotwords=load_hotwords(args.hotwords),
         datasets=datasets,
         limit=args.limit,
         dry_run=bool(args.dry_run),
