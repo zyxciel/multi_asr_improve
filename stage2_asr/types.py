@@ -132,6 +132,9 @@ class PipelineConfig:
     edge_zone_ratio: float = 0.10
     # Concurrent Pass A HTTP calls against vLLM/vLLM-Ascend (1 = sequential).
     pass_a_batch_size: int = 1
+    # Pass B: 1 = sequential (later turns see earlier Pass B edits).
+    # >1 = snapshot meeting draft + judge_many (faster; no in-pass cascade).
+    pass_b_batch_size: int = 1
 
 
 @dataclass

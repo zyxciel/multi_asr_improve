@@ -20,6 +20,7 @@ Stage-2 is **operational** for pilot / platform runs:
 | Pass A/B LLM judge (Qwen3.6) via `vllm_engine` on Ascend | Done |
 | Thinking/CoT off by default + robust JSON extract | Done |
 | Pass A true batching + **re-batched retries** (no serial `1/1` tail) | Done |
+| Optional Pass B `judge_many` (`--pass-b-batch-size N`, default sequential) | Done |
 | `llm_infer.jsonl` with `user` + `response` (≤16k chars each) | Done |
 | Hotwords: `docs/hotwords.txt` (761 unique; plaintext loader) | Done |
 
@@ -28,7 +29,6 @@ Stage-2 is **operational** for pilot / platform runs:
 - Discourse / semantic Tier (e.g. `爱情` → `娃娃亲` from topic context)
 - Punctuation / fluency / term-normalization as a separate polish stage
 - Token-aware neighbor truncation (ops workaround: raise `--vllm-max-model-len`)
-- Pass B `judge_many` batching
 - Built-in data-parallel launcher (use split tasks instead)
 
 ---
@@ -136,7 +136,7 @@ Pass B (and heavy Pass A neighbors) can exceed small `max_model_len` (e.g. 4096)
 - Template + hyps/pinyin + hotwords + `max_tokens` reservation  
 
 **Ops fix first:** `--vllm-max-model-len 8192` (or 16384) if KV allows; else lower util (`--vllm-gpu-memory-utilization 0.85`) / keep TP=2.  
-**Code fix later:** token-aware truncate + Pass B neighbors by time distance (same as Pass A).
+**Pass B speed A/B:** keep ASR + Pass A artifacts; rerun `--stage pass_b` with `--pass-b-batch-size 1` vs `64` into **separate** `--work-dir` copies (or copy `mode_c_draft.json` / hyps). Compare wall time, `pass_stats.pass_b.n_audits` / `n_batched`, and `llm_edits.jsonl` Pass B lines.
 
 ---
 
@@ -188,7 +188,6 @@ Ordered for a large-scale cleanup launch:
 
 - [ ] CLI for `--neighbor-max-turns` / `--neighbor-window-seconds`  
 - [ ] Token-aware prompt truncate (reserve `max_tokens`)  
-- [ ] Pass B batched `judge_many`  
 - [ ] Lower default judge `max_tokens` (256–512)  
 
 ### E. Policy (only if pilot shows discourse errors dominate)

@@ -84,6 +84,15 @@ def _add_common_run_args(p: argparse.ArgumentParser) -> None:
         help="Pass A micro-batch size (>1 enables batched vllm_engine.generate / HTTP concurrency)",
     )
     p.add_argument(
+        "--pass-b-batch-size",
+        type=int,
+        default=1,
+        help=(
+            "Pass B micro-batch size (1 = sequential, later turns see earlier Pass B edits; "
+            ">1 = snapshot meeting_draft + judge_many for A/B speed vs quality)"
+        ),
+    )
+    p.add_argument(
         "--vllm-tp-size",
         type=int,
         default=1,
@@ -171,6 +180,7 @@ def _pipeline_config(args: argparse.Namespace) -> PipelineConfig:
     return PipelineConfig(
         max_asr_seconds=float(args.max_asr_seconds),
         pass_a_batch_size=max(1, int(args.pass_a_batch_size)),
+        pass_b_batch_size=max(1, int(getattr(args, "pass_b_batch_size", 1))),
     )
 
 

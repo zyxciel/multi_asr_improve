@@ -100,6 +100,52 @@ def _meeting_draft(turns: list[Turn], texts: dict[int, str]) -> list[dict]:
     ]
 
 
+def _cap_neighbors(meeting: list[dict], turn_index: int, cfg: PipelineConfig) -> list[dict]:
+    """Cap meeting neighbors (~4096 tokens ≈ 8192 chars, neighbor_max_turns)."""
+    neighbors = [row for row in meeting if row["turn_index"] != turn_index]
+    char_budget = 4096 * 2
+    used = 0
+    capped: list[dict] = []
+    for row in neighbors:
+        cost = len(str(row.get("text", ""))) + 32
+        if capped and used + cost > char_budget:
+            break
+        capped.append(row)
+        used += cost
+        if len(capped) >= cfg.neighbor_max_turns:
+            break
+    return capped
+
+
+def _hyps_for_turn(i: int, text: str, moss_texts: dict[int, str]) -> list[Hypothesis]:
+    hyps: list[Hypothesis] = [Hypothesis("draft", text)]
+    if i in moss_texts:
+        hyps.insert(0, Hypothesis("moss", moss_texts[i]))
+    return hyps
+
+
+def _validate_pass_b_raw(raw) -> tuple[dict | None, str | None]:
+    if isinstance(raw, BaseException):
+        return None, str(raw)
+    if not isinstance(raw, dict):
+        return None, f"expected dict judgment, got {type(raw).__name__}"
+    ok, err = validate_judgment_schema(raw)
+    if not ok:
+        return None, err
+    judgment = judgment_from_payload(raw)
+    if any(e.tier == "A" for e in judgment.edits):
+        return None, "pass_b_rejects_tier_a"
+    ok2, err2 = validate_edits_span_local(judgment.edits)
+    if not ok2:
+        return None, err2
+    ok3, err3 = validate_edits_evidence_ladder(
+        judgment.edits, allowed_tiers=_PASS_B_TIERS
+    )
+    if not ok3:
+        return None, err3
+    return raw, None
+
+
 def _try_pass_b_judge(
     llm_judge,
     *,
@@ -121,21 +167,220 @@ def _try_pass_b_judge(
         )
     except Exception as exc:  # noqa: BLE001
         return None, str(exc)
-    ok, err = validate_judgment_schema(raw)
-    if not ok:
-        return None, err
-    judgment = judgment_from_payload(raw)
-    if any(e.tier == "A" for e in judgment.edits):
-        return None, "pass_b_rejects_tier_a"
-    ok2, err2 = validate_edits_span_local(judgment.edits)
-    if not ok2:
-        return None, err2
-    ok3, err3 = validate_edits_evidence_ladder(
-        judgment.edits, allowed_tiers=_PASS_B_TIERS
-    )
-    if not ok3:
-        return None, err3
-    return raw, None
+    return _validate_pass_b_raw(raw)
+
+
+def _apply_pass_b_accepted(
+    *,
+    out: dict[int, str],
+    audits: list[dict],
+    i: int,
+    text: str,
+    accepted: dict,
+    overlap: bool,
+    heavy: bool,
+    used_fallback: bool,
+    batched: bool = False,
+) -> bool:
+    """Apply a validated Pass B judgment. Returns True if the turn text changed."""
+    extra = {"batched": True} if batched else {}
+    judgment = judgment_from_payload(accepted)
+    new_text = judgment.text
+    if overlap or heavy:
+        if judgment.base_model not in {"moss", "draft"} and not judgment.edits:
+            audits.append(
+                {
+                    "turn_index": i,
+                    "pass": "B",
+                    "path": "moss_aware_reject",
+                    "reason": "overlap_non_moss_base_without_edits",
+                    "base_model": judgment.base_model,
+                    **extra,
+                }
+            )
+            return False
+    if new_text != text:
+        out[i] = new_text
+        for e in judgment.edits:
+            audits.append(
+                {
+                    "turn_index": i,
+                    "pass": "B",
+                    "path": "llm",
+                    "span_asr": e.span_asr,
+                    "span_out": e.span_out,
+                    "tier": e.tier,
+                    "anchor": e.anchor,
+                    "fallback_judge_ok": used_fallback or None,
+                    **extra,
+                }
+            )
+        if not judgment.edits:
+            audits.append(
+                {
+                    "turn_index": i,
+                    "pass": "B",
+                    "path": "llm",
+                    "tier": "B",
+                    "anchor": "meeting_draft",
+                    "span_asr": text,
+                    "span_out": new_text,
+                    "fallback_judge_ok": used_fallback or None,
+                    **extra,
+                }
+            )
+        return True
+    return False
+
+
+def _run_pass_b_batched(
+    *,
+    turns: list[Turn],
+    out: dict[int, str],
+    audits: list[dict],
+    hotwords: list[str],
+    llm_judge,
+    fallback_judge,
+    cfg: PipelineConfig,
+    overlap_turn_indices: set[int],
+    heavy_overlap_turn_indices: set[int],
+    moss_texts: dict[int, str],
+) -> tuple[dict[int, str], list[dict]]:
+    """Snapshot meeting_draft once; judge_many in chunks (no in-pass cascade)."""
+    meeting = _meeting_draft(turns, out)
+    batch_size = max(1, int(getattr(cfg, "pass_b_batch_size", 1) or 1))
+    prepared: list[dict] = []
+    for i, turn in enumerate(turns):
+        text = out.get(i, turn.text)
+        if not text:
+            continue
+        if turn.duration + 1e-9 < cfg.min_asr_seconds:
+            continue
+        prepared.append(
+            {
+                "i": i,
+                "text": text,
+                "overlap": i in overlap_turn_indices,
+                "heavy": i in heavy_overlap_turn_indices,
+                "hyps": _hyps_for_turn(i, text, moss_texts),
+                "neighbors": _cap_neighbors(meeting, i, cfg),
+                "unit_id": f"pass_b_t{i}",
+                "last_err": None,
+            }
+        )
+
+    def _jobs_for(chunk: list[dict]) -> list[dict]:
+        return [
+            {
+                "hypotheses": p["hyps"],
+                "neighbor_draft": p["neighbors"],
+                "hotwords": hotwords,
+                "overlap": p["overlap"],
+                "heavy_overlap": p["heavy"],
+                "unit_id": p["unit_id"],
+            }
+            for p in chunk
+        ]
+
+    def _accept_or_defer(chunk: list[dict], raws: list, *, attempt: int) -> list[dict]:
+        deferred: list[dict] = []
+        for p, raw in zip(chunk, raws):
+            accepted, err = _validate_pass_b_raw(raw)
+            if accepted is None:
+                p["last_err"] = err
+                p["retries"] = attempt
+                deferred.append(p)
+                continue
+            _apply_pass_b_accepted(
+                out=out,
+                audits=audits,
+                i=p["i"],
+                text=p["text"],
+                accepted=accepted,
+                overlap=p["overlap"],
+                heavy=p["heavy"],
+                used_fallback=bool(p.get("used_fallback")),
+                batched=True,
+            )
+        return deferred
+
+    pending = list(prepared)
+    while pending:
+        chunk = pending[:batch_size]
+        pending = pending[batch_size:]
+        still = _accept_or_defer(
+            chunk,
+            llm_judge.judge_many(_jobs_for(chunk), max_workers=batch_size),
+            attempt=1,
+        )
+        for attempt in range(2, cfg.llm_max_retries + 2):
+            if not still:
+                break
+            still = _accept_or_defer(
+                still,
+                llm_judge.judge_many(_jobs_for(still), max_workers=batch_size),
+                attempt=attempt,
+            )
+
+        if still and fallback_judge is not None and hasattr(fallback_judge, "judge_many"):
+            before = list(still)
+            for p in before:
+                p["used_fallback"] = True
+            still = _accept_or_defer(
+                before,
+                fallback_judge.judge_many(_jobs_for(before), max_workers=batch_size),
+                attempt=max(int(before[0].get("retries") or 0), 1),
+            )
+            recovered = {p["i"] for p in before} - {p["i"] for p in still}
+            for a in audits:
+                if a.get("turn_index") in recovered and a.get("path") == "llm":
+                    a["fallback_judge_ok"] = True
+                    a["fallback_judge"] = getattr(fallback_judge, "name", "fallback")
+        elif still and fallback_judge is not None:
+            next_still: list[dict] = []
+            for p in still:
+                p["used_fallback"] = True
+                raw, err = _try_pass_b_judge(
+                    fallback_judge,
+                    hyps=p["hyps"],
+                    neighbors=p["neighbors"],
+                    hotwords=hotwords,
+                    overlap=p["overlap"],
+                    heavy_overlap=p["heavy"],
+                    unit_id=p["unit_id"],
+                )
+                if raw is None:
+                    p["last_err"] = err or p.get("last_err")
+                    next_still.append(p)
+                    continue
+                _apply_pass_b_accepted(
+                    out=out,
+                    audits=audits,
+                    i=p["i"],
+                    text=p["text"],
+                    accepted=raw,
+                    overlap=p["overlap"],
+                    heavy=p["heavy"],
+                    used_fallback=True,
+                    batched=True,
+                )
+            still = next_still
+
+        for p in still:
+            audits.append(
+                {
+                    "turn_index": p["i"],
+                    "pass": "B",
+                    "path": "llm",
+                    "fallback": True,
+                    "batched": True,
+                    "fallback_judge": getattr(fallback_judge, "name", None)
+                    if p.get("used_fallback")
+                    else None,
+                    "last_error": p.get("last_err"),
+                }
+            )
+    return out, audits
 
 
 def run_pass_b(
@@ -154,6 +399,7 @@ def run_pass_b(
     Required global consistency pass:
     1) Hotword alias fast path (span-local + Tier C)
     2) Optional LLM Tier B/C scan with full meeting_draft as neighbors
+       (sequential by default; `--pass-b-batch-size N` snapshots neighbors and batches)
     3) MOSS-aware: overlap turns prefer / force moss provisional text
     4) Optional fallback_judge (e.g. DeepSeek) after primary retries fail
     """
@@ -182,6 +428,21 @@ def run_pass_b(
                 )
         return out, audits
 
+    batch_size = max(1, int(getattr(cfg, "pass_b_batch_size", 1) or 1))
+    if batch_size > 1 and hasattr(llm_judge, "judge_many"):
+        return _run_pass_b_batched(
+            turns=turns,
+            out=out,
+            audits=audits,
+            hotwords=hotwords,
+            llm_judge=llm_judge,
+            fallback_judge=fallback_judge,
+            cfg=cfg,
+            overlap_turn_indices=overlap_turn_indices,
+            heavy_overlap_turn_indices=heavy_overlap_turn_indices,
+            moss_texts=moss_texts,
+        )
+
     meeting = _meeting_draft(turns, out)
     for i, turn in enumerate(turns):
         text = out.get(i, turn.text)
@@ -192,29 +453,14 @@ def run_pass_b(
 
         overlap = i in overlap_turn_indices
         heavy = i in heavy_overlap_turn_indices
-        hyps: list[Hypothesis] = [Hypothesis("draft", text)]
-        if i in moss_texts:
-            hyps.insert(0, Hypothesis("moss", moss_texts[i]))
-
-        neighbors = [row for row in meeting if row["turn_index"] != i]
-        # Cap neighbors similarly to Pass A (~4096 tokens ≈ 8192 chars).
-        char_budget = 4096 * 2
-        used = 0
-        capped: list[dict] = []
-        for row in neighbors:
-            cost = len(str(row.get("text", ""))) + 32
-            if capped and used + cost > char_budget:
-                break
-            capped.append(row)
-            used += cost
-            if len(capped) >= cfg.neighbor_max_turns:
-                break
+        hyps = _hyps_for_turn(i, text, moss_texts)
+        capped = _cap_neighbors(meeting, i, cfg)
 
         unit_id = f"pass_b_t{i}"
         accepted = None
         last_err = None
         used_fallback = False
-        for attempt in range(cfg.llm_max_retries + 1):
+        for _attempt in range(cfg.llm_max_retries + 1):
             raw, err = _try_pass_b_judge(
                 llm_judge,
                 hyps=hyps,
@@ -261,52 +507,18 @@ def run_pass_b(
             )
             continue
 
-        judgment = judgment_from_payload(accepted)
-        new_text = judgment.text
-        if overlap or heavy:
-            # MOSS-aware: reject non-moss/non-draft base with no Tier B/C evidence
-            # (do not wipe Pass A repairs by forcing raw moss back).
-            if judgment.base_model not in {"moss", "draft"} and not judgment.edits:
-                audits.append(
-                    {
-                        "turn_index": i,
-                        "pass": "B",
-                        "path": "moss_aware_reject",
-                        "reason": "overlap_non_moss_base_without_edits",
-                        "base_model": judgment.base_model,
-                    }
-                )
-                continue
-
-        if new_text != text:
-            out[i] = new_text
-            for e in judgment.edits:
-                audits.append(
-                    {
-                        "turn_index": i,
-                        "pass": "B",
-                        "path": "llm",
-                        "span_asr": e.span_asr,
-                        "span_out": e.span_out,
-                        "tier": e.tier,
-                        "anchor": e.anchor,
-                        "fallback_judge_ok": used_fallback or None,
-                    }
-                )
-            if not judgment.edits:
-                audits.append(
-                    {
-                        "turn_index": i,
-                        "pass": "B",
-                        "path": "llm",
-                        "tier": "B",
-                        "anchor": "meeting_draft",
-                        "span_asr": text,
-                        "span_out": new_text,
-                        "fallback_judge_ok": used_fallback or None,
-                    }
-                )
-            # Refresh meeting draft for subsequent turns
+        changed = _apply_pass_b_accepted(
+            out=out,
+            audits=audits,
+            i=i,
+            text=text,
+            accepted=accepted,
+            overlap=overlap,
+            heavy=heavy,
+            used_fallback=used_fallback,
+            batched=False,
+        )
+        if changed:
             meeting = _meeting_draft(turns, out)
 
     return out, audits

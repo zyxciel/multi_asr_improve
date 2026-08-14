@@ -177,6 +177,7 @@ def _summarize_pass_b(audits: list[dict]) -> dict[str, Any]:
         "fallback_judge_success": sum(1 for a in audits if a.get("fallback_judge_ok")),
         "moss_aware_reject": sum(1 for a in audits if a.get("path") == "moss_aware_reject"),
         "moss_force": sum(1 for a in audits if a.get("path") == "moss_force"),
+        "n_batched": sum(1 for a in audits if a.get("batched")),
     }
 
 
@@ -510,7 +511,10 @@ def _run_pipeline_body(
         draft_doc = json.loads(draft_path.read_text(encoding="utf-8"))
         draft_turns = [Turn.from_dict(t) for t in draft_doc.get("turns", [])]
         draft_texts = {i: t.text for i, t in enumerate(draft_turns)}
-        _log(f"[pass_b] start: {len(draft_turns)} turns work_dir={work_dir}")
+        _log(
+            f"[pass_b] start: {len(draft_turns)} turns "
+            f"batch_size={cfg.pass_b_batch_size} work_dir={work_dir}"
+        )
         final_map, pass_b_audits = run_pass_b(
             turns,
             draft_texts,
@@ -646,7 +650,10 @@ def _run_pipeline_body(
             "pass_stats": pass_stats,
         }
 
-    _log(f"[pass_b] start: {len(turns)} turns work_dir={work_dir}")
+    _log(
+        f"[pass_b] start: {len(turns)} turns "
+        f"batch_size={cfg.pass_b_batch_size} work_dir={work_dir}"
+    )
     final_map, pass_b_audits = run_pass_b(
         turns,
         draft_texts,

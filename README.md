@@ -135,6 +135,7 @@ python -m stage2_asr.cli run-batch \
   --llm-backend vllm_engine \
   --llm-model-id /path/or/hf/id/to/Qwen3.6-27B \
   --pass-a-batch-size 16 \
+  --pass-b-batch-size 16 \
   --vllm-tp-size 1 \
   --vllm-gpu-memory-utilization 0.90 \
   --no-deepseek-fallback
@@ -142,6 +143,7 @@ python -m stage2_asr.cli run-batch \
 
 - First call loads the model into NPU; later units reuse the same engine.
 - `--pass-a-batch-size N` runs Pass A as `LLM.generate([N prompts])` (true batching), including validation retries (avoids a serial `1/1` tail).
+- `--pass-b-batch-size N` (default **1** = sequential). `N>1` snapshots the Pass A meeting draft and batches Pass B with `judge_many` (faster; later turns do **not** see in-pass Pass B rewrites). Use the same `work-dir` ASR/Pass A artifacts and compare `pass_stats.json` / `llm_edits.jsonl` for the A/B.
 - Thinking/CoT is **off by default** (`enable_thinking=False` in chat template). Use `--llm-enable-thinking` only if you need it; leaked `<think>` blocks are stripped and logged to `llm_infer.jsonl`, JSON only drives Pass A/B.
 - DeepSeek fallback is **disabled automatically** for `vllm_engine` (avoids loading a second engine / OOM). Prefer `--no-deepseek-fallback`.
 - Traces: `work-dir/llm_infer.jsonl` (includes `user` prompt + `response`, each capped at 16k chars)
