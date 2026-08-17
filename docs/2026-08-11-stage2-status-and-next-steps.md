@@ -17,7 +17,7 @@ Stage-2 is **operational** for pilot / platform runs:
 | Staged runs (`asr` / `pass_a` / `pass_b` / `llm`) + artifact reuse | Done |
 | Dataset `run-batch` (wav ↔ `mode_c.json` pairing) | Done |
 | Multi-ASR (MOSS / Qwen3-ASR / FireRed) + crop reuse | Done |
-| Pass A/B LLM judge (Qwen3.6) via `vllm_engine` on Ascend | Done |
+| Pass A/B LLM judge (Qwen3.8-27B) via `vllm_engine` on Ascend | Done |
 | Thinking/CoT off by default + robust JSON extract | Done |
 | Pass A true batching + **re-batched retries** (no serial `1/1` tail) | Done |
 | Optional Pass B `judge_many` (`--pass-b-batch-size N`, default sequential) | Done |
@@ -87,7 +87,7 @@ stage2-asr run-batch \
   --work-root /path/to/stage2_out \
   --backend real --enable-real --stage llm \
   --llm-backend vllm_engine \
-  --llm-model-id /path/or/hf/id/Qwen3.6-27B \
+  --llm-model-id /path/or/hf/id/Qwen3.8-27B \
   --vllm-tp-size 2 \
   --vllm-dtype bf16 \
   --vllm-max-model-len 8192 \

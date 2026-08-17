@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 """
-Qwen3.6-27B text LLM judge adapter.
+Qwen3.8-27B text LLM judge adapter (also works with Qwen3.6-27B via --llm-model-id).
 
-Upstream weights: https://huggingface.co/Qwen/Qwen3.6-27B
+Upstream weights: https://huggingface.co/Qwen/Qwen3.8-27B
 Backends:
   - transformers: local AutoModelForCausalLM (device_map=auto) — slow
   - vllm: OpenAI-compatible HTTP server
@@ -82,6 +82,12 @@ class Qwen36LlmJudge:
             raise ValueError(
                 f"unsupported llm backend {backend!r}; expected {sorted(_BACKENDS)}"
             )
+
+    def _thinking_template_kwargs(self) -> dict[str, bool]:
+        kwargs = {"enable_thinking": self.enable_thinking}
+        if not self.enable_thinking:
+            kwargs["preserve_thinking"] = False
+        return kwargs
 
     def _format_hyps(self, hypotheses: list[Hypothesis]) -> str:
         lines = []
@@ -259,6 +265,7 @@ class Qwen36LlmJudge:
                 "max_tokens": self.max_tokens,
                 "api_key": self.api_key,
                 "timeout_s": self.timeout_s,
+                "chat_template_kwargs": self._thinking_template_kwargs(),
             }
             for _, user in prompts_meta
         ]
@@ -375,6 +382,7 @@ class Qwen36LlmJudge:
                     max_tokens=self.max_tokens,
                     api_key=self.api_key,
                     timeout_s=self.timeout_s,
+                    chat_template_kwargs=self._thinking_template_kwargs(),
                 )
             else:
                 text = self._generate_transformers(system, user)

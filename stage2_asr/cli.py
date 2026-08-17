@@ -38,7 +38,11 @@ def _add_common_run_args(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument("--max-asr-seconds", type=float, default=30.0)
     p.add_argument("--qwen-model-id", default="Qwen/Qwen3-ASR-1.7B")
-    p.add_argument("--llm-model-id", default="Qwen/Qwen3.6-27B")
+    p.add_argument(
+        "--llm-model-id",
+        default="Qwen/Qwen3.6-27B",
+        help="Judge weights: Qwen/Qwen3.8-27B if the vLLM build can load it; else keep Qwen3.6-27B",
+    )
     p.add_argument("--deepseek-model-id", default="deepseek-ai/DeepSeek-V2.5")
     p.add_argument(
         "--no-deepseek-fallback",

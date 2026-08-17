@@ -29,6 +29,7 @@ def chat_completion(
     max_tokens: int = 1024,
     api_key: str | None = None,
     timeout_s: float = 300.0,
+    chat_template_kwargs: dict[str, Any] | None = None,
 ) -> str:
     """POST /v1/chat/completions; return assistant message content."""
     root = normalize_openai_base_url(base_url)
@@ -40,6 +41,8 @@ def chat_completion(
         "max_tokens": max_tokens,
         "stream": False,
     }
+    if chat_template_kwargs:
+        payload["chat_template_kwargs"] = chat_template_kwargs
     data = json.dumps(payload).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     if api_key:

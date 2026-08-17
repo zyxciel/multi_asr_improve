@@ -20,7 +20,9 @@ def test_chat_completion_openai_compat():
         def do_POST(self):  # noqa: N802
             length = int(self.headers.get("Content-Length", "0"))
             body = json.loads(self.rfile.read(length).decode("utf-8"))
-            assert body["model"] == "Qwen/Qwen3.6-27B"
+            assert body["model"] == "Qwen/Qwen3.8-27B"
+            if "chat_template_kwargs" in body:
+                assert body["chat_template_kwargs"].get("enable_thinking") is False
             assert body["messages"][0]["role"] == "system"
             payload = {
                 "choices": [
@@ -57,7 +59,7 @@ def test_chat_completion_openai_compat():
     try:
         text = chat_completion(
             base_url=f"http://127.0.0.1:{port}",
-            model="Qwen/Qwen3.6-27B",
+            model="Qwen/Qwen3.8-27B",
             messages=[{"role": "system", "content": "s"}, {"role": "user", "content": "u"}],
             temperature=0.1,
         )
@@ -67,7 +69,7 @@ def test_chat_completion_openai_compat():
             enabled=True,
             backend="vllm",
             base_url=f"http://127.0.0.1:{port}",
-            model_id="Qwen/Qwen3.6-27B",
+            model_id="Qwen/Qwen3.8-27B",
             log_fn=logs.append,
         )
         out = judge.judge(

@@ -52,11 +52,14 @@ def format_chat_prompt(
         {"role": "user", "content": user},
     ]
     if hasattr(tokenizer, "apply_chat_template"):
-        # Qwen3 / Qwen3.6: enable_thinking=False keeps CoT out of the decode path.
+        # Qwen3.6 / 3.8: thinking is on by default; disable for JSON-only ASR judge.
         kwargs = {
             "tokenize": False,
             "add_generation_prompt": True,
         }
+        template_kwargs = {"enable_thinking": bool(enable_thinking)}
+        if not enable_thinking:
+            template_kwargs["preserve_thinking"] = False
         try:
             return tokenizer.apply_chat_template(
                 messages,
@@ -67,7 +70,7 @@ def format_chat_prompt(
             try:
                 return tokenizer.apply_chat_template(
                     messages,
-                    chat_template_kwargs={"enable_thinking": bool(enable_thinking)},
+                    chat_template_kwargs=template_kwargs,
                     **kwargs,
                 )
             except TypeError:

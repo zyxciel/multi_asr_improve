@@ -7,7 +7,7 @@ Pinned open-source components for Stage-2 adapters.
 | Stage-1 fusion input | https://github.com/zyxciel/diarizen-moss-fusion | Consume `mode_c.json` |
 | Qwen3-ASR | https://github.com/QwenLM/Qwen3-ASR | `stage2_asr/runners/qwen3_asr.py` → `qwen_asr.Qwen3ASRModel.transcribe` |
 | FireRedASR2S | https://github.com/FireRedTeam/FireRedASR2S | `stage2_asr/runners/firered_asr2s.py` → `FireRedAsr2System` |
-| Judge LLM | https://huggingface.co/Qwen/Qwen3.6-27B | `stage2_asr/runners/llm_qwen36.py` |
+| Judge LLM | https://huggingface.co/Qwen/Qwen3.8-27B | `stage2_asr/runners/llm_qwen36.py` |
 | Dialect eval (future) | https://github.com/ASLP-lab/WenetSpeech-Chuan | Not wired |
 
 Local clones for API reference (gitignored): `third_party/Qwen3-ASR`, `third_party/FireRedASR2S`.
