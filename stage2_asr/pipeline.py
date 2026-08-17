@@ -232,6 +232,38 @@ def _merge_hyps(existing: list[dict], new: list[dict]) -> list[dict]:
     return [by_model[key] for key in sorted(by_model)]
 
 
+def _moss_hypothesis_from_turns(unit: AsrUnit, turns: list[Turn]) -> Hypothesis | None:
+    texts: list[str] = []
+    for i in unit.turn_indices:
+        if 0 <= i < len(turns) and (turns[i].text or "").strip():
+            texts.append(turns[i].text)
+    if not texts:
+        return None
+    return Hypothesis(
+        model="moss",
+        text="。".join(texts),
+        meta={"moss_merged": len(texts) > 1},
+    )
+
+
+def _ensure_moss_hyp(
+    hyps: list[Hypothesis],
+    unit: AsrUnit,
+    turns: list[Turn],
+    *,
+    selected: set[str],
+) -> list[Hypothesis]:
+    """Guarantee a moss hyp from Mode-C text when moss is requested (no GPU)."""
+    if "moss" not in selected:
+        return hyps
+    if any(h.model == "moss" and (h.text or "").strip() for h in hyps):
+        return hyps
+    moss = _moss_hypothesis_from_turns(unit, turns)
+    if moss is None:
+        return hyps
+    return [h for h in hyps if h.model != "moss"] + [moss]
+
+
 def _rebuild_overlap_metadata(
     records: list[dict],
     turns: list[Turn],
@@ -348,8 +380,11 @@ def _run_pipeline_body(
     audio = _load_audio_optional(audio_path, cfg.sample_rate)
     units_path = work_dir / "asr_units.json"
 
-    # LLM-only stages reload persisted units so unit_id stays aligned with asr_hypotheses.
-    if stage in {"pass_a", "pass_b", "llm"}:
+    # Reload persisted units so staged ASR (qwen/firered, then moss) keeps the same unit_id keys.
+    reuse_units = stage in {"pass_a", "pass_b", "llm"} or (
+        stage == "asr" and units_path.exists()
+    )
+    if reuse_units:
         loaded = _load_units(units_path)
         if loaded is not None:
             units = loaded
@@ -393,11 +428,14 @@ def _run_pipeline_body(
                 continue
 
             asr_i += 1
+            selected_for_call = set(normalized_models)
+            if unit.heavy_overlap:
+                selected_for_call.add("moss")
             cache = _cache_path(work_dir, unit.unit_id, asr_runner_name)
+            hyps: list[Hypothesis] | None = None
             if cache.exists():
-                _log(f"[asr] {asr_i}/{n_asr} {unit.unit_id} cache-hit")
                 cached = json.loads(cache.read_text(encoding="utf-8"))
-                hyps = [
+                cached_hyps = [
                     Hypothesis(
                         model=h["model"],
                         text=h["text"],
@@ -405,8 +443,16 @@ def _run_pipeline_body(
                         meta=h.get("meta") or {},
                     )
                     for h in cached
+                    if isinstance(h, dict)
                 ]
-            else:
+                cached_models = {h.model for h in cached_hyps if (h.text or "").strip()}
+                # Empty/stale moss caches must not block injecting Mode-C text.
+                if cached_models or "moss" not in selected_for_call:
+                    _log(f"[asr] {asr_i}/{n_asr} {unit.unit_id} cache-hit")
+                    hyps = cached_hyps
+                else:
+                    _log(f"[asr] {asr_i}/{n_asr} {unit.unit_id} ignore-empty-cache")
+            if hyps is None:
                 crop_path = None
                 crop_note = "no-crop"
                 if audio_path.exists():
@@ -427,10 +473,6 @@ def _run_pipeline_body(
                     except Exception as exc:  # noqa: BLE001
                         crop_path = None
                         crop_note = f"crop-failed:{exc}"
-                selected_for_call = set(normalized_models)
-                if unit.heavy_overlap and "moss" not in selected_for_call:
-                    # Heavy overlap still needs an anchor hypothesis; moss is CPU-cheap.
-                    selected_for_call = set(selected_for_call) | {"moss"}
                 _log(
                     f"[asr] {asr_i}/{n_asr} {unit.unit_id} transcribe "
                     f"({crop_note}) models={sorted(selected_for_call)}"
@@ -453,10 +495,13 @@ def _run_pipeline_body(
                         crop_path=crop_path,
                     )
                     hyps = [h for h in hyps if h.model in selected_for_call]
-                cache.write_text(
-                    json.dumps([h.to_dict() for h in hyps], ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
+            hyps = _ensure_moss_hyp(
+                hyps, unit, turns, selected=selected_for_call
+            )
+            cache.write_text(
+                json.dumps([h.to_dict() for h in hyps], ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
 
             new_hyps = [h.to_dict() for h in hyps]
             # Accumulate hyps across staged ASR runs and re-runs of stage=all.

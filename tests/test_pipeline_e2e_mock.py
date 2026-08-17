@@ -193,6 +193,53 @@ def test_stage_asr_can_accumulate_different_models(tmp_path: Path):
     assert "firered" in models
 
 
+def test_stage_asr_moss_merges_into_existing_qwen_firered(tmp_path: Path):
+    """Moss must be addable after qwen/firered, even if a prior empty moss cache exists."""
+    out = tmp_path / "work"
+    run_pipeline(
+        input_json=FIXTURES / "mode_c.json",
+        audio_path=tmp_path / "missing.wav",
+        work_dir=out,
+        asr_runner=MockAsrRunner(),
+        llm_judge=MockLlmJudge(),
+        config=PipelineConfig(),
+        stage="asr",
+        asr_models=["qwen", "firered"],
+    )
+    before = {
+        r["unit_id"]: {h["model"] for h in (r.get("hyps") or [])}
+        for r in _read_hyp_records(out / "asr_hypotheses.json")
+        if not r.get("skipped")
+    }
+    cache_dir = out / "asr_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    units = json.loads((out / "asr_units.json").read_text(encoding="utf-8"))["units"]
+    for u in units:
+        (cache_dir / f"{u['unit_id']}__mock_asr__moss.json").write_text("[]", encoding="utf-8")
+
+    run_pipeline(
+        input_json=FIXTURES / "mode_c.json",
+        audio_path=tmp_path / "missing.wav",
+        work_dir=out,
+        asr_runner=MockAsrRunner(),
+        llm_judge=MockLlmJudge(),
+        config=PipelineConfig(),
+        stage="asr",
+        asr_models=["moss"],
+    )
+    records = _read_hyp_records(out / "asr_hypotheses.json")
+    models = {
+        r["unit_id"]: {h["model"] for h in (r.get("hyps") or [])}
+        for r in records
+        if not r.get("skipped")
+    }
+    assert models
+    for uid, ms in models.items():
+        assert "moss" in ms, uid
+        if "qwen" in before.get(uid, set()) or "firered" in before.get(uid, set()):
+            assert "qwen" in ms and "firered" in ms, uid
+
+
 def test_stage_all_merges_prior_hyps(tmp_path: Path):
     out = tmp_path / "work"
     run_pipeline(
