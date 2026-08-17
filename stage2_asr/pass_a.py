@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from stage2_asr.agreement import all_hyps_agree, pick_best_hyp
+from stage2_asr.text_map import distribute_unit_text
 from stage2_asr.types import AsrUnit, Hypothesis, PipelineConfig, Turn
 from stage2_asr.validators import (
     judgment_from_payload,
@@ -393,22 +394,7 @@ def run_pass_a_batch(
 
 
 def _distribute_placeholder(unit: AsrUnit, text: str, turns: list[Turn]):
-    """Yield (turn_index, text_piece) by relative duration (same as pipeline)."""
-    idxs = unit.turn_indices
-    if not idxs:
-        return
-    if len(idxs) == 1:
-        yield idxs[0], text
-        return
-    durs = [max(1e-6, turns[i].duration) for i in idxs]
-    total = sum(durs)
-    chars = list(text)
-    n = len(chars)
-    cursor = 0
-    for k, (idx, dur) in enumerate(zip(idxs, durs)):
-        if k == len(idxs) - 1:
-            yield idx, "".join(chars[cursor:])
-        else:
-            take = int(round(n * (dur / total)))
-            yield idx, "".join(chars[cursor : cursor + take])
-            cursor += take
+    """Yield (turn_index, text_piece) using the shared unit map-back."""
+    mapped = distribute_unit_text(unit.turn_indices, text, turns)
+    for idx, piece in mapped.items():
+        yield idx, piece

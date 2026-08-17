@@ -170,6 +170,14 @@ def _try_pass_b_judge(
     return _validate_pass_b_raw(raw)
 
 
+def _apply_edits_to_text(text: str, edits: list[Edit]) -> str:
+    out = text
+    for e in edits:
+        if e.span_asr and e.span_asr in out:
+            out = out.replace(e.span_asr, e.span_out, 1)
+    return out
+
+
 def _apply_pass_b_accepted(
     *,
     out: dict[int, str],
@@ -185,7 +193,6 @@ def _apply_pass_b_accepted(
     """Apply a validated Pass B judgment. Returns True if the turn text changed."""
     extra = {"batched": True} if batched else {}
     judgment = judgment_from_payload(accepted)
-    new_text = judgment.text
     if overlap or heavy:
         if judgment.base_model not in {"moss", "draft"} and not judgment.edits:
             audits.append(
@@ -199,6 +206,21 @@ def _apply_pass_b_accepted(
                 }
             )
             return False
+    if not judgment.edits:
+        if judgment.text != text:
+            audits.append(
+                {
+                    "turn_index": i,
+                    "pass": "B",
+                    "path": "empty_edits_reject",
+                    "span_asr": text,
+                    "span_out": judgment.text,
+                    "fallback_judge_ok": used_fallback or None,
+                    **extra,
+                }
+            )
+        return False
+    new_text = _apply_edits_to_text(text, judgment.edits)
     if new_text != text:
         out[i] = new_text
         for e in judgment.edits:
@@ -211,20 +233,6 @@ def _apply_pass_b_accepted(
                     "span_out": e.span_out,
                     "tier": e.tier,
                     "anchor": e.anchor,
-                    "fallback_judge_ok": used_fallback or None,
-                    **extra,
-                }
-            )
-        if not judgment.edits:
-            audits.append(
-                {
-                    "turn_index": i,
-                    "pass": "B",
-                    "path": "llm",
-                    "tier": "B",
-                    "anchor": "meeting_draft",
-                    "span_asr": text,
-                    "span_out": new_text,
                     "fallback_judge_ok": used_fallback or None,
                     **extra,
                 }

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from stage2_asr.text_map import join_turn_texts
 from stage2_asr.types import AsrStatus, AsrUnit, Hypothesis, Turn
 
 
@@ -27,9 +28,7 @@ class MockAsrRunner:
                 if (t.text or "").strip():
                     texts.append(t.text)
         merged = len(texts) > 1
-        if not texts:
-            return "", False
-        return "。".join(texts), merged
+        return join_turn_texts(texts), merged
 
     def _default_qwen_firered(self, moss_text: str) -> tuple[str, str]:
         """Inject controlled disagreements for mock repair demos."""

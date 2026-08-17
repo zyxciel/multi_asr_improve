@@ -11,6 +11,7 @@ from stage2_asr.audio_io import crop_unit_wav, load_wav_mono16k
 from stage2_asr.llm_log import LlmInferLogger
 from stage2_asr.pass_a import run_pass_a_batch, run_pass_a_for_unit
 from stage2_asr.pass_b import run_pass_b
+from stage2_asr.text_map import distribute_unit_text, join_turn_texts
 from stage2_asr.types import AsrStatus, AsrUnit, Hypothesis, PipelineConfig, Turn
 from stage2_asr.units import build_asr_units
 from stage2_asr.validate import validate_turns
@@ -128,25 +129,8 @@ def _cache_path(work_dir: Path, unit_id: str, runner_name: str) -> Path:
 
 
 def _distribute_text(unit_turn_indices: list[int], text: str, turns: list[Turn]) -> dict[int, str]:
-    """Map unit text back to member turns by relative duration."""
-    if not unit_turn_indices:
-        return {}
-    if len(unit_turn_indices) == 1:
-        return {unit_turn_indices[0]: text}
-    durs = [max(1e-6, turns[i].duration) for i in unit_turn_indices]
-    total = sum(durs)
-    chars = list(text)
-    n = len(chars)
-    out: dict[int, str] = {}
-    cursor = 0
-    for k, (idx, dur) in enumerate(zip(unit_turn_indices, durs)):
-        if k == len(unit_turn_indices) - 1:
-            out[idx] = "".join(chars[cursor:])
-        else:
-            take = int(round(n * (dur / total)))
-            out[idx] = "".join(chars[cursor : cursor + take])
-            cursor += take
-    return out
+    """Map unit text back to member turns (joiner split, else relative duration)."""
+    return distribute_unit_text(unit_turn_indices, text, turns)
 
 
 def _summarize_pass_a(audits: list[dict]) -> dict[str, Any]:
@@ -237,11 +221,12 @@ def _moss_hypothesis_from_turns(unit: AsrUnit, turns: list[Turn]) -> Hypothesis 
     for i in unit.turn_indices:
         if 0 <= i < len(turns) and (turns[i].text or "").strip():
             texts.append(turns[i].text)
-    if not texts:
+    joined = join_turn_texts(texts)
+    if not joined:
         return None
     return Hypothesis(
         model="moss",
-        text="。".join(texts),
+        text=joined,
         meta={"moss_merged": len(texts) > 1},
     )
 

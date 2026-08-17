@@ -59,6 +59,75 @@ def test_pass_b_llm_tier_bc_with_meeting_draft():
     assert any(a.get("path") == "llm" and a.get("pass") == "B" for a in audits)
 
 
+def test_pass_b_empty_edits_keeps_draft():
+    """Pass B must not apply a whole-turn rewrite when edits is empty."""
+    turns = [
+        Turn(0, 2, "s0", "这一夫多妻制。"),
+        Turn(2, 4, "s1", "求婚啊。"),
+    ]
+    draft = {0: "这一夫多妻制。", 1: "求婚啊。"}
+
+    class EmptyEditsRewrite:
+        def judge(self, **kwargs):
+            text = kwargs["hypotheses"][0].text
+            if "一夫多妻" in text:
+                return {
+                    "text": "这一夫妻子。",
+                    "base_model": "draft",
+                    "edits": [],
+                    "overlap": False,
+                }
+            return {
+                "text": "丑化。",
+                "base_model": "draft",
+                "edits": [],
+                "overlap": False,
+            }
+
+    out, audits = run_pass_b(
+        turns,
+        draft,
+        llm_judge=EmptyEditsRewrite(),
+        config=PipelineConfig(),
+    )
+    assert out[0] == "这一夫多妻制。"
+    assert out[1] == "求婚啊。"
+    assert any(a.get("path") == "empty_edits_reject" for a in audits)
+
+
+def test_pass_b_applies_validated_edits_not_judgment_text():
+    """judgment.text is untrusted; the turn must equal draft with validated spans applied."""
+    turns = [Turn(0, 2, "s0", "系统奔至了")]
+    draft = {0: "系统奔至了"}
+
+    class MismatchedText:
+        def judge(self, **kwargs):
+            return {
+                "text": "完全无关的会议总结",
+                "base_model": "draft",
+                "edits": [
+                    {
+                        "span_asr": "奔至",
+                        "span_out": "蹦字",
+                        "tier": "C",
+                        "pinyin_asr": "benzhi",
+                        "pinyin_out": "bengzi",
+                        "anchor": "meeting_draft",
+                    }
+                ],
+                "overlap": False,
+            }
+
+    out, audits = run_pass_b(
+        turns,
+        draft,
+        llm_judge=MismatchedText(),
+        config=PipelineConfig(),
+    )
+    assert out[0] == "系统蹦字了"
+    assert any(a.get("path") == "llm" and a.get("span_asr") == "奔至" for a in audits)
+
+
 def test_pass_b_rejects_tier_a_and_keeps_draft():
     turns = [Turn(0, 2, "s0", "原文")]
     draft = {0: "原文"}

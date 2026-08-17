@@ -2,6 +2,7 @@ from __future__ import annotations
 
 """Combine MOSS provisional text with Qwen + FireRed runners."""
 
+from stage2_asr.text_map import join_turn_texts
 from stage2_asr.types import AsrStatus, AsrUnit, Hypothesis, Turn
 
 
@@ -19,9 +20,10 @@ class EnsembleAsrRunner:
                 t = turns[i]
                 if (t.text or "").strip():
                     texts.append(t.text)
-        if not texts:
+        joined = join_turn_texts(texts)
+        if not joined:
             return None
-        return Hypothesis(model="moss", text="。".join(texts), meta={"moss_merged": len(texts) > 1})
+        return Hypothesis(model="moss", text=joined, meta={"moss_merged": len(texts) > 1})
 
     def transcribe_unit(
         self,
