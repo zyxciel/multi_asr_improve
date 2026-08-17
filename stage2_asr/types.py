@@ -32,8 +32,12 @@ class Turn:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "Turn":
-        status = d.get("asr_status", "empty")
-        if isinstance(status, AsrStatus):
+        status = d.get("asr_status")
+        if status is None:
+            asr_status = (
+                AsrStatus.PROVISIONAL if str(d.get("text", "")).strip() else AsrStatus.EMPTY
+            )
+        elif isinstance(status, AsrStatus):
             asr_status = status
         else:
             asr_status = AsrStatus(str(status))

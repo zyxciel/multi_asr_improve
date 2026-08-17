@@ -24,7 +24,7 @@ class MockAsrRunner:
         for i in unit.turn_indices:
             if 0 <= i < len(turns):
                 t = turns[i]
-                if t.text and t.asr_status != AsrStatus.EMPTY:
+                if (t.text or "").strip():
                     texts.append(t.text)
         merged = len(texts) > 1
         if not texts:
