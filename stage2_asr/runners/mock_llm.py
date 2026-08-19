@@ -1,7 +1,39 @@
 from __future__ import annotations
 
 from stage2_asr.pinyin_util import pinyin_edit_distance, to_pinyin
+from stage2_asr.polish import apply_polish_edits
 from stage2_asr.types import Hypothesis
+
+
+def _blob_from_hyps(hypotheses) -> str:
+    parts: list[str] = []
+    for h in hypotheses or []:
+        if h is None:
+            continue
+        if isinstance(h, dict):
+            parts.append(str(h.get("text") or ""))
+            meta = h.get("meta") if isinstance(h.get("meta"), dict) else {}
+            parts.append(str(meta.get("unit_text") or ""))
+        else:
+            parts.append(str(getattr(h, "text", "") or ""))
+            meta = getattr(h, "meta", None) or {}
+            if isinstance(meta, dict):
+                parts.append(str(meta.get("unit_text") or ""))
+    return " ".join(parts)
+
+
+def _blob_from_neighbors(neighbor_draft) -> str:
+    if not neighbor_draft:
+        return ""
+    if isinstance(neighbor_draft, str):
+        return neighbor_draft
+    parts: list[str] = []
+    for row in neighbor_draft:
+        if isinstance(row, dict):
+            parts.append(str(row.get("text") or ""))
+        else:
+            parts.append(str(row))
+    return " ".join(parts)
 
 
 class MockLlmJudge:
@@ -96,3 +128,64 @@ class MockLlmJudge:
             "edits": edits,
             "overlap": bool(overlap or heavy_overlap),
         }
+
+    def polish(
+        self,
+        *,
+        text: str,
+        neighbor_draft: list[dict],
+        hotwords: list[str],
+        turn_index: int,
+        unit_id: str,
+        hypotheses: list | None = None,
+        **_kwargs,
+    ) -> dict:
+        """Deterministic polish: ITN / casing, plus hyp- and neighbor-anchored recoveries."""
+        _ = (hotwords, turn_index, unit_id)
+        original = text or ""
+        edits: list[dict] = []
+        hyp_blob = _blob_from_hyps(hypotheses)
+        neighbor_blob = _blob_from_neighbors(neighbor_draft)
+        if "温度" in original and "Windows" in hyp_blob:
+            edits.append(
+                {
+                    "span_asr": "温度",
+                    "span_out": "Windows",
+                    "kind": "codeswitch",
+                    "anchor": "hyp",
+                }
+            )
+        if "爱情" in original and "娃娃亲" in neighbor_blob:
+            edits.append(
+                {
+                    "span_asr": "爱情",
+                    "span_out": "娃娃亲",
+                    "kind": "entity",
+                    "anchor": "neighbor_draft",
+                }
+            )
+        for src, dst, kind in (
+            ("百分之五十", "50%", "itn"),
+            ("三点", "3点", "itn"),
+            ("wifi", "Wi-Fi", "codeswitch"),
+            ("WIFI", "Wi-Fi", "codeswitch"),
+            ("gpu", "GPU", "codeswitch"),
+            ("Gpu", "GPU", "codeswitch"),
+        ):
+            if src in original and src != dst:
+                edits.append({"span_asr": src, "span_out": dst, "kind": kind})
+        if original and original[-1] not in "。？！!?.,;；、":
+            edits.append(
+                {
+                    "span_asr": "",
+                    "span_out": "。",
+                    "kind": "punc",
+                    "start_char": len(original),
+                }
+            )
+        new_text, _located = apply_polish_edits(original, edits)
+        return {"text": new_text, "edits": edits}
+
+    def polish_many(self, jobs: list[dict], *, max_workers: int = 8) -> list[dict]:
+        _ = max_workers
+        return [self.polish(**job) for job in jobs]

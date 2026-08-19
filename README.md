@@ -54,9 +54,13 @@ stage2-asr run --input mode_c.json --audio prepared.wav --work-dir out --backend
 
 # 2) LLM only (reads out/asr_hypotheses.json; no ASR inference)
 stage2-asr run --input mode_c.json --audio prepared.wav --work-dir out --backend real --enable-real --stage llm
+
+# 3) Display + recovery polish (punctuation / entity / code-switch / ITN;
+#    also hyp/context/world recoveries that Pass A/B blocked, e.g. 温度→Windows)
+stage2-asr run --input mode_c.json --audio prepared.wav --work-dir out --backend real --enable-real --stage polish
 ```
 
-Available stages: `all` (default), `asr`, `pass_a`, `pass_b`, `llm`  
+Available stages: `all` (default; includes polish), `asr`, `pass_a`, `pass_b`, `llm` (Pass A+B only, no polish), `polish`  
 ASR model subsets: `moss`, `qwen`, `firered` (comma-separated via `--asr-models`)
 
 FireRed system config used by the adapter:
@@ -144,7 +148,7 @@ python -m stage2_asr.cli run-batch \
 - First call loads the model into NPU; later units reuse the same engine.
 - `--pass-a-batch-size N` runs Pass A as `LLM.generate([N prompts])` (true batching), including validation retries (avoids a serial `1/1` tail).
 - `--pass-b-batch-size N` (default **1** = sequential). `N>1` snapshots the Pass A meeting draft and batches Pass B with `judge_many` (faster; later turns do **not** see in-pass Pass B rewrites). Use the same `work-dir` ASR/Pass A artifacts and compare `pass_stats.json` / `llm_edits.jsonl` for the A/B.
-- Thinking/CoT is **off by default** (`enable_thinking=False` in chat template / `chat_template_kwargs`). Required for Qwen3.8 (thinks by default). Use `--llm-enable-thinking` only if you need it; leaked `<think>` blocks are stripped and logged to `llm_infer.jsonl`, JSON only drives Pass A/B.
+- Thinking/CoT is **off by default** (`enable_thinking=False` in chat template / `chat_template_kwargs`). Required for Qwen3.8 (thinks by default). Use `--llm-enable-thinking` only if you need it; leaked `<think>` blocks are stripped and logged to `llm_infer.jsonl`, JSON only drives Pass A/B **and** polish. Keep thinking **off** for polish as well (JSON span edits; CoT adds latency/KV without helping rule-like ITN/punctuation).
 - Qwen3.8-27B uses hybrid attention (Gated DeltaNet). The **vLLM-Ascend / vLLM build must support that architecture**; an older 3.6-only engine will fail at load. Pass `--llm-model-id` if weights live at a local path.
 - DeepSeek fallback is **disabled automatically** for `vllm_engine` (avoids loading a second engine / OOM). Prefer `--no-deepseek-fallback`.
 - Traces: `work-dir/llm_infer.jsonl` (includes `user` prompt + `response`, each capped at 16k chars)
@@ -185,6 +189,6 @@ third_party/         # optional local clones (gitignored)
 
 ## Artifacts
 
-`asr_units.json` (reloaded on `pass_a`/`pass_b`/`llm` so unit_ids stay stable), `asr_hypotheses.json` (hyps merge across `asr` and `all` re-runs), `mode_c_draft.json`, `mode_c_asr_final.json`, `llm_edits.jsonl` (Pass A preserved when re-running `pass_b`), `pass_stats.json` (merged across staged passes), `llm_infer.jsonl` (LLM request/response traces for Pass A/B), `asr_cache/`, `crops/` (reused across ASR model runs; not rewritten if present)
+`asr_units.json` (reloaded on `pass_a`/`pass_b`/`llm` so unit_ids stay stable), `asr_hypotheses.json` (hyps merge across `asr` and `all` re-runs), `mode_c_draft.json`, `mode_c_asr_final.json` (phonetic deliverable for WER/CPWER), `mode_c_polished.json` (display: punctuation / entity / code-switch / ITN), `llm_edits.jsonl` (Pass A preserved when re-running `pass_b`; polish lines replaced when re-running `polish`), `pass_stats.json` (merged across staged passes), `llm_infer.jsonl` (LLM request/response traces for Pass A/B and polish), `asr_cache/`, `crops/` (reused across ASR model runs; not rewritten if present)
 
-Progress logs go to **stderr** (`[asr]`, `[pass_a]`, `[pass_b]`, `[batch]`); the final JSON summary stays on **stdout**.
+Progress logs go to **stderr** (`[asr]`, `[pass_a]`, `[pass_b]`, `[polish]`, `[batch]`); the final JSON summary stays on **stdout**.

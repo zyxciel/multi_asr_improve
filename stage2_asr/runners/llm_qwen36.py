@@ -17,6 +17,11 @@ from typing import Any, Callable
 
 from stage2_asr.pinyin_util import to_pinyin
 from stage2_asr.prompt import SYSTEM_PROMPT, render_user_prompt
+from stage2_asr.polish_prompt import (
+    POLISH_SYSTEM_PROMPT,
+    format_polish_hypotheses,
+    render_polish_user_prompt,
+)
 from stage2_asr.llm_parse import parse_judgment_json
 from stage2_asr.runners.base import UnsupportedRunnerError
 from stage2_asr.runners.openai_compat import chat_completion, chat_completion_many
@@ -132,6 +137,29 @@ class Qwen36LlmJudge:
         raw_text = self._generate(SYSTEM_PROMPT, user, unit_id=unit_id, pass_name="judge")
         return self._parse_json(raw_text)
 
+    def polish(
+        self,
+        *,
+        text: str,
+        neighbor_draft: list[dict],
+        hotwords: list[str],
+        turn_index: int,
+        unit_id: str,
+        hypotheses: list | None = None,
+        **_kwargs,
+    ) -> dict:
+        user = render_polish_user_prompt(
+            text=text,
+            neighbor_draft=json.dumps(neighbor_draft, ensure_ascii=False),
+            hotwords=json.dumps(hotwords, ensure_ascii=False),
+            turn_index=int(turn_index),
+            hypotheses=format_polish_hypotheses(hypotheses),
+        )
+        raw_text = self._generate(
+            POLISH_SYSTEM_PROMPT, user, unit_id=unit_id, pass_name="polish"
+        )
+        return self._parse_json(raw_text)
+
     def judge_many(
         self,
         jobs: list[dict[str, Any]],
@@ -158,37 +186,96 @@ class Qwen36LlmJudge:
                 heavy_overlap=job["heavy_overlap"],
             )
             prompts_meta.append((str(job.get("unit_id", "")), user))
+        return self._complete_many(
+            prompts_meta,
+            system=SYSTEM_PROMPT,
+            pass_name="judge_many",
+            batch_pass_name="judge_many_batch",
+            max_workers=max_workers,
+        )
 
+    def polish_many(
+        self,
+        jobs: list[dict[str, Any]],
+        *,
+        max_workers: int = 8,
+    ) -> list[dict | BaseException]:
+        if not jobs:
+            return []
+        prompts_meta: list[tuple[str, str]] = []
+        for job in jobs:
+            user = render_polish_user_prompt(
+                text=str(job.get("text", "")),
+                neighbor_draft=json.dumps(job.get("neighbor_draft") or [], ensure_ascii=False),
+                hotwords=json.dumps(job.get("hotwords") or [], ensure_ascii=False),
+                turn_index=int(job.get("turn_index") or 0),
+                hypotheses=format_polish_hypotheses(job.get("hypotheses")),
+            )
+            prompts_meta.append((str(job.get("unit_id", "")), user))
+        return self._complete_many(
+            prompts_meta,
+            system=POLISH_SYSTEM_PROMPT,
+            pass_name="polish",
+            batch_pass_name="polish_batch",
+            max_workers=max_workers,
+        )
+
+    def _complete_many(
+        self,
+        prompts_meta: list[tuple[str, str]],
+        *,
+        system: str,
+        pass_name: str,
+        batch_pass_name: str,
+        max_workers: int,
+    ) -> list[dict | BaseException]:
         if self.generate_fn is not None:
             texts: list[str | BaseException] = []
             for unit_id, user in prompts_meta:
                 try:
                     texts.append(
-                        self._generate(
-                            SYSTEM_PROMPT, user, unit_id=unit_id, pass_name="judge_many"
-                        )
+                        self._generate(system, user, unit_id=unit_id, pass_name=pass_name)
                     )
                 except BaseException as exc:  # noqa: BLE001
                     texts.append(exc)
             return self._parse_many(texts)
 
         if self.backend == "vllm_engine":
-            return self._judge_many_engine(prompts_meta)
+            return self._judge_many_engine(
+                prompts_meta,
+                system=system,
+                pass_name=pass_name,
+                batch_pass_name=batch_pass_name,
+            )
 
         if self.backend == "vllm":
-            return self._judge_many_http(prompts_meta, max_workers=max_workers)
+            return self._judge_many_http(
+                prompts_meta,
+                max_workers=max_workers,
+                system=system,
+                pass_name=pass_name,
+                batch_pass_name=batch_pass_name,
+            )
 
-        # transformers / other: sequential
         out: list[dict | BaseException] = []
-        for job in jobs:
+        for unit_id, user in prompts_meta:
             try:
-                out.append(self.judge(**job))
+                out.append(
+                    self._parse_json(
+                        self._generate(system, user, unit_id=unit_id, pass_name=pass_name)
+                    )
+                )
             except BaseException as exc:  # noqa: BLE001
                 out.append(exc)
         return out
 
     def _judge_many_engine(
-        self, prompts_meta: list[tuple[str, str]]
+        self,
+        prompts_meta: list[tuple[str, str]],
+        *,
+        system: str = SYSTEM_PROMPT,
+        pass_name: str = "judge_many",
+        batch_pass_name: str = "judge_many_batch",
     ) -> list[dict | BaseException]:
         t0 = time.time()
         engine = self._ensure_engine()
@@ -199,13 +286,13 @@ class Qwen36LlmJudge:
                 rendered.append(
                     format_chat_prompt(
                         tokenizer,
-                        SYSTEM_PROMPT,
+                        system,
                         user,
                         enable_thinking=self.enable_thinking,
                     )
                 )
             else:
-                rendered.append(f"System: {SYSTEM_PROMPT}\n\nUser: {user}\n\nAssistant:")
+                rendered.append(f"System: {system}\n\nUser: {user}\n\nAssistant:")
         try:
             texts = vllm_generate_texts(
                 engine,
@@ -226,7 +313,7 @@ class Qwen36LlmJudge:
                 {
                     "judge": self.name,
                     "backend": self.backend,
-                    "pass": "judge_many",
+                    "pass": pass_name,
                     "unit_id": unit_id,
                     "ok": True,
                     "latency_s": None,
@@ -243,7 +330,7 @@ class Qwen36LlmJudge:
             {
                 "judge": self.name,
                 "backend": self.backend,
-                "pass": "judge_many_batch",
+                "pass": batch_pass_name,
                 "n": len(prompts_meta),
                 "latency_s": time.time() - t0,
             }
@@ -251,14 +338,20 @@ class Qwen36LlmJudge:
         return self._parse_many(list(texts))
 
     def _judge_many_http(
-        self, prompts_meta: list[tuple[str, str]], *, max_workers: int
+        self,
+        prompts_meta: list[tuple[str, str]],
+        *,
+        max_workers: int,
+        system: str = SYSTEM_PROMPT,
+        pass_name: str = "judge_many",
+        batch_pass_name: str = "judge_many_batch",
     ) -> list[dict | BaseException]:
         http_jobs = [
             {
                 "base_url": self.base_url or "",
                 "model": self.model_id,
                 "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "system", "content": system},
                     {"role": "user", "content": user},
                 ],
                 "temperature": self.temperature,
@@ -276,7 +369,7 @@ class Qwen36LlmJudge:
                 {
                     "judge": self.name,
                     "backend": self.backend,
-                    "pass": "judge_many",
+                    "pass": pass_name,
                     "unit_id": unit_id,
                     "ok": not isinstance(raw, BaseException),
                     "latency_s": None,
@@ -293,7 +386,7 @@ class Qwen36LlmJudge:
             {
                 "judge": self.name,
                 "backend": self.backend,
-                "pass": "judge_many_batch",
+                "pass": batch_pass_name,
                 "n": len(prompts_meta),
                 "latency_s": time.time() - t0,
                 "max_workers": max_workers,

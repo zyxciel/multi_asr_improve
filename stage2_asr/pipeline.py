@@ -11,6 +11,7 @@ from stage2_asr.audio_io import crop_unit_wav, load_wav_mono16k
 from stage2_asr.llm_log import LlmInferLogger
 from stage2_asr.pass_a import run_pass_a_batch, run_pass_a_for_unit
 from stage2_asr.pass_b import run_pass_b
+from stage2_asr.polish import hyps_by_turn_from_records, run_polish
 from stage2_asr.text_map import distribute_unit_text, join_turn_texts
 from stage2_asr.types import AsrStatus, AsrUnit, Hypothesis, PipelineConfig, Turn
 from stage2_asr.units import build_asr_units
@@ -165,6 +166,113 @@ def _summarize_pass_b(audits: list[dict]) -> dict[str, Any]:
     }
 
 
+def _summarize_polish(audits: list[dict]) -> dict[str, Any]:
+    kinds: dict[str, int] = {}
+    anchors: dict[str, int] = {}
+    for a in audits:
+        if a.get("path") == "llm" and a.get("kind"):
+            k = str(a["kind"])
+            kinds[k] = kinds.get(k, 0) + 1
+        if a.get("path") == "llm" and a.get("anchor"):
+            an = str(a["anchor"])
+            anchors[an] = anchors.get(an, 0) + 1
+    return {
+        "n_audits": len(audits),
+        "llm_edits": sum(1 for a in audits if a.get("path") == "llm" and not a.get("fallback")),
+        "empty_edits_reject": sum(1 for a in audits if a.get("path") == "empty_edits_reject"),
+        "fallback": sum(1 for a in audits if a.get("fallback")),
+        "by_kind": kinds,
+        "by_anchor": anchors,
+        "n_batched": sum(1 for a in audits if a.get("batched")),
+    }
+
+
+def _rewrite_edits_keep_other_passes(
+    edits_path: Path, pass_name: str, new_audits: list[dict]
+) -> None:
+    """Keep lines from other passes; replace this pass's lines."""
+    kept: list[dict] = []
+    if edits_path.exists():
+        for line in edits_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict) and obj.get("pass") != pass_name:
+                kept.append(obj)
+    with edits_path.open("w", encoding="utf-8") as f:
+        for a in kept:
+            f.write(json.dumps(a, ensure_ascii=False) + "\n")
+        for a in new_audits:
+            row = a if isinstance(a, dict) and a.get("pass") == pass_name else {"pass": pass_name, **a}
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def _persist_polish(
+    *,
+    turns: list[Turn],
+    texts: dict[int, str],
+    raw_doc: dict[str, Any],
+    work_dir: Path,
+    llm_judge,
+    hotwords: list[str],
+    cfg: PipelineConfig,
+    n_units: int,
+    llm_log_path: Path | None,
+    hyp_records: list[dict] | None = None,
+) -> dict[str, Any]:
+    batch_note = max(1, int(getattr(cfg, "pass_a_batch_size", 1) or 1))
+    _log(
+        f"[polish] start: {len(turns)} turns "
+        f"batch_size={batch_note} work_dir={work_dir}"
+    )
+    polished_map, audits = run_polish(
+        turns,
+        texts,
+        llm_judge=llm_judge,
+        hotwords=hotwords,
+        config=cfg,
+        hyp_by_turn=hyps_by_turn_from_records(hyp_records or [], turns),
+    )
+    _log(f"[polish] done: {len(audits)} audits")
+    polished_turns = []
+    for i, t in enumerate(turns):
+        text = polished_map.get(i, t.text)
+        polished_turns.append(
+            Turn(
+                start=t.start,
+                end=t.end,
+                speaker_id=t.speaker_id,
+                text=text,
+                asr_status=AsrStatus.FINAL if text else t.asr_status,
+                source=t.source,
+                confidence=t.confidence,
+            )
+        )
+    polished_doc = {
+        "meta": {**(raw_doc.get("meta") or {}), "stage": "polish"},
+        "turns": [t.to_dict() for t in polished_turns],
+    }
+    polished_path = work_dir / "mode_c_polished.json"
+    polished_path.write_text(
+        json.dumps(polished_doc, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    _rewrite_edits_keep_other_passes(work_dir / "llm_edits.jsonl", "polish", audits)
+    stats_path = work_dir / "pass_stats.json"
+    pass_stats = _merge_pass_stats(stats_path, {"polish": _summarize_polish(audits)})
+    _log(f"[polish] wrote {polished_path}")
+    return {
+        "polished_path": polished_path,
+        "stats_path": stats_path,
+        "llm_log_path": llm_log_path,
+        "n_turns": len(polished_turns),
+        "n_units": n_units,
+        "pass_stats": pass_stats,
+    }
+
+
 def _unit_by_id(units: list) -> dict[str, Any]:
     return {str(unit.unit_id): unit for unit in units}
 
@@ -300,12 +408,13 @@ def run_pipeline(
     - pass_a: run Pass A only from saved ASR hypotheses/cache.
     - pass_b: run Pass B only from mode_c_draft.json.
     - llm: run Pass A then Pass B from saved ASR hypotheses/cache (no ASR inference).
-    - all: full pipeline in one run.
+    - polish: display polish (punc / entity / codeswitch / ITN) from mode_c_asr_final.json.
+    - all: full pipeline in one run (ASR + Pass A/B + polish).
     """
     cfg = config or PipelineConfig()
     hotwords = hotwords or []
     stage = str(stage).lower()
-    allowed_stages = {"all", "asr", "pass_a", "pass_b", "llm"}
+    allowed_stages = {"all", "asr", "pass_a", "pass_b", "llm", "polish"}
     if stage not in allowed_stages:
         raise ValueError(f"unknown stage {stage!r}; expected one of {sorted(allowed_stages)}")
     normalized_models = [m.strip().lower() for m in (asr_models or ["moss", "qwen", "firered"]) if m.strip()]
@@ -320,7 +429,7 @@ def run_pipeline(
 
     llm_logger: LlmInferLogger | None = None
     llm_log_path: Path | None = None
-    if stage in {"all", "pass_a", "pass_b", "llm"}:
+    if stage in {"all", "pass_a", "pass_b", "llm", "polish"}:
         llm_log_path = work_dir / "llm_infer.jsonl"
         llm_logger = LlmInferLogger(llm_log_path)
         _attach_llm_logger(llm_judge, llm_logger)
@@ -360,6 +469,31 @@ def _run_pipeline_body(
     normalized_models: list[str],
     llm_log_path: Path | None,
 ) -> dict[str, Any]:
+    if stage == "polish":
+        final_path = work_dir / "mode_c_asr_final.json"
+        if not final_path.exists():
+            raise FileNotFoundError(
+                f"{final_path} missing; run stage=pass_b (or all/llm) first."
+            )
+        final_doc = json.loads(final_path.read_text(encoding="utf-8"))
+        final_turns = [Turn.from_dict(t) for t in final_doc.get("turns", [])]
+        texts = {i: t.text for i, t in enumerate(final_turns)}
+        loaded = _load_units(work_dir / "asr_units.json")
+        n_units = len(loaded) if loaded is not None else 0
+        extra = _persist_polish(
+            turns=final_turns,
+            texts=texts,
+            raw_doc=final_doc if isinstance(final_doc, dict) else {},
+            work_dir=work_dir,
+            llm_judge=llm_judge,
+            hotwords=hotwords,
+            cfg=cfg,
+            n_units=n_units,
+            llm_log_path=llm_log_path,
+            hyp_records=_load_hyp_records(work_dir / "asr_hypotheses.json"),
+        )
+        return {"stage": "polish", "final_path": final_path, **extra}
+
     raw_turns, raw_doc = load_mode_c(input_json)
     turns, skipped = validate_turns(raw_turns, cfg)
     audio = _load_audio_optional(audio_path, cfg.sample_rate)
@@ -733,13 +867,29 @@ def _run_pipeline_body(
     stats_path.write_text(json.dumps(pass_stats, ensure_ascii=False, indent=2), encoding="utf-8")
     _log(f"[stage={stage}] done: final={final_path} draft={draft_path}")
 
+    extra: dict[str, Any] = {}
+    if stage == "all":
+        extra = _persist_polish(
+            turns=final_turns,
+            texts={i: t.text for i, t in enumerate(final_turns)},
+            raw_doc=final_doc,
+            work_dir=work_dir,
+            llm_judge=llm_judge,
+            hotwords=hotwords,
+            cfg=cfg,
+            n_units=len(units),
+            llm_log_path=llm_log_path,
+            hyp_records=hyp_records,
+        )
+
     return {
         "stage": stage,
         "final_path": final_path,
         "draft_path": draft_path,
-        "stats_path": stats_path,
+        "stats_path": extra.get("stats_path", stats_path),
         "llm_log_path": llm_log_path,
         "n_turns": len(final_turns),
         "n_units": len(units),
-        "pass_stats": pass_stats,
+        "pass_stats": extra.get("pass_stats", pass_stats),
+        **({"polished_path": extra["polished_path"]} if extra.get("polished_path") else {}),
     }

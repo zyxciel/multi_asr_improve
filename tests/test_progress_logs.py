@@ -27,3 +27,4 @@ def test_pipeline_emits_pass_progress_on_stderr(tmp_path: Path, capsys):
     assert "[asr]" in err or "ASR" in err
     assert "[pass_a]" in err
     assert "[pass_b]" in err
+    assert "[polish]" in err

@@ -28,8 +28,8 @@ def _add_common_run_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--stage",
         default="all",
-        choices=["all", "asr", "pass_a", "pass_b", "llm"],
-        help="Execution stage: all | asr | pass_a | pass_b | llm",
+        choices=["all", "asr", "pass_a", "pass_b", "llm", "polish"],
+        help="Execution stage: all | asr | pass_a | pass_b | llm | polish",
     )
     p.add_argument(
         "--asr-models",
@@ -152,7 +152,13 @@ def _resolve_backend(args: argparse.Namespace) -> str | None:
         )
         return None
     if getattr(args, "llm_backend", "transformers") == "vllm" and not getattr(args, "llm_base_url", None):
-        if backend == "real" and str(args.stage).lower() in {"all", "pass_a", "pass_b", "llm"}:
+        if backend == "real" and str(args.stage).lower() in {
+            "all",
+            "pass_a",
+            "pass_b",
+            "llm",
+            "polish",
+        }:
             print(
                 "--llm-backend vllm (HTTP) requires --llm-base-url. "
                 "For in-process vllm.LLM on Ascend, use --llm-backend vllm_engine instead.",
@@ -246,6 +252,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
         payload["pass_stats"] = str(result["stats_path"])
     if result.get("llm_log_path") is not None:
         payload["llm_log"] = str(result["llm_log_path"])
+    if result.get("polished_path") is not None:
+        payload["polished"] = str(result["polished_path"])
     if result.get("asr_hypotheses_path") is not None:
         payload["asr_hypotheses"] = str(result["asr_hypotheses_path"])
     if result.get("asr_models") is not None:

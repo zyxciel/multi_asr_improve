@@ -1,4 +1,4 @@
-"""Append-only JSONL logger for LLM inference (Pass A/B)."""
+"""Append-only JSONL logger for LLM inference (Pass A/B and polish)."""
 
 from __future__ import annotations
 
