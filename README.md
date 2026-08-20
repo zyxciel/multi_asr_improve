@@ -55,8 +55,9 @@ stage2-asr run --input mode_c.json --audio prepared.wav --work-dir out --backend
 # 2) LLM only (reads out/asr_hypotheses.json; no ASR inference)
 stage2-asr run --input mode_c.json --audio prepared.wav --work-dir out --backend real --enable-real --stage llm
 
-# 3) Conservative polish on mode_c_asr_final.json (evidenced entity / code-switch;
-#    necessary punctuation only; no ITN). Does not overwrite the WER deliverable.
+# 3) Merge same-speaker units from mode_c_asr_final.json, then polish.
+#    Writes mode_c_asr_final_merged.json + mode_c_polished.json (unit grid).
+#    Does not overwrite the per-turn WER file mode_c_asr_final.json.
 stage2-asr run --input mode_c.json --audio prepared.wav --work-dir out --backend real --enable-real --stage polish
 ```
 
@@ -191,7 +192,7 @@ third_party/         # optional local clones (gitignored)
 
 ## Artifacts
 
-`asr_units.json` (reloaded on `pass_a`/`pass_b`/`llm` so unit_ids stay stable), `asr_hypotheses.json` (hyps merge across `asr` and `all` re-runs), `mode_c_draft.json`, `mode_c_asr_final.json` (phonetic deliverable for WER/CPWER), `mode_c_polished.json` (conservative polish: necessary punctuation / evidenced entity / code-switch; **no ITN**), `llm_edits.jsonl` (Pass A preserved when re-running `pass_b`; polish lines replaced when re-running `polish`; polish rows include `anchor` + `evidence`), `pass_stats.json` (merged across staged passes), `llm_infer.jsonl` (LLM request/response traces for Pass A/B and polish), `asr_cache/`, `crops/` (reused across ASR model runs; not rewritten if present)
+`asr_units.json` (reloaded on `pass_a`/`pass_b`/`llm` so unit_ids stay stable), `asr_hypotheses.json` (hyps merge across `asr` and `all` re-runs), `mode_c_draft.json` (Pass A **pre-merge**, original Mode-C turn grid), `mode_c_draft_merged.json` (Pass A **post-merge**, one row per ASR unit), `mode_c_asr_final.json` (Pass B pre-merge; phonetic WER/CPWER deliverable), `mode_c_asr_final_merged.json` (Pass B post-merge), `mode_c_polished.json` (polish on the **merged** unit grid), `llm_edits.jsonl` (Pass A preserved when re-running `pass_b`; polish lines replaced when re-running `polish`; polish rows include `anchor` + `evidence`), `pass_stats.json` (merged across staged passes), `llm_infer.jsonl` (LLM request/response traces for Pass A/B and polish), `asr_cache/`, `crops/` (reused across ASR model runs; not rewritten if present)
 
 ### Polish policy (post round-1 WER regression)
 
@@ -199,7 +200,7 @@ Round-1 polish raised WER: unconstrained add/delete/rewrite/continuation, number
 
 | Rule | Enforcement |
 |---|---|
-| Base = `mode_c_asr_final.json` | Polish never overwrites that file |
+| Base = merged ASR units (`mode_c_asr_final_merged.json`) | Polish never overwrites `mode_c_asr_final.json` (pre-merge WER grid) |
 | No added sentences / empty insertions / repeat collapse (`好好好`→`好`) | Validator |
 | CN→CN substitution: `|Δlen| ≤ 2` | Validator (`爱情`→`娃娃亲` allowed; `爱情`→`娃娃亲的事` rejected) |
 | CN→EN may change length | Only if `span_out` already appears in a hyp / neighbor / hotword (`温度`→`Windows`) |

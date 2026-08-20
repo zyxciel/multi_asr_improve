@@ -258,6 +258,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
         payload["final"] = str(result["final_path"])
     if result.get("draft_path") is not None:
         payload["draft"] = str(result["draft_path"])
+    if result.get("draft_merged_path") is not None:
+        payload["draft_merged"] = str(result["draft_merged_path"])
+    if result.get("final_merged_path") is not None:
+        payload["final_merged"] = str(result["final_merged_path"])
     if result.get("stats_path") is not None:
         payload["pass_stats"] = str(result["stats_path"])
     if result.get("llm_log_path") is not None:

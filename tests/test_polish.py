@@ -457,12 +457,20 @@ def test_pipeline_all_writes_polished_without_clobbering_asr_final(tmp_path: Pat
         stage="all",
     )
     assert (out / "mode_c_asr_final.json").exists()
+    assert (out / "mode_c_draft.json").exists()
+    assert (out / "mode_c_draft_merged.json").exists()
+    assert (out / "mode_c_asr_final_merged.json").exists()
     assert (out / "mode_c_polished.json").exists()
     assert result.get("polished_path") is not None
     asr_final = json.loads((out / "mode_c_asr_final.json").read_text(encoding="utf-8"))
+    merged = json.loads((out / "mode_c_asr_final_merged.json").read_text(encoding="utf-8"))
     polished = json.loads((out / "mode_c_polished.json").read_text(encoding="utf-8"))
     assert asr_final["meta"]["stage"] == "pass_b_final"
+    assert merged["meta"]["grid"] == "asr_units"
     assert polished["meta"]["stage"] == "polish"
+    assert polished["meta"]["grid"] == "asr_units"
+    assert len(merged["turns"]) <= len(asr_final["turns"])
+    assert len(polished["turns"]) == len(merged["turns"])
     edits = [
         json.loads(line)
         for line in (out / "llm_edits.jsonl").read_text(encoding="utf-8").splitlines()
@@ -597,6 +605,87 @@ def test_pipeline_polish_stage_uses_saved_asr_hyps(tmp_path: Path):
     assert win.get("anchor") == "hyp"
     asr_final = json.loads((out / "mode_c_asr_final.json").read_text(encoding="utf-8"))
     assert asr_final["turns"][0]["text"] == "以前那个温度的问题"
+
+
+def test_pipeline_polish_merges_fragments_before_llm(tmp_path: Path):
+    out = tmp_path / "work"
+    out.mkdir(parents=True, exist_ok=True)
+    final_doc = {
+        "meta": {"stage": "pass_b_final"},
+        "turns": [
+            {
+                "start": 0.0,
+                "end": 1.0,
+                "speaker_id": "s0",
+                "text": "以前那个温",
+                "asr_status": "final",
+            },
+            {
+                "start": 1.1,
+                "end": 2.0,
+                "speaker_id": "s0",
+                "text": "度的问题",
+                "asr_status": "final",
+            },
+        ],
+    }
+    (out / "mode_c_asr_final.json").write_text(
+        json.dumps(final_doc, ensure_ascii=False), encoding="utf-8"
+    )
+    (out / "asr_units.json").write_text(
+        json.dumps(
+            {
+                "units": [
+                    {
+                        "unit_id": "unit_0000",
+                        "start": 0.0,
+                        "end": 2.0,
+                        "speaker_id": "s0",
+                        "turn_indices": [0, 1],
+                        "moss_merged": True,
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (out / "asr_hypotheses.json").write_text(
+        json.dumps(
+            {
+                "records": [
+                    {
+                        "unit_id": "unit_0000",
+                        "turn_indices": [0, 1],
+                        "hyps": [
+                            {"model": "moss", "text": "以前那个温度的问题"},
+                            {"model": "qwen", "text": "以前那个Windows的问题"},
+                        ],
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    run_pipeline(
+        input_json=FIXTURES / "mode_c.json",
+        audio_path=tmp_path / "missing.wav",
+        work_dir=out,
+        asr_runner=MockAsrRunner(),
+        llm_judge=MockLlmJudge(),
+        config=PipelineConfig(),
+        stage="polish",
+    )
+    merged = json.loads((out / "mode_c_asr_final_merged.json").read_text(encoding="utf-8"))
+    assert len(merged["turns"]) == 1
+    assert merged["turns"][0]["text"] == "以前那个温度的问题"
+    polished = json.loads((out / "mode_c_polished.json").read_text(encoding="utf-8"))
+    assert len(polished["turns"]) == 1
+    assert polished["turns"][0]["text"].count("Windows") == 1
+    assert "温度" not in polished["turns"][0]["text"]
+    asr_final = json.loads((out / "mode_c_asr_final.json").read_text(encoding="utf-8"))
+    assert len(asr_final["turns"]) == 2
 
 
 def test_qwen_polish_logs_prompt_and_response():

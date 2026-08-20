@@ -298,6 +298,44 @@ def hyps_by_turn_from_records(
     return out
 
 
+def hyps_by_unit_from_records(
+    records: list[dict],
+    units: list,
+) -> dict[int, list[Hypothesis]]:
+    """Attach unit-level hyps to merged turns (index = unit order). No map-back."""
+    by_id: dict[str, dict] = {}
+    for record in records or []:
+        if not isinstance(record, dict):
+            continue
+        uid = str(record.get("unit_id") or "")
+        if uid:
+            by_id[uid] = record
+    out: dict[int, list[Hypothesis]] = {}
+    for i, unit in enumerate(units or []):
+        record = by_id.get(str(getattr(unit, "unit_id", "") or ""))
+        if record is None:
+            continue
+        hyps: list[Hypothesis] = []
+        for raw in record.get("hyps") or []:
+            if not isinstance(raw, dict):
+                continue
+            unit_text = str(raw.get("text") or "")
+            hyps.append(
+                Hypothesis(
+                    model=str(raw.get("model") or ""),
+                    text=unit_text,
+                    lid=raw.get("lid"),
+                    meta={
+                        "unit_id": str(getattr(unit, "unit_id", "") or ""),
+                        "unit_text": unit_text,
+                    },
+                )
+            )
+        if hyps:
+            out[i] = hyps
+    return out
+
+
 def _validate_polish_raw(
     raw: Any,
     *,

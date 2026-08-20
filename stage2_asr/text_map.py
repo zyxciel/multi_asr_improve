@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from stage2_asr.types import Turn
+from stage2_asr.types import AsrStatus, AsrUnit, Turn
 
 JOINER = "。"
 _END_PUNCT = set("。，、？！；,.!?")
@@ -16,6 +16,47 @@ def join_turn_texts(texts: list[str]) -> str:
         if out[-1] not in _END_PUNCT:
             out += JOINER
         out += piece
+    return out
+
+
+def stitch_member_texts(pieces: list[str]) -> str:
+    """Reassemble mapped-back fragments without injecting a sentence joiner.
+
+    Duration-split pieces such as 以前那个温 + 度的问题 must become one sentence.
+    """
+    return "".join(t.strip() for t in pieces if (t or "").strip())
+
+
+def merged_turns_from_units(
+    turns: list[Turn],
+    texts: dict[int, str],
+    units: list[AsrUnit],
+) -> list[Turn]:
+    """One turn per ASR unit; text is stitched member-turn text."""
+    out: list[Turn] = []
+    for unit in units:
+        pieces: list[str] = []
+        source = "fused"
+        confidence = 1.0
+        for i in unit.turn_indices:
+            if 0 <= i < len(turns):
+                pieces.append(str(texts.get(i, turns[i].text) or ""))
+                source = turns[i].source
+                confidence = turns[i].confidence
+            elif i in texts:
+                pieces.append(str(texts[i] or ""))
+        text = stitch_member_texts(pieces)
+        out.append(
+            Turn(
+                start=float(unit.start),
+                end=float(unit.end),
+                speaker_id=str(unit.speaker_id),
+                text=text,
+                asr_status=AsrStatus.FINAL if text else AsrStatus.EMPTY,
+                source=source,
+                confidence=confidence,
+            )
+        )
     return out
 
 

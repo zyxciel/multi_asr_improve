@@ -333,6 +333,10 @@ def run_batch(
                 row["final"] = str(result["final_path"])
             if result.get("draft_path") is not None:
                 row["draft"] = str(result["draft_path"])
+            if result.get("draft_merged_path") is not None:
+                row["draft_merged"] = str(result["draft_merged_path"])
+            if result.get("final_merged_path") is not None:
+                row["final_merged"] = str(result["final_merged_path"])
             if result.get("polished_path") is not None:
                 row["polished"] = str(result["polished_path"])
             if result.get("asr_hypotheses_path") is not None:
