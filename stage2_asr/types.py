@@ -139,6 +139,9 @@ class PipelineConfig:
     # Pass B: 1 = sequential (later turns see earlier Pass B edits).
     # >1 = snapshot meeting draft + judge_many (faster; no in-pass cascade).
     pass_b_batch_size: int = 1
+    # Polish: 1 = sequential (later turns see earlier polish edits).
+    # >1 = snapshot neighbors + polish_many. Independent of Pass A/B.
+    polish_batch_size: int = 1
 
 
 @dataclass

@@ -1,48 +1,46 @@
 from __future__ import annotations
 
-"""Polish prompt: display + hyp/context/world-knowledge recovery.
+"""Polish prompt: minimal evidenced edits on the phonetic-final ASR text.
 
-Pass A/B stay phonetic (span-local + pinyin). This pass may change word
-identity when an ASR hyp, neighbors, or meeting-consistent world knowledge
-supports it. No char-count or pinyin cap.
+Pass A/B stay phonetic (span-local + pinyin). This pass may substitute an
+entity or code-switched term only when a hyp / neighbor / hotword contains
+the replacement. No ITN. No world-knowledge-only swaps.
 """
 
 POLISH_SYSTEM_PROMPT = (
-    "You are a meeting-transcript display and recovery editor. "
-    "The input is the phonetic Pass A/B final, which is often still wrong on "
-    "code-switched English, named entities, and topic-level substitutions "
-    "because those passes forbid |Δlen|>1 and context-only fixes. "
-    "Your job: punctuation, entity orthography, code-switched terms, ITN, "
-    "AND recovering the intended words using (1) the three ASR hypotheses, "
-    "(2) neighbor/meeting context, (3) LLM world knowledge consistent with "
-    "this meeting. "
+    "You are a conservative meeting-transcript editor. "
+    "The input is the phonetic Pass A/B final. Copy it; change as little as possible. "
+    "Allowed work: (1) necessary punctuation only, (2) minimal entity substitutions, "
+    "(3) Chinese-English code-switch corrections — each with explicit evidence. "
+    "Do not add content, insert sentences, delete repeated characters, rewrite style, "
+    "or normalize numbers. "
     "You MUST output ONLY valid JSON. "
     "Do NOT output chain-of-thought, analysis, or <think> blocks."
 )
 
 POLISH_USER_TEMPLATE = """### Task
-Polish one meeting turn. Output JSON only.
+Polish one meeting turn. Base = the phonetic-final text below. Output JSON only.
 
-This pass is NOT bound by Pass A/B span-local char-count (|Δlen|≤1) or pinyin
-edit-distance. Those rules already blocked valid repairs such as 温度→Windows.
+### Hard constraints (violations are discarded)
+1. Base is the current phonetic-final text. List every change in edits. Empty edits cannot rewrite the turn.
+2. Minimal entity substitution or correction only. Do NOT add content, insert sentences, continue the utterance, paraphrase, or delete repetitive characters (好好好 stays 好好好).
+3. Chinese→Chinese substitution: |len(span_asr)-len(span_out)| ≤ 2 (one or two characters of slack). Examples: 张三风→张三丰 (|Δ|=0), 爱情→娃娃亲 (|Δ|=1). REJECT 爱情→娃娃亲的事 (|Δ|=3).
+4. Chinese→English (or English→Chinese) may change character count because scripts differ, but span_out MUST already appear in a hyp / neighbor / hotword. Example: 温度→Windows only if a hyp contains Windows.
+5. Punctuation: only necessary additions or fixes of existing marks. Do not punctuate every turn. Do not punctuate backchannels (嗯、对、好、好的). Do not invent English punctuation in Chinese.
+6. NO number normalization / ITN. Keep spoken and written numbers as in the input. REJECT 三点→3点, 0.61→zero point sixty-one, 532→five hundred thirty-two, 百分之五十→50%.
+7. Do not expand abbreviations (GPU ↛ Graphics Processing Unit). Do not swap entities from world knowledge without a hyp/neighbor/hotword span.
+8. If unsure, keep the input (edits=[]).
 
-### Evidence ladder (prefer earlier rungs)
-1. hyp: span_out (or a close canonical form) already appears in another ASR hypothesis for this turn/unit. Strongest evidence. Use even if lengths differ a lot.
-2. neighbor_draft / meeting_draft / hotword: topic or name consistency with neighbors or hotwords.
-3. world: world knowledge that is the only reading coherent with this meeting (e.g. a product-name discussion where 温度 is a mishearing of Windows). Do not use world knowledge to invent facts that the meeting never implied.
+### Evidence (required on entity / codeswitch except latin casing like gpu→GPU)
+- hyp: span_out already appears in an ASR hypothesis for this turn/unit.
+- neighbor_draft / meeting_draft: span_out already appears in a neighbor turn.
+- hotword: span_out is a provided hotword.
+Write a short evidence string stating where span_out was found. Do not use world.
 
-### Allowed edit kinds (use these exact strings)
-- punc: Chinese punctuation (，。？！、：；).
-- entity: named entity / topic term already intended in the meeting (爱情→娃娃亲 when neighbors discuss 娃娃亲).
-- codeswitch: mixed Chinese-English / product names (温度→Windows when a hyp has Windows; gpu→GPU).
-- itn: spoken numbers/dates/times/money/percentages → written form.
-
-### Constraints
-1. Every change MUST be listed in edits. Empty edits cannot rewrite the turn.
-2. span_asr MUST be an exact substring of the input (or "" for insertion at start_char).
-3. Prefer small spans. Do not summarize or add clauses that nobody said.
-4. Do not expand abbreviations into definitions (GPU ↛ Graphics Processing Unit).
-5. If truly unsure, keep the input (edits=[]).
+### Allowed edit kinds (exact strings)
+- punc: necessary Chinese punctuation only; must not change letters/CJK/digits.
+- entity: Chinese entity correction with evidence; |Δlen|≤2 (张三风→张三丰, 爱情→娃娃亲).
+- codeswitch: mixed CN-EN / product names with evidence (温度→Windows); or latin casing of a token already in the text (gpu→GPU).
 
 ### Inputs
 - Turn index: {turn_index}
@@ -58,22 +56,25 @@ edit-distance. Those rules already blocked valid repairs such as 温度→Window
   "edits": [
     {{
       "span_asr": "exact substring of the input",
-      "span_out": "replacement (length unrestricted)",
-      "kind": "punc|entity|codeswitch|itn",
-      "anchor": "hyp|neighbor_draft|meeting_draft|hotword|world",
+      "span_out": "replacement",
+      "kind": "punc|entity|codeswitch",
+      "anchor": "hyp|neighbor_draft|meeting_draft|hotword",
+      "evidence": "where span_out was found",
       "start_char": 0
     }}
   ]
 }}
 
 ### Few-shots
-1) punc: 大家好明天见 → 大家好，明天见。
-2) itn: 明天下午三点五十开会 → 三点五十 → 3:50
-3) codeswitch casing: gpu → GPU
-4) codeswitch + hyp (MUST APPLY): text 以前那个温度的问题; qwen hyp 以前那个Windows的问题 → 温度 → Windows, kind=codeswitch, anchor=hyp. |Δlen|=5 is allowed.
-5) entity + neighbor (MUST APPLY): text 他们说的爱情到底怎么办; neighbor 娃娃亲这件事 → 爱情 → 娃娃亲, kind=entity, anchor=neighbor_draft. No pinyin link required.
-6) REJECT: 很好 → 非常好 (synonym, no hyp/context need)
-7) REJECT: 微信 → WeChat when no hyp/neighbor used English and the speaker used Chinese only
+1) punc (necessary clause mark only): 大家好明天见 → 大家好，明天见 (do NOT also append 。 if not needed)
+2) codeswitch casing: gpu → GPU (latin already in the text)
+3) codeswitch + hyp: text 以前那个温度的问题; qwen hyp 以前那个Windows的问题 → 温度 → Windows, kind=codeswitch, anchor=hyp, evidence="qwen hyp contains Windows"
+4) entity + neighbor, |Δ|=0: text 找张三风签字; neighbor 张三丰已经到了 → 张三风 → 张三丰, kind=entity, anchor=neighbor_draft, evidence="neighbor contains 张三丰"
+5) entity + neighbor, |Δ|=1: text 他们说的爱情到底怎么办; neighbor 娃娃亲这件事 → 爱情 → 娃娃亲, kind=entity, anchor=neighbor_draft, evidence="neighbor contains 娃娃亲"
+6) REJECT: 爱情 → 娃娃亲的事 (|Δlen|=3 exceeds ±2 slack); 很好 → 非常好 (synonym without span_out in hyp/neighbor)
+7) REJECT: 微信 → WeChat when no hyp/neighbor/hotword contains WeChat
+8) REJECT: 三点 → 3点 ; 0.61 → zero point sixty-one ; 532 → five hundred thirty-two (no number normalization)
+9) REJECT: insert a new sentence; 好好好 → 好 ; empty span_asr insertions
 
 Now polish the turn. Output JSON only.
 """

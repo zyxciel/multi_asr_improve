@@ -103,26 +103,6 @@ def _merge_pass_stats(path: Path, updates: dict[str, Any]) -> dict[str, Any]:
     return merged
 
 
-def _rewrite_edits_pass_b(edits_path: Path, pass_b_audits: list[dict]) -> None:
-    """Keep Pass A lines; replace any prior Pass B lines with this run's audits."""
-    pass_a: list[dict] = []
-    if edits_path.exists():
-        for line in edits_path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(obj, dict) and obj.get("pass") == "A":
-                pass_a.append(obj)
-    with edits_path.open("w", encoding="utf-8") as f:
-        for a in pass_a:
-            f.write(json.dumps(a, ensure_ascii=False) + "\n")
-        for a in pass_b_audits:
-            f.write(json.dumps(a, ensure_ascii=False) + "\n")
-
-
 def _cache_path(work_dir: Path, unit_id: str, runner_name: str) -> Path:
     d = work_dir / "asr_cache"
     d.mkdir(parents=True, exist_ok=True)
@@ -223,7 +203,7 @@ def _persist_polish(
     llm_log_path: Path | None,
     hyp_records: list[dict] | None = None,
 ) -> dict[str, Any]:
-    batch_note = max(1, int(getattr(cfg, "pass_a_batch_size", 1) or 1))
+    batch_note = max(1, int(getattr(cfg, "polish_batch_size", 1) or 1))
     _log(
         f"[polish] start: {len(turns)} turns "
         f"batch_size={batch_note} work_dir={work_dir}"
@@ -408,7 +388,7 @@ def run_pipeline(
     - pass_a: run Pass A only from saved ASR hypotheses/cache.
     - pass_b: run Pass B only from mode_c_draft.json.
     - llm: run Pass A then Pass B from saved ASR hypotheses/cache (no ASR inference).
-    - polish: display polish (punc / entity / codeswitch / ITN) from mode_c_asr_final.json.
+    - polish: conservative polish (punc / evidenced entity / codeswitch; no ITN) from mode_c_asr_final.json.
     - all: full pipeline in one run (ASR + Pass A/B + polish).
     """
     cfg = config or PipelineConfig()
@@ -712,7 +692,7 @@ def _run_pipeline_body(
         final_path = work_dir / "mode_c_asr_final.json"
         final_path.write_text(json.dumps(final_doc, ensure_ascii=False, indent=2), encoding="utf-8")
         edits_path = work_dir / "llm_edits.jsonl"
-        _rewrite_edits_pass_b(edits_path, pass_b_audits)
+        _rewrite_edits_keep_other_passes(edits_path, "B", pass_b_audits)
         stats_path = work_dir / "pass_stats.json"
         pass_stats = _merge_pass_stats(stats_path, {"pass_b": _summarize_pass_b(pass_b_audits)})
         _log(f"[pass_b] wrote {final_path}")

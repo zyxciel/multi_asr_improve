@@ -97,6 +97,15 @@ def _add_common_run_args(p: argparse.ArgumentParser) -> None:
         ),
     )
     p.add_argument(
+        "--polish-batch-size",
+        type=int,
+        default=1,
+        help=(
+            "Polish micro-batch size (1 = sequential, later turns see earlier polish edits; "
+            ">1 = snapshot neighbors + polish_many). Independent of Pass A/B."
+        ),
+    )
+    p.add_argument(
         "--vllm-tp-size",
         type=int,
         default=1,
@@ -191,6 +200,7 @@ def _pipeline_config(args: argparse.Namespace) -> PipelineConfig:
         max_asr_seconds=float(args.max_asr_seconds),
         pass_a_batch_size=max(1, int(args.pass_a_batch_size)),
         pass_b_batch_size=max(1, int(getattr(args, "pass_b_batch_size", 1))),
+        polish_batch_size=max(1, int(getattr(args, "polish_batch_size", 1))),
     )
 
 

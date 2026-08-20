@@ -140,7 +140,7 @@ class MockLlmJudge:
         hypotheses: list | None = None,
         **_kwargs,
     ) -> dict:
-        """Deterministic polish: ITN / casing, plus hyp- and neighbor-anchored recoveries."""
+        """Deterministic polish: evidenced entity/codeswitch only. No ITN or trailing 。."""
         _ = (hotwords, turn_index, unit_id)
         original = text or ""
         edits: list[dict] = []
@@ -153,6 +153,17 @@ class MockLlmJudge:
                     "span_out": "Windows",
                     "kind": "codeswitch",
                     "anchor": "hyp",
+                    "evidence": "qwen hyp contains Windows",
+                }
+            )
+        if "张三风" in original and "张三丰" in neighbor_blob:
+            edits.append(
+                {
+                    "span_asr": "张三风",
+                    "span_out": "张三丰",
+                    "kind": "entity",
+                    "anchor": "neighbor_draft",
+                    "evidence": "neighbor contains 张三丰",
                 }
             )
         if "爱情" in original and "娃娃亲" in neighbor_blob:
@@ -162,27 +173,24 @@ class MockLlmJudge:
                     "span_out": "娃娃亲",
                     "kind": "entity",
                     "anchor": "neighbor_draft",
+                    "evidence": "neighbor contains 娃娃亲",
                 }
             )
-        for src, dst, kind in (
-            ("百分之五十", "50%", "itn"),
-            ("三点", "3点", "itn"),
-            ("wifi", "Wi-Fi", "codeswitch"),
-            ("WIFI", "Wi-Fi", "codeswitch"),
-            ("gpu", "GPU", "codeswitch"),
-            ("Gpu", "GPU", "codeswitch"),
+        for src, dst in (
+            ("wifi", "Wi-Fi"),
+            ("WIFI", "Wi-Fi"),
+            ("gpu", "GPU"),
+            ("Gpu", "GPU"),
         ):
             if src in original and src != dst:
-                edits.append({"span_asr": src, "span_out": dst, "kind": kind})
-        if original and original[-1] not in "。？！!?.,;；、":
-            edits.append(
-                {
-                    "span_asr": "",
-                    "span_out": "。",
-                    "kind": "punc",
-                    "start_char": len(original),
-                }
-            )
+                edits.append(
+                    {
+                        "span_asr": src,
+                        "span_out": dst,
+                        "kind": "codeswitch",
+                        "evidence": "latin token already in the phonetic final",
+                    }
+                )
         new_text, _located = apply_polish_edits(original, edits)
         return {"text": new_text, "edits": edits}
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from stage2_asr.neighbors import cap_neighbors, meeting_draft
 from stage2_asr.pinyin_util import pinyin_edit_distance
 from stage2_asr.types import Edit, Hypothesis, PipelineConfig, Turn
 from stage2_asr.validators import (
@@ -85,36 +86,6 @@ def _apply_hotword_aliases(
         if new_text != text:
             out[i] = new_text
     return out, audits
-
-
-def _meeting_draft(turns: list[Turn], texts: dict[int, str]) -> list[dict]:
-    return [
-        {
-            "turn_index": i,
-            "start": t.start,
-            "end": t.end,
-            "speaker_id": t.speaker_id,
-            "text": texts.get(i, t.text),
-        }
-        for i, t in enumerate(turns)
-    ]
-
-
-def _cap_neighbors(meeting: list[dict], turn_index: int, cfg: PipelineConfig) -> list[dict]:
-    """Cap meeting neighbors (~4096 tokens ≈ 8192 chars, neighbor_max_turns)."""
-    neighbors = [row for row in meeting if row["turn_index"] != turn_index]
-    char_budget = 4096 * 2
-    used = 0
-    capped: list[dict] = []
-    for row in neighbors:
-        cost = len(str(row.get("text", ""))) + 32
-        if capped and used + cost > char_budget:
-            break
-        capped.append(row)
-        used += cost
-        if len(capped) >= cfg.neighbor_max_turns:
-            break
-    return capped
 
 
 def _hyps_for_turn(i: int, text: str, moss_texts: dict[int, str]) -> list[Hypothesis]:
@@ -255,7 +226,7 @@ def _run_pass_b_batched(
     moss_texts: dict[int, str],
 ) -> tuple[dict[int, str], list[dict]]:
     """Snapshot meeting_draft once; judge_many in chunks (no in-pass cascade)."""
-    meeting = _meeting_draft(turns, out)
+    meeting = meeting_draft(turns, out)
     batch_size = max(1, int(getattr(cfg, "pass_b_batch_size", 1) or 1))
     prepared: list[dict] = []
     for i, turn in enumerate(turns):
@@ -271,7 +242,7 @@ def _run_pass_b_batched(
                 "overlap": i in overlap_turn_indices,
                 "heavy": i in heavy_overlap_turn_indices,
                 "hyps": _hyps_for_turn(i, text, moss_texts),
-                "neighbors": _cap_neighbors(meeting, i, cfg),
+                "neighbors": cap_neighbors(meeting, i, cfg),
                 "unit_id": f"pass_b_t{i}",
                 "last_err": None,
             }
@@ -451,7 +422,7 @@ def run_pass_b(
             moss_texts=moss_texts,
         )
 
-    meeting = _meeting_draft(turns, out)
+    meeting = meeting_draft(turns, out)
     for i, turn in enumerate(turns):
         text = out.get(i, turn.text)
         if not text:
@@ -462,7 +433,7 @@ def run_pass_b(
         overlap = i in overlap_turn_indices
         heavy = i in heavy_overlap_turn_indices
         hyps = _hyps_for_turn(i, text, moss_texts)
-        capped = _cap_neighbors(meeting, i, cfg)
+        capped = cap_neighbors(meeting, i, cfg)
 
         unit_id = f"pass_b_t{i}"
         accepted = None
@@ -527,6 +498,6 @@ def run_pass_b(
             batched=False,
         )
         if changed:
-            meeting = _meeting_draft(turns, out)
+            meeting = meeting_draft(turns, out)
 
     return out, audits
