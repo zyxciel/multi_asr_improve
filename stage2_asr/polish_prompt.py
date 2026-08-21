@@ -25,7 +25,7 @@ Polish one meeting turn. Base = the phonetic-final text below. Output JSON only.
 1. Base is the current phonetic-final text. List every change in edits. Empty edits cannot rewrite the turn.
 2. Minimal entity substitution or correction only. Do NOT add content, insert sentences, continue the utterance, paraphrase, or delete repetitive characters (好好好 stays 好好好).
 3. Chinese→Chinese substitution: |len(span_asr)-len(span_out)| ≤ 2 (one or two characters of slack). Examples: 张三风→张三丰 (|Δ|=0), 爱情→娃娃亲 (|Δ|=1). REJECT 爱情→娃娃亲的事 (|Δ|=3).
-4. Chinese→English (or English→Chinese) may change character count because scripts differ, but span_out MUST already appear in a hyp / neighbor / hotword. Example: 温度→Windows only if a hyp contains Windows.
+4. Chinese→English / mixed CN–EN may change character count because scripts differ, but span_out MUST already appear in a hyp / neighbor / hotword (case-insensitive for English). Examples: 温度→Windows; 温度的问题→Windows产品 when a hyp contains windows产品.
 5. Punctuation: only necessary additions or fixes of existing marks. Do not punctuate every turn. Do not punctuate backchannels (嗯、对、好、好的). Do not invent English punctuation in Chinese.
 6. NO number normalization / ITN. Keep spoken and written numbers as in the input. REJECT 三点→3点, 0.61→zero point sixty-one, 532→five hundred thirty-two, 百分之五十→50%.
 7. Do not expand abbreviations (GPU ↛ Graphics Processing Unit). Do not swap entities from world knowledge without a hyp/neighbor/hotword span.
@@ -40,7 +40,7 @@ Write a short evidence string stating where span_out was found. Do not use world
 ### Allowed edit kinds (exact strings)
 - punc: necessary Chinese punctuation only; must not change letters/CJK/digits.
 - entity: Chinese entity correction with evidence; |Δlen|≤2 (张三风→张三丰, 爱情→娃娃亲).
-- codeswitch: mixed CN-EN / product names with evidence (温度→Windows); or latin casing of a token already in the text (gpu→GPU).
+- codeswitch: mixed CN-EN / product names with evidence (温度→Windows, 温度的问题→Windows产品); or latin casing of a token already in the text (gpu→GPU).
 
 ### Inputs
 - Turn index: {turn_index}
@@ -68,7 +68,7 @@ Write a short evidence string stating where span_out was found. Do not use world
 ### Few-shots
 1) punc (necessary clause mark only): 大家好明天见 → 大家好，明天见 (do NOT also append 。 if not needed)
 2) codeswitch casing: gpu → GPU (latin already in the text)
-3) codeswitch + hyp: text 以前那个温度的问题; qwen hyp 以前那个Windows的问题 → 温度 → Windows, kind=codeswitch, anchor=hyp, evidence="qwen hyp contains Windows"
+3) codeswitch + hyp: text 以前那个温度的问题; qwen hyp 以前那个windows产品 → 温度的问题 → Windows产品, kind=codeswitch, anchor=hyp, evidence="qwen hyp contains windows产品"
 4) entity + neighbor, |Δ|=0: text 找张三风签字; neighbor 张三丰已经到了 → 张三风 → 张三丰, kind=entity, anchor=neighbor_draft, evidence="neighbor contains 张三丰"
 5) entity + neighbor, |Δ|=1: text 他们说的爱情到底怎么办; neighbor 娃娃亲这件事 → 爱情 → 娃娃亲, kind=entity, anchor=neighbor_draft, evidence="neighbor contains 娃娃亲"
 6) REJECT: 爱情 → 娃娃亲的事 (|Δlen|=3 exceeds ±2 slack); 很好 → 非常好 (synonym without span_out in hyp/neighbor)

@@ -178,6 +178,23 @@ def test_validate_cjk_to_en_length_may_change_with_hyp_evidence():
     assert ok is True, err
 
 
+def test_validate_cjk_to_mixed_cn_en_with_hyp_evidence():
+    ok, err = validate_polish_edits(
+        [
+            {
+                "span_asr": "温度的问题",
+                "span_out": "Windows产品",
+                "kind": "codeswitch",
+                "anchor": "hyp",
+                "evidence": "qwen hyp contains windows产品",
+            }
+        ],
+        text="以前那个温度的问题",
+        hypotheses=[Hypothesis("qwen", "以前那个windows产品")],
+    )
+    assert ok is True, err
+
+
 def test_validate_rejects_entity_without_evidence_source():
     ok, err = validate_polish_edits(
         [

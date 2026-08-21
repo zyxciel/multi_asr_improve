@@ -146,7 +146,17 @@ class MockLlmJudge:
         edits: list[dict] = []
         hyp_blob = _blob_from_hyps(hypotheses)
         neighbor_blob = _blob_from_neighbors(neighbor_draft)
-        if "温度" in original and "Windows" in hyp_blob:
+        if "温度的问题" in original and "windows产品" in hyp_blob.lower():
+            edits.append(
+                {
+                    "span_asr": "温度的问题",
+                    "span_out": "Windows产品",
+                    "kind": "codeswitch",
+                    "anchor": "hyp",
+                    "evidence": "qwen hyp contains windows产品",
+                }
+            )
+        elif "温度" in original and "Windows" in hyp_blob:
             edits.append(
                 {
                     "span_asr": "温度",

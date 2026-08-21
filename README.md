@@ -203,7 +203,7 @@ Round-1 polish raised WER: unconstrained add/delete/rewrite/continuation, number
 | Base = merged ASR units (`mode_c_asr_final_merged.json`) | Polish never overwrites `mode_c_asr_final.json` (pre-merge WER grid) |
 | No added sentences / empty insertions / repeat collapse (`好好好`→`好`) | Validator |
 | CN→CN substitution: `|Δlen| ≤ 2` | Validator (`爱情`→`娃娃亲` allowed; `爱情`→`娃娃亲的事` rejected) |
-| CN→EN may change length | Only if `span_out` already appears in a hyp / neighbor / hotword (`温度`→`Windows`) |
+| CN→EN / mixed CN–EN may change length | `span_out` (or case-insensitive English) already in a hyp / neighbor / hotword (`温度`→`Windows`, `温度的问题`→`Windows产品`) |
 | Punctuation | Word/CJK/digit skeleton must stay identical; no trailing `。` on every turn |
 | No number normalization | Digit sequence must be unchanged; `itn` kind removed |
 | Evidence | `entity` / `codeswitch` (except latin casing `gpu`→`GPU`) require `anchor` ∈ {hyp, neighbor_draft, meeting_draft, hotword} plus an `evidence` string; `world` is rejected. Logged on each `llm_edits.jsonl` polish row |

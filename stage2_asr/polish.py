@@ -51,9 +51,18 @@ def _is_latin_only(s: str) -> bool:
     return bool(core) and _cjk_count(core) == 0 and _latin_count(core) > 0
 
 
+def _is_mixed(s: str) -> bool:
+    return _cjk_count(s) > 0 and _latin_count(s) > 0
+
+
 def _codeswitch_scripts(asr: str, out: str) -> bool:
-    return (_is_cjk_only(asr) and _is_latin_only(out)) or (
-        _is_latin_only(asr) and _is_cjk_only(out)
+    """CJK ↔ Latin, or CJK ↔ mixed CN–EN (温度的问题 → Windows产品)."""
+    a_cjk, a_lat, a_mix = _is_cjk_only(asr), _is_latin_only(asr), _is_mixed(asr)
+    o_cjk, o_lat, o_mix = _is_cjk_only(out), _is_latin_only(out), _is_mixed(out)
+    return bool(
+        (a_cjk and (o_lat or o_mix))
+        or (a_lat and (o_cjk or o_mix))
+        or (a_mix and (o_cjk or o_lat or o_mix))
     )
 
 
@@ -116,11 +125,11 @@ def _span_out_in_source(
     if not needle:
         return False
     if anchor == "hyp":
-        return needle in hyp_blob
+        return needle in hyp_blob or needle.lower() in hyp_blob.lower()
     if anchor in {"neighbor_draft", "meeting_draft"}:
-        return needle in neighbor_blob
+        return needle in neighbor_blob or needle.lower() in neighbor_blob.lower()
     if anchor == "hotword":
-        return needle in hotword_blob
+        return needle in hotword_blob or needle.lower() in hotword_blob.lower()
     return False
 
 

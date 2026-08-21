@@ -19,12 +19,66 @@ def join_turn_texts(texts: list[str]) -> str:
     return out
 
 
+def _fold_punct(s: str) -> str:
+    return s.strip().strip("。，、？！；,.!?;:\"'")
+
+
+def _suffix_prefix_overlap(left: str, right: str) -> int:
+    max_k = min(len(left), len(right))
+    for k in range(max_k, 0, -1):
+        if left.endswith(right[:k]):
+            return k
+    return 0
+
+
+def _collapse_tandem(s: str) -> str:
+    n = len(s)
+    if n >= 8 and n % 2 == 0:
+        half = n // 2
+        if half >= 4 and s[:half] == s[half:]:
+            return s[:half]
+    return s
+
+
 def stitch_member_texts(pieces: list[str]) -> str:
     """Reassemble mapped-back fragments without injecting a sentence joiner.
 
     Duration-split pieces such as 以前那个温 + 度的问题 must become one sentence.
+    Full-sentence copies on every member turn must not be concatenated.
     """
-    return "".join(t.strip() for t in pieces if (t or "").strip())
+    cleaned = [t.strip() for t in pieces if (t or "").strip()]
+    if not cleaned:
+        return ""
+    folded = [_fold_punct(p) for p in cleaned]
+    keep: list[int] = []
+    for i, fp in enumerate(folded):
+        if any(j != i and fp and fp in folded[j] for j in range(len(cleaned))):
+            contained_in_longer = any(
+                j != i and fp in folded[j] and len(folded[j]) > len(fp)
+                for j in range(len(cleaned))
+            )
+            if contained_in_longer:
+                continue
+        if any(folded[j] == fp for j in keep):
+            continue
+        keep.append(i)
+    if not keep:
+        keep = [max(range(len(cleaned)), key=lambda i: len(folded[i]))]
+    out = cleaned[keep[0]]
+    for i in keep[1:]:
+        piece = cleaned[i]
+        fo, fp = _fold_punct(out), _fold_punct(piece)
+        if fp in fo:
+            continue
+        if fo in fp:
+            out = piece
+            continue
+        overlap = _suffix_prefix_overlap(out, piece)
+        if overlap >= 2:
+            out = out + piece[overlap:]
+        else:
+            out = out + piece
+    return _collapse_tandem(out)
 
 
 def merged_turns_from_units(

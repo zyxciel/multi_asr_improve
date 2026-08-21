@@ -63,6 +63,29 @@ def test_stitch_member_texts_does_not_inject_joiner():
     assert stitch_member_texts(["以前那个温", "度的问题"]) == "以前那个温度的问题"
 
 
+def test_stitch_member_texts_drops_duplicate_and_contained_sentences():
+    assert stitch_member_texts(["Windows产品", "Windows产品"]) == "Windows产品"
+    assert stitch_member_texts(["以前那个Windows产品", "Windows产品"]) == "以前那个Windows产品"
+    assert stitch_member_texts(["Windows产品", "以前那个Windows产品"]) == "以前那个Windows产品"
+
+
+def test_stitch_member_texts_collapses_tandem_repetition():
+    assert stitch_member_texts(["温度的问题", "温度的问题"]) == "温度的问题"
+    doubled = stitch_member_texts(["以前那个Windows产品", "以前那个Windows产品"])
+    assert doubled == "以前那个Windows产品"
+    assert doubled.count("Windows") == 1
+
+
+def test_merged_turns_from_units_does_not_repeat_full_sentence():
+    turns = [
+        Turn(0.0, 1.0, "s0", "以前那个Windows产品"),
+        Turn(1.1, 2.0, "s0", "以前那个Windows产品"),
+    ]
+    units = [AsrUnit("unit_0000", 0.0, 2.0, "s0", [0, 1], moss_merged=True)]
+    merged = merged_turns_from_units(turns, {0: turns[0].text, 1: turns[1].text}, units)
+    assert merged[0].text == "以前那个Windows产品"
+
+
 def test_merged_turns_from_units_concatenates_same_speaker_fragments():
     turns = [
         Turn(0.0, 1.0, "s0", "以前那个温"),
