@@ -152,9 +152,10 @@ def build_asr_units(
         gap = float(t.start) - cur_end
         same = t.speaker_id == cur_spk
         new_span = float(t.end) - cur_start
-        if same and 0 <= gap <= cfg.max_gap_seconds and new_span <= cfg.max_asr_seconds:
+        # gap < 0 means the next turn overlaps or is nested in the current unit.
+        if same and gap <= cfg.max_gap_seconds and new_span <= cfg.max_asr_seconds:
             cur_indices.append(idx)
-            cur_end = float(t.end)
+            cur_end = max(cur_end, float(t.end))
             continue
         flush()
         cur_indices = [idx]

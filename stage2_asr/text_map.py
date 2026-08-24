@@ -81,6 +81,56 @@ def stitch_member_texts(pieces: list[str]) -> str:
     return _collapse_tandem(out)
 
 
+def _fold_compare(s: str) -> str:
+    return "".join(_fold_punct(s).split()).casefold()
+
+
+def _intervals_overlap(a: Turn, b: Turn) -> bool:
+    return float(a.start) < float(b.end) and float(b.start) < float(a.end)
+
+
+def _redundant_overlap_text(a: str, b: str) -> bool:
+    fa, fb = _fold_compare(a), _fold_compare(b)
+    if not fa or not fb:
+        return False
+    if fa == fb:
+        return True
+    shorter, longer = (fa, fb) if len(fa) <= len(fb) else (fb, fa)
+    return len(shorter) >= 4 and shorter in longer
+
+
+def keep_non_repeating_overlap_indices(turns: list[Turn]) -> list[int]:
+    """Drop time-overlapping turns whose text is the same or contained."""
+    keep = [True] * len(turns)
+    for i in range(len(turns)):
+        if not keep[i]:
+            continue
+        for j in range(i + 1, len(turns)):
+            if not keep[j]:
+                continue
+            if not _intervals_overlap(turns[i], turns[j]):
+                continue
+            if not _redundant_overlap_text(turns[i].text, turns[j].text):
+                continue
+            fi = _fold_compare(turns[i].text)
+            fj = _fold_compare(turns[j].text)
+            if fi == fj:
+                drop_j = turns[j].duration <= turns[i].duration
+            else:
+                drop_j = len(fj) <= len(fi)
+            if drop_j:
+                keep[j] = False
+            else:
+                keep[i] = False
+                break
+    return [idx for idx, ok in enumerate(keep) if ok]
+
+
+def collapse_time_overlapping_repeats(turns: list[Turn]) -> list[Turn]:
+    """Keep one copy when overlapping speech was transcribed twice."""
+    return [turns[i] for i in keep_non_repeating_overlap_indices(turns)]
+
+
 def merged_turns_from_units(
     turns: list[Turn],
     texts: dict[int, str],

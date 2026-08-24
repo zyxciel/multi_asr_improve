@@ -28,6 +28,19 @@ def test_no_concat_different_speakers():
     assert len(units) == 2
 
 
+def test_concat_same_speaker_overlapping_or_nested_turns():
+    turns = [
+        Turn(0.0, 5.0, "speaker_0", text="以前那个温度的问题"),
+        Turn(2.0, 8.0, "speaker_0", text="温度的问题"),  # overlap, gap < 0
+        Turn(3.0, 4.0, "speaker_0", text="温度"),  # nested
+    ]
+    units = build_asr_units(turns)
+    assert len(units) == 1
+    assert units[0].turn_indices == [0, 1, 2]
+    assert units[0].start == 0.0
+    assert units[0].end == 8.0
+
+
 def test_short_skip_after_failed_merge():
     turns = [Turn(0.0, 0.2, "speaker_0", text="x")]
     units = build_asr_units(turns)

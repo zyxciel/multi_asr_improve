@@ -5,6 +5,7 @@ from stage2_asr.text_map import (
     join_turn_texts,
     merged_turns_from_units,
     stitch_member_texts,
+    collapse_time_overlapping_repeats,
 )
 from stage2_asr.types import AsrUnit, Turn
 
@@ -104,3 +105,39 @@ def test_merged_turns_from_units_concatenates_same_speaker_fragments():
     assert merged[0].start == 0.0
     assert merged[0].end == 2.0
     assert merged[1].text == "好的"
+
+
+def test_collapse_time_overlapping_repeats_drops_duplicate_mixture():
+    """Cross-speaker overlap often copies the same MOSS mix onto both units."""
+    turns = [
+        Turn(0.0, 5.0, "s0", "以前那个Windows产品"),
+        Turn(2.0, 6.0, "s1", "以前那个Windows产品"),
+        Turn(10.0, 11.0, "s0", "好的"),
+    ]
+    collapsed = collapse_time_overlapping_repeats(turns)
+    assert len(collapsed) == 2
+    assert collapsed[0].text == "以前那个Windows产品"
+    assert collapsed[0].duration >= 5.0 - 1e-9
+    assert collapsed[1].text == "好的"
+
+
+def test_collapse_time_overlapping_repeats_keeps_distinct_speech():
+    turns = [
+        Turn(0.0, 5.0, "s0", "以前那个Windows产品"),
+        Turn(2.0, 6.0, "s1", "我们先把这个确认一下"),
+    ]
+    collapsed = collapse_time_overlapping_repeats(turns)
+    assert len(collapsed) == 2
+    texts = {t.text for t in collapsed}
+    assert texts == {"以前那个Windows产品", "我们先把这个确认一下"}
+
+
+def test_collapse_time_overlapping_repeats_keeps_longer_contained_text():
+    turns = [
+        Turn(0.0, 8.0, "s0", "Windows产品"),
+        Turn(2.0, 6.0, "s1", "以前那个Windows产品"),
+    ]
+    collapsed = collapse_time_overlapping_repeats(turns)
+    assert len(collapsed) == 1
+    assert collapsed[0].text == "以前那个Windows产品"
+

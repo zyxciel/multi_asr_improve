@@ -12,7 +12,12 @@ from stage2_asr.llm_log import LlmInferLogger
 from stage2_asr.pass_a import run_pass_a_batch, run_pass_a_for_unit
 from stage2_asr.pass_b import run_pass_b
 from stage2_asr.polish import hyps_by_turn_from_records, hyps_by_unit_from_records, run_polish
-from stage2_asr.text_map import distribute_unit_text, join_turn_texts, merged_turns_from_units
+from stage2_asr.text_map import (
+    distribute_unit_text,
+    join_turn_texts,
+    keep_non_repeating_overlap_indices,
+    merged_turns_from_units,
+)
 from stage2_asr.types import AsrStatus, AsrUnit, Hypothesis, PipelineConfig, Turn
 from stage2_asr.units import build_asr_units
 from stage2_asr.validate import validate_turns
@@ -111,10 +116,13 @@ def _write_merged_mode_c(
     texts: dict[int, str],
     raw_doc: dict[str, Any],
     stage: str,
-) -> list[Turn]:
+) -> tuple[list[Turn], list[AsrUnit]]:
     merged = merged_turns_from_units(turns, texts, units)
+    keep = keep_non_repeating_overlap_indices(merged)
+    merged = [merged[i] for i in keep]
+    kept_units = [units[i] for i in keep]
     rows: list[dict[str, Any]] = []
-    for t, unit in zip(merged, units):
+    for t, unit in zip(merged, kept_units):
         row = t.to_dict()
         row["unit_id"] = unit.unit_id
         row["turn_indices"] = unit.turn_indices
@@ -129,7 +137,7 @@ def _write_merged_mode_c(
         "turns": rows,
     }
     path.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
-    return merged
+    return merged, kept_units
 
 
 def _cache_path(work_dir: Path, unit_id: str, runner_name: str) -> Path:
@@ -510,7 +518,7 @@ def _run_pipeline_body(
         polish_units = None
         polish_grid = None
         if loaded:
-            polish_turns = _write_merged_mode_c(
+            polish_turns, polish_units = _write_merged_mode_c(
                 work_dir / "mode_c_asr_final_merged.json",
                 units=loaded,
                 turns=final_turns,
@@ -519,9 +527,8 @@ def _run_pipeline_body(
                 stage="pass_b_final_merged",
             )
             polish_texts = {i: t.text for i, t in enumerate(polish_turns)}
-            polish_units = loaded
             polish_grid = "asr_units"
-            n_units = len(loaded)
+            n_units = len(polish_units)
         extra = _persist_polish(
             turns=polish_turns,
             texts=polish_texts,
@@ -916,7 +923,7 @@ def _run_pipeline_body(
     final_path = work_dir / "mode_c_asr_final.json"
     final_path.write_text(json.dumps(final_doc, ensure_ascii=False, indent=2), encoding="utf-8")
     final_merged_path = work_dir / "mode_c_asr_final_merged.json"
-    merged_final = _write_merged_mode_c(
+    merged_final, kept_units = _write_merged_mode_c(
         final_merged_path,
         units=units,
         turns=final_turns,
@@ -950,10 +957,10 @@ def _run_pipeline_body(
             llm_judge=llm_judge,
             hotwords=hotwords,
             cfg=cfg,
-            n_units=len(units),
+            n_units=len(kept_units),
             llm_log_path=llm_log_path,
             hyp_records=hyp_records,
-            units=units,
+            units=kept_units,
             grid="asr_units",
         )
 
