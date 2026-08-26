@@ -307,39 +307,34 @@ def hyps_by_turn_from_records(
     return out
 
 
-def hyps_by_unit_from_records(
+def hyps_by_merged_from_records(
     records: list[dict],
-    units: list,
+    member_indices: list[list[int]],
 ) -> dict[int, list[Hypothesis]]:
-    """Attach unit-level hyps to merged turns (index = unit order). No map-back."""
-    by_id: dict[str, dict] = {}
-    for record in records or []:
-        if not isinstance(record, dict):
-            continue
-        uid = str(record.get("unit_id") or "")
-        if uid:
-            by_id[uid] = record
+    """Attach unit hyps to merged rows whose members intersect the unit."""
     out: dict[int, list[Hypothesis]] = {}
-    for i, unit in enumerate(units or []):
-        record = by_id.get(str(getattr(unit, "unit_id", "") or ""))
-        if record is None:
-            continue
+    for i, members in enumerate(member_indices or []):
+        mset = {int(x) for x in members}
         hyps: list[Hypothesis] = []
-        for raw in record.get("hyps") or []:
-            if not isinstance(raw, dict):
+        for record in records or []:
+            if not isinstance(record, dict):
                 continue
-            unit_text = str(raw.get("text") or "")
-            hyps.append(
-                Hypothesis(
-                    model=str(raw.get("model") or ""),
-                    text=unit_text,
-                    lid=raw.get("lid"),
-                    meta={
-                        "unit_id": str(getattr(unit, "unit_id", "") or ""),
-                        "unit_text": unit_text,
-                    },
+            indices = [int(x) for x in (record.get("turn_indices") or [])]
+            if not mset.intersection(indices):
+                continue
+            unit_id = str(record.get("unit_id") or "")
+            for raw in record.get("hyps") or []:
+                if not isinstance(raw, dict):
+                    continue
+                unit_text = str(raw.get("text") or "")
+                hyps.append(
+                    Hypothesis(
+                        model=str(raw.get("model") or ""),
+                        text=unit_text,
+                        lid=raw.get("lid"),
+                        meta={"unit_id": unit_id, "unit_text": unit_text},
+                    )
                 )
-            )
         if hyps:
             out[i] = hyps
     return out

@@ -3,11 +3,9 @@ from __future__ import annotations
 from stage2_asr.text_map import (
     distribute_unit_text,
     join_turn_texts,
-    merged_turns_from_units,
-    stitch_member_texts,
-    collapse_time_overlapping_repeats,
+    merge_consecutive_turns,
 )
-from stage2_asr.types import AsrUnit, Turn
+from stage2_asr.types import Turn
 
 
 def test_join_turn_texts_uses_joiner_when_no_ending_punct():
@@ -60,84 +58,53 @@ def test_distribute_duration_fallback_strips_boundary_joiners():
     assert not out[1].endswith("。") or text.endswith("。")
 
 
-def test_stitch_member_texts_does_not_inject_joiner():
-    assert stitch_member_texts(["以前那个温", "度的问题"]) == "以前那个温度的问题"
-
-
-def test_stitch_member_texts_drops_duplicate_and_contained_sentences():
-    assert stitch_member_texts(["Windows产品", "Windows产品"]) == "Windows产品"
-    assert stitch_member_texts(["以前那个Windows产品", "Windows产品"]) == "以前那个Windows产品"
-    assert stitch_member_texts(["Windows产品", "以前那个Windows产品"]) == "以前那个Windows产品"
-
-
-def test_stitch_member_texts_collapses_tandem_repetition():
-    assert stitch_member_texts(["温度的问题", "温度的问题"]) == "温度的问题"
-    doubled = stitch_member_texts(["以前那个Windows产品", "以前那个Windows产品"])
-    assert doubled == "以前那个Windows产品"
-    assert doubled.count("Windows") == 1
-
-
-def test_merged_turns_from_units_does_not_repeat_full_sentence():
-    turns = [
-        Turn(0.0, 1.0, "s0", "以前那个Windows产品"),
-        Turn(1.1, 2.0, "s0", "以前那个Windows产品"),
-    ]
-    units = [AsrUnit("unit_0000", 0.0, 2.0, "s0", [0, 1], moss_merged=True)]
-    merged = merged_turns_from_units(turns, {0: turns[0].text, 1: turns[1].text}, units)
-    assert merged[0].text == "以前那个Windows产品"
-
-
-def test_merged_turns_from_units_concatenates_same_speaker_fragments():
+def test_merge_consecutive_same_speaker_keeps_original_endpoints():
     turns = [
         Turn(0.0, 1.0, "s0", "以前那个温"),
         Turn(1.1, 2.0, "s0", "度的问题"),
-        Turn(5.0, 6.0, "s1", "好的"),
+        Turn(8.0, 9.0, "s0", "好的"),  # gap 6 > 5
     ]
-    units = [
-        AsrUnit("unit_0000", 0.0, 2.0, "s0", [0, 1], moss_merged=True),
-        AsrUnit("unit_0001", 5.0, 6.0, "s1", [2]),
+    merged, members = merge_consecutive_turns(turns, max_duration=30.0, max_merge_gap=5.0)
+    assert [(t.start, t.end, t.speaker_id, t.text) for t in merged] == [
+        (0.0, 2.0, "s0", "以前那个温度的问题"),
+        (8.0, 9.0, "s0", "好的"),
     ]
-    texts = {i: t.text for i, t in enumerate(turns)}
-    merged = merged_turns_from_units(turns, texts, units)
+    assert members == [[0, 1], [2]]
+
+
+def test_merge_does_not_join_different_speakers_or_non_adjacent_rows():
+    turns = [
+        Turn(0.0, 1.0, "s0", "甲"),
+        Turn(1.1, 2.0, "s1", "乙"),
+        Turn(2.1, 3.0, "s0", "丙"),
+    ]
+    merged, members = merge_consecutive_turns(turns, max_duration=30.0, max_merge_gap=5.0)
+    assert len(merged) == 3
+    assert [t.text for t in merged] == ["甲", "乙", "丙"]
+    assert [t.start for t in merged] == [0.0, 1.1, 2.1]
+    assert [t.end for t in merged] == [1.0, 2.0, 3.0]
+    assert members == [[0], [1], [2]]
+
+
+def test_merge_keeps_overlapping_speakers_and_their_timestamps():
+    turns = [
+        Turn(0.0, 5.0, "s0", "以前那个Windows产品"),
+        Turn(2.0, 6.0, "s1", "以前那个Windows产品"),
+    ]
+    merged, members = merge_consecutive_turns(turns, max_duration=30.0, max_merge_gap=5.0)
     assert len(merged) == 2
-    assert merged[0].text == "以前那个温度的问题"
-    assert merged[0].speaker_id == "s0"
-    assert merged[0].start == 0.0
-    assert merged[0].end == 2.0
-    assert merged[1].text == "好的"
+    assert merged[0].start == 0.0 and merged[0].end == 5.0
+    assert merged[1].start == 2.0 and merged[1].end == 6.0
+    assert members == [[0], [1]]
 
 
-def test_collapse_time_overlapping_repeats_drops_duplicate_mixture():
-    """Cross-speaker overlap often copies the same MOSS mix onto both units."""
-    turns = [
-        Turn(0.0, 5.0, "s0", "以前那个Windows产品"),
-        Turn(2.0, 6.0, "s1", "以前那个Windows产品"),
-        Turn(10.0, 11.0, "s0", "好的"),
+def test_merge_splits_overlong_turn_into_equal_chunks():
+    turns = [Turn(0.0, 70.0, "s0", "很长的一段话")]
+    merged, members = merge_consecutive_turns(turns, max_duration=30.0, max_merge_gap=5.0)
+    assert [(round(t.start, 6), round(t.end, 6), t.text) for t in merged] == [
+        (0.0, 30.0, "很长的一段话"),
+        (30.0, 60.0, ""),
+        (60.0, 70.0, ""),
     ]
-    collapsed = collapse_time_overlapping_repeats(turns)
-    assert len(collapsed) == 2
-    assert collapsed[0].text == "以前那个Windows产品"
-    assert collapsed[0].duration >= 5.0 - 1e-9
-    assert collapsed[1].text == "好的"
-
-
-def test_collapse_time_overlapping_repeats_keeps_distinct_speech():
-    turns = [
-        Turn(0.0, 5.0, "s0", "以前那个Windows产品"),
-        Turn(2.0, 6.0, "s1", "我们先把这个确认一下"),
-    ]
-    collapsed = collapse_time_overlapping_repeats(turns)
-    assert len(collapsed) == 2
-    texts = {t.text for t in collapsed}
-    assert texts == {"以前那个Windows产品", "我们先把这个确认一下"}
-
-
-def test_collapse_time_overlapping_repeats_keeps_longer_contained_text():
-    turns = [
-        Turn(0.0, 8.0, "s0", "Windows产品"),
-        Turn(2.0, 6.0, "s1", "以前那个Windows产品"),
-    ]
-    collapsed = collapse_time_overlapping_repeats(turns)
-    assert len(collapsed) == 1
-    assert collapsed[0].text == "以前那个Windows产品"
+    assert members == [[0], [0], [0]]
 

@@ -483,9 +483,9 @@ def test_pipeline_all_writes_polished_without_clobbering_asr_final(tmp_path: Pat
     merged = json.loads((out / "mode_c_asr_final_merged.json").read_text(encoding="utf-8"))
     polished = json.loads((out / "mode_c_polished.json").read_text(encoding="utf-8"))
     assert asr_final["meta"]["stage"] == "pass_b_final"
-    assert merged["meta"]["grid"] == "asr_units"
+    assert merged["meta"]["grid"] == "merged"
     assert polished["meta"]["stage"] == "polish"
-    assert polished["meta"]["grid"] == "asr_units"
+    assert polished["meta"]["grid"] == "merged"
     assert len(merged["turns"]) <= len(asr_final["turns"])
     assert len(polished["turns"]) == len(merged["turns"])
     edits = [

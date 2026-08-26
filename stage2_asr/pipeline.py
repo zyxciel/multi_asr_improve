@@ -11,12 +11,11 @@ from stage2_asr.audio_io import crop_unit_wav, load_wav_mono16k
 from stage2_asr.llm_log import LlmInferLogger
 from stage2_asr.pass_a import run_pass_a_batch, run_pass_a_for_unit
 from stage2_asr.pass_b import run_pass_b
-from stage2_asr.polish import hyps_by_turn_from_records, hyps_by_unit_from_records, run_polish
+from stage2_asr.polish import hyps_by_merged_from_records, hyps_by_turn_from_records, run_polish
 from stage2_asr.text_map import (
     distribute_unit_text,
     join_turn_texts,
-    keep_non_repeating_overlap_indices,
-    merged_turns_from_units,
+    merge_consecutive_turns,
 )
 from stage2_asr.types import AsrStatus, AsrUnit, Hypothesis, PipelineConfig, Turn
 from stage2_asr.units import build_asr_units
@@ -111,33 +110,34 @@ def _merge_pass_stats(path: Path, updates: dict[str, Any]) -> dict[str, Any]:
 def _write_merged_mode_c(
     path: Path,
     *,
-    units: list[AsrUnit],
     turns: list[Turn],
     texts: dict[int, str],
     raw_doc: dict[str, Any],
     stage: str,
-) -> tuple[list[Turn], list[AsrUnit]]:
-    merged = merged_turns_from_units(turns, texts, units)
-    keep = keep_non_repeating_overlap_indices(merged)
-    merged = [merged[i] for i in keep]
-    kept_units = [units[i] for i in keep]
+    config: PipelineConfig,
+) -> tuple[list[Turn], list[list[int]]]:
+    merged, members = merge_consecutive_turns(
+        turns,
+        texts,
+        max_duration=config.max_asr_seconds,
+        max_merge_gap=config.max_gap_seconds,
+    )
     rows: list[dict[str, Any]] = []
-    for t, unit in zip(merged, kept_units):
+    for t, idxs in zip(merged, members):
         row = t.to_dict()
-        row["unit_id"] = unit.unit_id
-        row["turn_indices"] = unit.turn_indices
+        row["turn_indices"] = idxs
         rows.append(row)
     doc = {
         "meta": {
             **(raw_doc.get("meta") or {}),
             "stage": stage,
-            "grid": "asr_units",
+            "grid": "merged",
             "n_source_turns": len(turns),
         },
         "turns": rows,
     }
     path.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
-    return merged, kept_units
+    return merged, members
 
 
 def _cache_path(work_dir: Path, unit_id: str, runner_name: str) -> Path:
@@ -239,7 +239,7 @@ def _persist_polish(
     n_units: int,
     llm_log_path: Path | None,
     hyp_records: list[dict] | None = None,
-    units: list[AsrUnit] | None = None,
+    member_indices: list[list[int]] | None = None,
     grid: str | None = None,
 ) -> dict[str, Any]:
     batch_note = max(1, int(getattr(cfg, "polish_batch_size", 1) or 1))
@@ -247,8 +247,8 @@ def _persist_polish(
         f"[polish] start: {len(turns)} turns "
         f"batch_size={batch_note} work_dir={work_dir}"
     )
-    if units:
-        hyp_by_turn = hyps_by_unit_from_records(hyp_records or [], units)
+    if member_indices is not None:
+        hyp_by_turn = hyps_by_merged_from_records(hyp_records or [], member_indices)
     else:
         hyp_by_turn = hyps_by_turn_from_records(hyp_records or [], turns)
     polished_map, audits = run_polish(
@@ -277,12 +277,11 @@ def _persist_polish(
     meta = {**(raw_doc.get("meta") or {}), "stage": "polish"}
     if grid:
         meta["grid"] = grid
-    if units:
+    if member_indices is not None:
         rows = []
-        for t, unit in zip(polished_turns, units):
+        for t, idxs in zip(polished_turns, member_indices):
             row = t.to_dict()
-            row["unit_id"] = unit.unit_id
-            row["turn_indices"] = unit.turn_indices
+            row["turn_indices"] = idxs
             rows.append(row)
         turn_rows = rows
     else:
@@ -513,22 +512,15 @@ def _run_pipeline_body(
         texts = {i: t.text for i, t in enumerate(final_turns)}
         loaded = _load_units(work_dir / "asr_units.json")
         n_units = len(loaded) if loaded is not None else 0
-        polish_turns = final_turns
-        polish_texts = texts
-        polish_units = None
-        polish_grid = None
-        if loaded:
-            polish_turns, polish_units = _write_merged_mode_c(
-                work_dir / "mode_c_asr_final_merged.json",
-                units=loaded,
-                turns=final_turns,
-                texts=texts,
-                raw_doc=final_doc if isinstance(final_doc, dict) else {},
-                stage="pass_b_final_merged",
-            )
-            polish_texts = {i: t.text for i, t in enumerate(polish_turns)}
-            polish_grid = "asr_units"
-            n_units = len(polish_units)
+        polish_turns, polish_members = _write_merged_mode_c(
+            work_dir / "mode_c_asr_final_merged.json",
+            turns=final_turns,
+            texts=texts,
+            raw_doc=final_doc if isinstance(final_doc, dict) else {},
+            stage="pass_b_final_merged",
+            config=cfg,
+        )
+        polish_texts = {i: t.text for i, t in enumerate(polish_turns)}
         extra = _persist_polish(
             turns=polish_turns,
             texts=polish_texts,
@@ -540,8 +532,8 @@ def _run_pipeline_body(
             n_units=n_units,
             llm_log_path=llm_log_path,
             hyp_records=_load_hyp_records(work_dir / "asr_hypotheses.json"),
-            units=polish_units,
-            grid=polish_grid,
+            member_indices=polish_members,
+            grid="merged",
         )
         return {"stage": "polish", "final_path": final_path, **extra}
 
@@ -765,11 +757,11 @@ def _run_pipeline_body(
         final_merged_path = work_dir / "mode_c_asr_final_merged.json"
         _write_merged_mode_c(
             final_merged_path,
-            units=units,
             turns=final_turns,
             texts={i: t.text for i, t in enumerate(final_turns)},
             raw_doc=raw_doc,
             stage="pass_b_final_merged",
+            config=cfg,
         )
         edits_path = work_dir / "llm_edits.jsonl"
         _rewrite_edits_keep_other_passes(edits_path, "B", pass_b_audits)
@@ -860,11 +852,11 @@ def _run_pipeline_body(
     draft_merged_path = work_dir / "mode_c_draft_merged.json"
     _write_merged_mode_c(
         draft_merged_path,
-        units=units,
         turns=draft_turns,
         texts={i: t.text for i, t in enumerate(draft_turns)},
         raw_doc=raw_doc,
         stage="pass_a_draft_merged",
+        config=cfg,
     )
     _log(f"[pass_a] wrote {draft_path}")
     if stage == "pass_a":
@@ -923,13 +915,13 @@ def _run_pipeline_body(
     final_path = work_dir / "mode_c_asr_final.json"
     final_path.write_text(json.dumps(final_doc, ensure_ascii=False, indent=2), encoding="utf-8")
     final_merged_path = work_dir / "mode_c_asr_final_merged.json"
-    merged_final, kept_units = _write_merged_mode_c(
+    merged_final, merged_members = _write_merged_mode_c(
         final_merged_path,
-        units=units,
         turns=final_turns,
         texts={i: t.text for i, t in enumerate(final_turns)},
         raw_doc=raw_doc,
         stage="pass_b_final_merged",
+        config=cfg,
     )
 
     edits_path = work_dir / "llm_edits.jsonl"
@@ -957,11 +949,11 @@ def _run_pipeline_body(
             llm_judge=llm_judge,
             hotwords=hotwords,
             cfg=cfg,
-            n_units=len(kept_units),
+            n_units=len(merged_final),
             llm_log_path=llm_log_path,
             hyp_records=hyp_records,
-            units=kept_units,
-            grid="asr_units",
+            member_indices=merged_members,
+            grid="merged",
         )
 
     return {

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from stage2_asr.types import AsrStatus, AsrUnit, Turn
+import math
+
+from stage2_asr.types import AsrStatus, Turn
 
 JOINER = "。"
 _END_PUNCT = set("。，、？！；,.!?")
@@ -19,149 +21,113 @@ def join_turn_texts(texts: list[str]) -> str:
     return out
 
 
-def _fold_punct(s: str) -> str:
-    return s.strip().strip("。，、？！；,.!?;:\"'")
-
-
-def _suffix_prefix_overlap(left: str, right: str) -> int:
-    max_k = min(len(left), len(right))
-    for k in range(max_k, 0, -1):
-        if left.endswith(right[:k]):
-            return k
-    return 0
-
-
-def _collapse_tandem(s: str) -> str:
-    n = len(s)
-    if n >= 8 and n % 2 == 0:
-        half = n // 2
-        if half >= 4 and s[:half] == s[half:]:
-            return s[:half]
-    return s
-
-
-def stitch_member_texts(pieces: list[str]) -> str:
-    """Reassemble mapped-back fragments without injecting a sentence joiner.
-
-    Duration-split pieces such as 以前那个温 + 度的问题 must become one sentence.
-    Full-sentence copies on every member turn must not be concatenated.
-    """
-    cleaned = [t.strip() for t in pieces if (t or "").strip()]
-    if not cleaned:
+def _join_merge_texts(parts: list[str]) -> str:
+    pieces = [p.strip() for p in parts if (p or "").strip()]
+    if not pieces:
         return ""
-    folded = [_fold_punct(p) for p in cleaned]
-    keep: list[int] = []
-    for i, fp in enumerate(folded):
-        if any(j != i and fp and fp in folded[j] for j in range(len(cleaned))):
-            contained_in_longer = any(
-                j != i and fp in folded[j] and len(folded[j]) > len(fp)
-                for j in range(len(cleaned))
-            )
-            if contained_in_longer:
-                continue
-        if any(folded[j] == fp for j in keep):
-            continue
-        keep.append(i)
-    if not keep:
-        keep = [max(range(len(cleaned)), key=lambda i: len(folded[i]))]
-    out = cleaned[keep[0]]
-    for i in keep[1:]:
-        piece = cleaned[i]
-        fo, fp = _fold_punct(out), _fold_punct(piece)
-        if fp in fo:
-            continue
-        if fo in fp:
-            out = piece
-            continue
-        overlap = _suffix_prefix_overlap(out, piece)
-        if overlap >= 2:
-            out = out + piece[overlap:]
+    out = pieces[0]
+    for piece in pieces[1:]:
+        if out[-1].isascii() and piece[0].isascii() and (out[-1].isalnum() or piece[0].isalnum()):
+            out += " " + piece
         else:
-            out = out + piece
-    return _collapse_tandem(out)
+            out += piece
+    return out
 
 
-def _fold_compare(s: str) -> str:
-    return "".join(_fold_punct(s).split()).casefold()
-
-
-def _intervals_overlap(a: Turn, b: Turn) -> bool:
-    return float(a.start) < float(b.end) and float(b.start) < float(a.end)
-
-
-def _redundant_overlap_text(a: str, b: str) -> bool:
-    fa, fb = _fold_compare(a), _fold_compare(b)
-    if not fa or not fb:
-        return False
-    if fa == fb:
-        return True
-    shorter, longer = (fa, fb) if len(fa) <= len(fb) else (fb, fa)
-    return len(shorter) >= 4 and shorter in longer
-
-
-def keep_non_repeating_overlap_indices(turns: list[Turn]) -> list[int]:
-    """Drop time-overlapping turns whose text is the same or contained."""
-    keep = [True] * len(turns)
-    for i in range(len(turns)):
-        if not keep[i]:
-            continue
-        for j in range(i + 1, len(turns)):
-            if not keep[j]:
-                continue
-            if not _intervals_overlap(turns[i], turns[j]):
-                continue
-            if not _redundant_overlap_text(turns[i].text, turns[j].text):
-                continue
-            fi = _fold_compare(turns[i].text)
-            fj = _fold_compare(turns[j].text)
-            if fi == fj:
-                drop_j = turns[j].duration <= turns[i].duration
-            else:
-                drop_j = len(fj) <= len(fi)
-            if drop_j:
-                keep[j] = False
-            else:
-                keep[i] = False
-                break
-    return [idx for idx, ok in enumerate(keep) if ok]
-
-
-def collapse_time_overlapping_repeats(turns: list[Turn]) -> list[Turn]:
-    """Keep one copy when overlapping speech was transcribed twice."""
-    return [turns[i] for i in keep_non_repeating_overlap_indices(turns)]
-
-
-def merged_turns_from_units(
+def merge_consecutive_turns(
     turns: list[Turn],
-    texts: dict[int, str],
-    units: list[AsrUnit],
-) -> list[Turn]:
-    """One turn per ASR unit; text is stitched member-turn text."""
+    texts: dict[int, str] | None = None,
+    *,
+    max_duration: float,
+    max_merge_gap: float,
+) -> tuple[list[Turn], list[list[int]]]:
+    """Merge adjacent same-speaker rows. Timestamps stay original endpoints.
+
+    Same rule as a TSV segment merge: split overlong rows into equal chunks,
+    then join only originally consecutive rows of one speaker when the gap and
+    combined duration allow it. Overlapping other speakers are left as-is.
+    """
+    if not turns:
+        return [], []
+
+    cleaned: list[tuple[int, float, float, str, str]] = []
+    for i, t in enumerate(turns):
+        start = float(t.start)
+        end = float(t.end)
+        spk = str(t.speaker_id)
+        if texts is None:
+            text = str(t.text or "")
+        else:
+            text = str(texts.get(i, t.text) or "")
+        duration = end - start
+        if duration > max_duration and max_duration > 0:
+            n_chunks = int(math.ceil(duration / max_duration))
+            for k in range(n_chunks):
+                chunk_start = start + k * max_duration
+                chunk_end = min(start + (k + 1) * max_duration, end)
+                cleaned.append((i, chunk_start, chunk_end, spk, text if k == 0 else ""))
+        else:
+            cleaned.append((i, start, end, spk, text))
+
+    groups: dict[str, list[tuple[int, tuple[int, float, float, str, str]]]] = {}
+    for new_id, row in enumerate(cleaned):
+        groups.setdefault(row[3], []).append((new_id, row))
+
+    merged_rows: list[tuple[float, float, str, str, list[int]]] = []
+    for spk, group in groups.items():
+        group.sort(key=lambda item: item[0])
+        _new_id0, row0 = group[0]
+        seg_start = row0[1]
+        seg_end = row0[2]
+        seg_ids = [_new_id0]
+        seg_orig = [row0[0]]
+        seg_texts = [row0[4]] if row0[4].strip() else []
+
+        for new_id, row in group[1:]:
+            orig_i, curr_start, curr_end, _spk, curr_text = row
+            gap = curr_start - seg_end
+            can_merge = (
+                new_id == seg_ids[-1] + 1
+                and gap <= max_merge_gap
+                and (curr_end - seg_start) <= max_duration
+            )
+            if can_merge:
+                seg_end = max(seg_end, curr_end)
+                seg_ids.append(new_id)
+                seg_orig.append(orig_i)
+                if curr_text.strip():
+                    seg_texts.append(curr_text)
+                continue
+            merged_rows.append(
+                (seg_start, seg_end, spk, _join_merge_texts(seg_texts), list(dict.fromkeys(seg_orig)))
+            )
+            seg_start = curr_start
+            seg_end = curr_end
+            seg_ids = [new_id]
+            seg_orig = [orig_i]
+            seg_texts = [curr_text] if curr_text.strip() else []
+        merged_rows.append(
+            (seg_start, seg_end, spk, _join_merge_texts(seg_texts), list(dict.fromkeys(seg_orig)))
+        )
+
+    merged_rows.sort(key=lambda item: (item[0], item[1], item[2]))
     out: list[Turn] = []
-    for unit in units:
-        pieces: list[str] = []
-        source = "fused"
-        confidence = 1.0
-        for i in unit.turn_indices:
-            if 0 <= i < len(turns):
-                pieces.append(str(texts.get(i, turns[i].text) or ""))
-                source = turns[i].source
-                confidence = turns[i].confidence
-            elif i in texts:
-                pieces.append(str(texts[i] or ""))
-        text = stitch_member_texts(pieces)
+    members: list[list[int]] = []
+    for start, end, spk, text, origs in merged_rows:
+        src = turns[origs[-1]]
         out.append(
             Turn(
-                start=float(unit.start),
-                end=float(unit.end),
-                speaker_id=str(unit.speaker_id),
+                start=start,
+                end=end,
+                speaker_id=spk,
                 text=text,
                 asr_status=AsrStatus.FINAL if text else AsrStatus.EMPTY,
-                source=source,
-                confidence=confidence,
+                source=src.source,
+                confidence=src.confidence,
             )
         )
-    return out
+        members.append(origs)
+    return out, members
 
 
 def _split_on_joiner(text: str, n: int) -> list[str] | None:
