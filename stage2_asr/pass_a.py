@@ -93,7 +93,7 @@ def run_pass_a_for_unit(
     fallback_judge=None,
 ) -> tuple[str, dict]:
     """Return (final_text, audit_record)."""
-    prefer_moss = unit.contains_overlap or unit.heavy_overlap
+    prefer_moss = unit.heavy_overlap
     audit: dict = {
         "unit_id": unit.unit_id,
         "heavy_overlap": unit.heavy_overlap,
@@ -230,7 +230,7 @@ def run_pass_a_batch(
     for i, item in enumerate(items):
         unit: AsrUnit = item["unit"]
         hyps: list[Hypothesis] = item["hyps"]
-        prefer_moss = unit.contains_overlap or unit.heavy_overlap
+        prefer_moss = unit.heavy_overlap
         audit: dict = {
             "unit_id": unit.unit_id,
             "heavy_overlap": unit.heavy_overlap,

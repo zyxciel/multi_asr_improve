@@ -164,7 +164,7 @@ def _apply_pass_b_accepted(
     """Apply a validated Pass B judgment. Returns True if the turn text changed."""
     extra = {"batched": True} if batched else {}
     judgment = judgment_from_payload(accepted)
-    if overlap or heavy:
+    if heavy:
         if judgment.base_model not in {"moss", "draft"} and not judgment.edits:
             audits.append(
                 {
@@ -379,7 +379,7 @@ def run_pass_b(
     1) Hotword alias fast path (span-local + Tier C)
     2) Optional LLM Tier B/C scan with full meeting_draft as neighbors
        (sequential by default; `--pass-b-batch-size N` snapshots neighbors and batches)
-    3) MOSS-aware: overlap turns prefer / force moss provisional text
+    3) MOSS-aware: heavy-overlap turns prefer / force moss provisional text
     4) Optional fallback_judge (e.g. DeepSeek) after primary retries fail
     """
     cfg = config or PipelineConfig()

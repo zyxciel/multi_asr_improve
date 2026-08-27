@@ -157,7 +157,33 @@ def test_pass_b_rejects_tier_a_and_keeps_draft():
     assert any(a.get("fallback") for a in audits)
 
 
-def test_pass_b_moss_aware_rejects_non_moss_takeover_on_overlap():
+def test_pass_b_moss_aware_rejects_non_moss_takeover_on_heavy_overlap():
+    turns = [Turn(0, 2, "s0", "moss文本")]
+    draft = {0: "moss文本"}
+
+    class NonMossBase:
+        def judge(self, **kwargs):
+            return {
+                "text": "qwen接管",
+                "base_model": "qwen",
+                "edits": [],
+                "overlap": True,
+            }
+
+    out, audits = run_pass_b(
+        turns,
+        draft,
+        llm_judge=NonMossBase(),
+        overlap_turn_indices={0},
+        heavy_overlap_turn_indices={0},
+        moss_texts={0: "moss文本"},
+        config=PipelineConfig(),
+    )
+    assert out[0] == "moss文本"
+    assert any(a.get("path") == "moss_aware_reject" for a in audits)
+
+
+def test_pass_b_light_overlap_does_not_moss_aware_reject():
     turns = [Turn(0, 2, "s0", "moss文本")]
     draft = {0: "moss文本"}
 
@@ -179,7 +205,7 @@ def test_pass_b_moss_aware_rejects_non_moss_takeover_on_overlap():
         config=PipelineConfig(),
     )
     assert out[0] == "moss文本"
-    assert any(a.get("path") == "moss_aware_reject" for a in audits)
+    assert not any(a.get("path") == "moss_aware_reject" for a in audits)
 
 
 def test_pass_b_with_mock_llm_smoke():

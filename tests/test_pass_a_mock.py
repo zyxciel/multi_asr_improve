@@ -78,3 +78,83 @@ def test_pass_a_deepseek_fallback_after_qwen_failures():
     assert audit.get("fallback_judge") == "deepseek"
     assert audit.get("fallback_judge_ok") is True
     assert audit.get("fallback") is not True
+
+
+def test_pass_a_light_overlap_keeps_qwen_judgment_without_forcing_moss():
+    """0.5s / low-ratio overlap must not override a 2–1 中建 vote."""
+    unit = AsrUnit(
+        "u",
+        0.0,
+        5.0,
+        "s0",
+        [0],
+        overlap_ratio=0.1,
+        contains_overlap=True,
+        heavy_overlap=False,
+    )
+    turns = [Turn(0.0, 5.0, "s0", "就是中介那边有吧")]
+    hyps = [
+        Hypothesis("moss", "就是中介那边有吧"),
+        Hypothesis("qwen", "就是中建那边有啊"),
+        Hypothesis("firered", "就是中建那边有吗"),
+    ]
+
+    class JudgeQwen:
+        def judge(self, **kwargs):
+            return {
+                "text": "就是中建那边有啊",
+                "base_model": "qwen",
+                "edits": [],
+                "overlap": True,
+            }
+
+    text, audit = run_pass_a_for_unit(
+        unit=unit,
+        turns=turns,
+        hyps=hyps,
+        draft_texts={0: "就是中介那边有吧"},
+        llm_judge=JudgeQwen(),
+        hotwords=[],
+        config=PipelineConfig(),
+    )
+    assert text == "就是中建那边有啊"
+    assert audit.get("forced_moss_base") is not True
+
+
+def test_pass_a_heavy_overlap_still_forces_moss_without_edits():
+    unit = AsrUnit(
+        "u",
+        0.0,
+        5.0,
+        "s0",
+        [0],
+        overlap_ratio=0.5,
+        contains_overlap=True,
+        heavy_overlap=True,
+    )
+    turns = [Turn(0.0, 5.0, "s0", "就是中介那边有吧")]
+    hyps = [
+        Hypothesis("moss", "就是中介那边有吧"),
+        Hypothesis("qwen", "就是中建那边有啊"),
+    ]
+
+    class JudgeQwen:
+        def judge(self, **kwargs):
+            return {
+                "text": "就是中建那边有啊",
+                "base_model": "qwen",
+                "edits": [],
+                "overlap": True,
+            }
+
+    text, audit = run_pass_a_for_unit(
+        unit=unit,
+        turns=turns,
+        hyps=hyps,
+        draft_texts={0: "就是中介那边有吧"},
+        llm_judge=JudgeQwen(),
+        hotwords=[],
+        config=PipelineConfig(),
+    )
+    assert text == "就是中介那边有吧"
+    assert audit.get("forced_moss_base") is True
