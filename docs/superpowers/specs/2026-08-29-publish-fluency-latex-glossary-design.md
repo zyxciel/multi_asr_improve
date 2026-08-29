@@ -11,7 +11,7 @@ Turn a phonetic meeting transcript into **accurate, fluent, display-formatted te
 
 Publish must:
 
-- Smooth the **whole recording** (moderate): drop fillers, resolve explicit self-corrections, stitch readable sentences with necessary punctuation. Keep spoken wording; do not paraphrase into publication prose.
+- Smooth the **whole recording** (moderate): drop fillers, resolve explicit self-corrections, stitch readable sentences with necessary punctuation, and apply **value-preserving ITN** for readability. Keep spoken wording otherwise; do not paraphrase into publication prose.
 - Insert **inline LaTeX math** (`$...$`) for spoken formulas. Whole-recording file is **Markdown + math**, not a `.tex` document.
 - Load a **seed glossary JSON** (terms + special spellings + optional `latex`) and write an **enriched** glossary with LLM-extracted keywords, rare words, and new terms.
 - Preserve timestamps and `speaker_id` on a per-turn published JSON **and** emit a concatenated `transcript.md`.
@@ -22,7 +22,7 @@ Publish must:
 
 - Do not overwrite `mode_c_asr_final.json` or `mode_c_polished.json`.
 - Do not compute corpus CER / cpCER on published text.
-- Do not do number ITN in either language (`三点` → `3点`, `three o'clock` → `3:00`, `0.61` → “zero point sixty-one”).
+- Do not rewrite numbers in a way that changes their meaning (serial ≠ place-value; see §2.1). Polish remains no-ITN. Publish **may** do value-preserving ITN toward a compact written form; it may **not** expand compact digits into spoken words (TTS-style TN).
 - Do not emit a compile-ready `.tex` file or Unicode-only symbol substitution as the math path.
 - Do not replace `docs/hotwords.txt`; hotwords remain ASR / Pass A/B / polish hints.
 - Do not shard a single meeting across multiple LLM prompts (`--publish-batch-size` > 1 packs **meetings**, not turns).
@@ -41,7 +41,7 @@ mode_c.json + wav
   → evidenced polish (unchanged)
   → mode_c_polished.json               # optional; used if present
   → --stage publish
-       1. LLM span edits (filler / repair / punc / latex)
+       1. LLM span edits (filler / repair / punc / latex / itn)
        2. LLM extract (keywords / rare_words / new_terms)
        3. LLM quality judge (faithfulness gate)
        → mode_c_published.json
@@ -75,12 +75,34 @@ New judge method: `publish` / `publish_many` (mirror `polish` / `polish_many`). 
 | `repair` | `span_out` is a **contiguous substring** of `span_asr` and strictly shorter; both the retracted words and the correction appear in `span_asr` | `周二不周三` → `周三`; `Tuesday no Wednesday` → `Wednesday` |
 | `punc` | Word/CJK/digit skeleton unchanged; use Chinese marks in Chinese spans and English marks in English spans; do not force `。` onto English | `大家好明天见` → `大家好，明天见`; `lets meet tomorrow` → `let's meet tomorrow` |
 | `latex` | `span_out` contains `$...$`; symbols/commands from seed glossary or the built-in math lexicon | `x平方` → `$x^{2}$`; `x squared` → `$x^{2}$` |
+| `itn` | Compact written form of the **same** number; serial and place-value readings must not be swapped (see §2.1) | `伍柒叁` → `573`; `五百三十七` → `537`; `百分之五十` → `50%`; `five hundred thirty-seven` → `537` |
 
 Publish does not merge or split turns. “Stitching” is punctuation inside a turn (`punc`). Cross-turn self-corrections are allowed only because both sides sit in the concatenated meeting string; the kept correction is written back onto the turn that held `span_asr`. Publish does **not** redo polish `entity` / `codeswitch` repairs, and must **not undo** them.
 
 **Filler lexicon:** closed **bilingual** list in code — Chinese `嗯` / `啊` / `那个` / `就是说` / `呃` and English `um` / `uh` / `ah` / `er` / `you know` / `like` (discourse `like` only when the span is exactly that token, not `I like this`). Plus any glossary entries with `"kind": "filler"`. A filler span must be **only** lexicon tokens (optional surrounding punctuation). Content words in either language (`会议`, `meeting`, `GPU`, `Windows`, `Qwen`) are never fillers.
 
 **Built-in math lexicon (small, in code):** spoken patterns in **both** languages — `平方` / `squared` → `^2`, `下标` / `subscript` → `_` — plus glossary `kind=symbol` / `kind=formula` with a `latex` field (`阿尔法` / `alpha` → `\alpha`).
+
+### 2.1 ITN (readability, meaning locked)
+
+Polish still forbids number rewrites (WER). Publish allows **ITN toward a compact written form** only when a deterministic checker says the meaning is unchanged.
+
+Two readings, never mixed:
+
+| Reading | How to detect | Allowed `span_out` | Forbidden |
+|---------|----------------|--------------------|-----------|
+| **Serial** (digit-by-digit) | Two or more consecutive Chinese numerals (`一二三` / `伍柒叁`) with **no** `十百千万亿点`; or English number-words with **no** `hundred` / `thousand` / `million` (`five seven three`) | The **same digit string** in Arabic: `伍柒叁` → `573`, `five seven three` → `573` | Place-value expansion: `伍柒叁` → `五百七十三` or `五百三十七`; `573` → `five hundred seventy-three` |
+| **Place-value** (quantity) | Contains `十百千万亿` or English `hundred` / `thousand` / `million` / `percent` | The **same numeric value** in compact form: `五百三十七` → `537`; `百分之五十` → `50%`; `five hundred thirty-seven` → `537` | A different value: `五百三十七` → `573`; serializing into a different digit order |
+
+**Hard fail (drop the edit), matching the product example:** `伍柒叁` → `五百三十七` (serial 5-7-3 vs quantity 537). Also fail `伍柒叁` → `五百七十三` (serial must not become a quantity phrase).
+
+Other locks:
+
+- Direction is **compact only**. TTS-style TN is forbidden: `573` → `五百七十三` / `five hundred seventy-three`; `0.61` → `zero point sixty-one`.
+- If ambiguous, keep the source: `三点` (clock vs score vs 3.0), `three o'clock` vs `3:00` only when the span is an explicit clock phrase (`三点钟` / `three o'clock`), not bare `三点`.
+- Digit **order** is meaning: `[5,7,3]` ≠ `[5,3,7]`.
+- `punc` / `latex` still must not change the digit sequence; number changes go through `itn` only.
+- Checker lives in code (numeral maps + serial vs place-value parse). The LLM does not self-certify meaning.
 
 ### 3. Validator
 
@@ -97,8 +119,9 @@ Publish does not merge or split turns. “Stitching” is punctuation inside a t
 - `repair` whose `span_out` is not a contiguous substring of `span_asr`, or not strictly shorter.
 - `punc` that changes `_core` (letters / CJK / digits).
 - `latex` with unknown TeX command/symbol (not in glossary `latex` fields and not in the built-in lexicon).
-- Number ITN (digit sequence change), including under `punc` / `latex`.
-- **Language break** (any kind): translating English → Chinese or Chinese → English is always dropped. A Latin run of length ≥ 2 present in `span_asr` missing from `span_out` (case-insensitive) is dropped, except a `latex` edit whose `span_asr` is a glossary `kind=symbol|formula` surface or a built-in math token. Mixed terms (`Windows产品`) must stay mixed. `punc` must not delete spaces inside a Latin token, and must not replace English punctuation with Chinese (or the reverse) inside a span that is otherwise unchanged.
+- `itn` that fails the §2.1 checker (serial/place-value mismatch, digit-order change, spoken expansion, ambiguous span).
+- Number changes under `punc` / `latex` / `filler` / `repair` (those kinds must keep the digit sequence).
+- **Language break** (any kind except allowed `itn` / `latex`): translating English → Chinese or Chinese → English is always dropped. A Latin run of length ≥ 2 present in `span_asr` missing from `span_out` (case-insensitive) is dropped, except a `latex` edit whose `span_asr` is a glossary `kind=symbol|formula` surface or a built-in math token, or an `itn` edit that passes §2.1 (so `five seven three` → `573` is allowed). Mixed terms (`Windows产品`) must stay mixed. `punc` must not delete spaces inside a Latin token, and must not replace English punctuation with Chinese (or the reverse) inside a span that is otherwise unchanged.
 
 ### 4. LLM extract
 
@@ -162,7 +185,7 @@ Neither language may absorb the other.
 
 Invariant after applying publish edits (before eval):
 
-- Every Latin run of length ≥ 2 in the unsmoothed meeting still occurs in the published meeting (case-insensitive), except runs fully covered by an allowed `latex` edit.
+- Every Latin run of length ≥ 2 in the unsmoothed meeting still occurs in the published meeting (case-insensitive), except runs fully covered by an allowed `latex` edit or an allowed `itn` edit (English number-words may become Arabic digits).
 - Non-filler CJK content is not deleted except as part of an allowed `repair`.
 - Mixed CN–EN spans keep both scripts (`Windows产品`, `用 GPU 训练`).
 - English-only turns stay English; Chinese-only turns stay Chinese.
@@ -173,8 +196,9 @@ Prompt is **bilingual with equal few-shots**, not a Chinese prompt with English 
 - EN filler/repair/punc: `um let's meet on Tuesday no Wednesday` → `let's meet on Wednesday`
 - Mixed: `以前那个 Windows产品`, `用 GPU 训练`, `Qwen3.8`
 - Math both languages: `x平方` / `x squared` → `$x^{2}$`
+- ITN: `伍柒叁` → `573`, `五百三十七` → `537`; REJECT `伍柒叁` → `五百三十七`
 
-Deleting, translating, or wrapping a code-switch or English/Chinese content term in `$...$` without a formula glossary hit **must** set eval `faithful: false`.
+Deleting, translating, or wrapping a code-switch or English/Chinese content term in `$...$` without a formula glossary hit **must** set eval `faithful: false`. An `itn` that the §2.1 checker would reject (including `伍柒叁` → `五百三十七`) **must** also set `faithful: false`.
 
 ### 6. Markdown renderer
 
@@ -267,6 +291,7 @@ Mock tests (no weights), next to `tests/test_polish.py`:
 1. Filler removed in **both** languages when in lexicon (`嗯`, `um`); unknown filler dropped.
 2. Repair contiguous-substring applied for CN (`周二不周三` → `周三`) and EN (`Tuesday no Wednesday` → `Wednesday`); non-substring rejected.
 3. LaTeX from glossary / built-in lexicon applied for `x平方` and `x squared`; unknown TeX dropped.
+3b. ITN: `伍柒叁` → `573` and `五百三十七` → `537` apply; `伍柒叁` → `五百三十七` and `伍柒叁` → `五百七十三` dropped; `573` → `five hundred seventy-three` dropped; bare `三点` kept.
 4. Edit touching `⟦t1⟧` dumps payload; turns unchanged after retries.
 5. Extract merge: seed `surface` wins; bad JSON → seed-only. Mixed term stays one `surface`.
 6. Quality judge `faithful: false` reverts; `faithful: true` keeps edits. Judge output with a `<think>` wrapper still parses JSON.
@@ -283,7 +308,8 @@ Success for this spec:
 ## Implementation notes (for the plan)
 
 - Reuse LLM JSON extract, infer log, retry, and `PipelineConfig` patterns from polish.
-- Do not relax polish validators or prompts.
+- Do not relax polish validators or prompts (polish stays no-ITN).
+- ITN checker is a unit-tested function (`serial` digit string vs `place_value` number); do not ask the LLM whether two number spans “mean the same thing”.
 - Judge adapter must support **per-call** `enable_thinking` / `max_tokens` (eval on + 2048; publish/extract off). Do not reuse a process-wide thinking flag for all three calls.
 - Default filler list is **bilingual and equal** (Chinese and English tokens, neither marked extra).
 - Prompt language: bilingual instructions; equal Chinese, English, and mixed few-shots. Do not write a Chinese-only system prompt.
