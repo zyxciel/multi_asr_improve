@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import json
 
+from pathlib import Path
+
 from stage2_asr.publish import (
     apply_publish_edits,
     concat_meeting,
     filter_publish_edits,
     latin_runs,
+    load_glossary,
     run_publish,
     split_meeting,
     validate_publish_payload,
@@ -45,6 +48,56 @@ def test_unknown_filler_dropped():
         glossary_terms=[],
     )
     assert kept == []
+
+
+def test_latin_filler_does_not_match_inside_words():
+    meeting = concat_meeting({0: "the number later yeah"})
+    kept, _ = filter_publish_edits(
+        [
+            {"span_asr": "um", "span_out": "", "kind": "filler"},
+            {"span_asr": "er", "span_out": "", "kind": "filler"},
+            {"span_asr": "ah", "span_out": "", "kind": "filler"},
+        ],
+        meeting=meeting,
+        glossary_terms=[],
+    )
+    assert kept == []
+    out, _ = apply_publish_edits(meeting, kept)
+    assert split_meeting(out)[0] == "the number later yeah"
+
+
+def test_latin_filler_still_drops_standalone_um():
+    meeting = concat_meeting({0: "um the number"})
+    kept, _ = filter_publish_edits(
+        [{"span_asr": "um", "span_out": "", "kind": "filler"}],
+        meeting=meeting,
+        glossary_terms=[],
+    )
+    out, _ = apply_publish_edits(meeting, kept)
+    assert split_meeting(out)[0].strip() == "the number"
+
+
+def test_cjk_filler_does_not_match_inside_demonstrative_phrase():
+    meeting = concat_meeting({0: "以前那个温度的问题"})
+    kept, _ = filter_publish_edits(
+        [{"span_asr": "那个", "span_out": "", "kind": "filler"}],
+        meeting=meeting,
+        glossary_terms=[],
+    )
+    assert kept == []
+    out, _ = apply_publish_edits(meeting, kept)
+    assert split_meeting(out)[0] == "以前那个温度的问题"
+
+
+def test_cjk_filler_still_drops_punctuated_nage():
+    meeting = concat_meeting({0: "那个，我们开会"})
+    kept, _ = filter_publish_edits(
+        [{"span_asr": "那个", "span_out": "", "kind": "filler"}],
+        meeting=meeting,
+        glossary_terms=[],
+    )
+    out, _ = apply_publish_edits(meeting, kept)
+    assert split_meeting(out)[0] == "，我们开会"
 
 
 def test_repair_cn_and_en():
@@ -202,6 +255,14 @@ def test_merge_glossary_seed_wins():
     assert gpu.get("kind") == "product"
 
 
+def test_load_glossary_invalid_json_returns_empty(tmp_path: Path):
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json", encoding="utf-8")
+    loaded = load_glossary(bad)
+    assert loaded == {"terms": [], "keywords": [], "rare_words": []}
+    assert load_glossary(None)["terms"] == []
+
+
 def test_pipeline_publish_stage_writes_artifacts_without_clobber(tmp_path: Path):
     from pathlib import Path as P
 
@@ -259,8 +320,11 @@ def test_pipeline_all_includes_publish(tmp_path: Path):
         config=PipelineConfig(),
         stage="all",
     )
-    assert (out / "mode_c_polished.json").exists()
-    assert (out / "mode_c_published.json").exists()
+    polished = json.loads((out / "mode_c_polished.json").read_text(encoding="utf-8"))
+    published = json.loads((out / "mode_c_published.json").read_text(encoding="utf-8"))
+    assert len(published["turns"]) == len(polished["turns"])
+    if polished["turns"] and "turn_indices" in polished["turns"][0]:
+        assert published["turns"][0]["turn_indices"] == polished["turns"][0]["turn_indices"]
     assert result.get("published_path") is not None
     stats = json.loads((out / "pass_stats.json").read_text(encoding="utf-8"))
     assert "polish" in stats

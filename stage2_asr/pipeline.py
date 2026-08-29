@@ -375,9 +375,21 @@ def _persist_publish(
             )
         )
     meta = {**(raw_doc.get("meta") or {}), "stage": "publish"}
+    raw_turns = raw_doc.get("turns") if isinstance(raw_doc.get("turns"), list) else []
+    turn_rows = []
+    for i, t in enumerate(published_turns):
+        row = t.to_dict()
+        if i < len(raw_turns) and isinstance(raw_turns[i], dict):
+            extra = {
+                k: v
+                for k, v in raw_turns[i].items()
+                if k not in {"text", "start", "end", "speaker_id", "asr_status", "source", "confidence"}
+            }
+            row = {**extra, **row}
+        turn_rows.append(row)
     published_doc = {
         "meta": meta,
-        "turns": [t.to_dict() for t in published_turns],
+        "turns": turn_rows,
     }
     published_path = work_dir / "mode_c_published.json"
     published_path.write_text(

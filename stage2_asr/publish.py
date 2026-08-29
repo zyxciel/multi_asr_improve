@@ -27,7 +27,6 @@ FILLERS = frozenset(
         "ah",
         "er",
         "you know",
-        "like",
     }
 )
 
@@ -79,17 +78,79 @@ def _overlaps(start: int, end: int, occupied: list[tuple[int, int]]) -> bool:
     return False
 
 
-def _locate(meeting: str, span: str, start_hint: Any = None) -> tuple[int, int] | None:
+def _is_latin_letter(ch: str) -> bool:
+    return bool(ch) and ch.isascii() and ch.isalpha()
+
+
+def _whole_latin_token(meeting: str, start: int, end: int) -> bool:
+    if start > 0 and _is_latin_letter(meeting[start - 1]):
+        return False
+    if end < len(meeting) and _is_latin_letter(meeting[end]):
+        return False
+    return True
+
+
+def _span_is_latin(span: str) -> bool:
+    core = (span or "").strip()
+    return bool(core) and all(ch.isascii() and (ch.isalpha() or ch.isspace() or ch in "'-") for ch in core)
+
+
+def _is_cjk(ch: str) -> bool:
+    return bool(ch) and "\u4e00" <= ch <= "\u9fff"
+
+
+def _content_char(ch: str) -> bool:
+    return _is_cjk(ch) or _is_latin_letter(ch) or (bool(ch) and ch.isdigit())
+
+
+def _span_is_multi_cjk(span: str) -> bool:
+    core = (span or "").strip()
+    return len(core) >= 2 and all(_is_cjk(ch) or ch.isspace() for ch in core)
+
+
+def _whole_cjk_filler(meeting: str, end: int) -> bool:
+    """Reject 那个/就是说 when they prefix a following noun (以前那个温度)."""
+    if end < len(meeting) and _content_char(meeting[end]):
+        return False
+    return True
+
+
+def _filler_span_ok(meeting: str, start: int, end: int, span: str) -> bool:
+    if _span_is_latin(span):
+        return _whole_latin_token(meeting, start, end)
+    if _span_is_multi_cjk(span):
+        return _whole_cjk_filler(meeting, end)
+    return True
+
+
+def _locate(
+    meeting: str,
+    span: str,
+    start_hint: Any = None,
+    *,
+    filler_token: bool = False,
+) -> tuple[int, int] | None:
     if span == "":
         return None
+
+    def _ok(start: int, stop: int) -> bool:
+        if not filler_token:
+            return True
+        return _filler_span_ok(meeting, start, stop, span)
+
     if isinstance(start_hint, int) and start_hint >= 0:
         stop = start_hint + len(span)
-        if stop <= len(meeting) and meeting[start_hint:stop] == span:
+        if stop <= len(meeting) and meeting[start_hint:stop] == span and _ok(start_hint, stop):
             return start_hint, stop
-    found = meeting.find(span)
-    if found < 0:
-        return None
-    return found, found + len(span)
+    start = 0
+    while True:
+        found = meeting.find(span, start)
+        if found < 0:
+            return None
+        end = found + len(span)
+        if _ok(found, end):
+            return found, end
+        start = found + 1
 
 
 def _glossary_latex_cmds(terms: list) -> set[str]:
@@ -215,7 +276,12 @@ def filter_publish_edits(
             continue
         if kind == "filler" and span_asr == "":
             continue
-        loc = _locate(meeting, span_asr, raw.get("start_char"))
+        loc = _locate(
+            meeting,
+            span_asr,
+            raw.get("start_char"),
+            filler_token=kind == "filler",
+        )
         if loc is None:
             continue
         start, end = loc
@@ -265,11 +331,15 @@ def apply_publish_edits(meeting: str, edits: list[dict]) -> tuple[str, list[dict
 
 
 def load_glossary(path: Path | None) -> dict:
+    empty = {"terms": [], "keywords": [], "rare_words": []}
     if path is None or not path.exists():
-        return {"terms": [], "keywords": [], "rare_words": []}
-    data = json.loads(path.read_text(encoding="utf-8"))
+        return empty
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+        return empty
     if not isinstance(data, dict):
-        return {"terms": [], "keywords": [], "rare_words": []}
+        return empty
     terms = data.get("terms") if isinstance(data.get("terms"), list) else []
     return {
         "terms": terms,
