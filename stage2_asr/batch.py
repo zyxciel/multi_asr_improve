@@ -131,7 +131,7 @@ def build_runners(
     from stage2_asr.runners.qwen3_asr import Qwen3AsrRunner
 
     needs_asr = stage in {"all", "asr"}
-    needs_llm = stage in {"all", "pass_a", "pass_b", "llm", "polish"}
+    needs_llm = stage in {"all", "pass_a", "pass_b", "llm", "polish", "publish"}
     fallback_judge = None
     asr = MockAsrRunner()
     llm = MockLlmJudge()
@@ -339,6 +339,12 @@ def run_batch(
                 row["final_merged"] = str(result["final_merged_path"])
             if result.get("polished_path") is not None:
                 row["polished"] = str(result["polished_path"])
+            if result.get("published_path") is not None:
+                row["published"] = str(result["published_path"])
+            if result.get("transcript_path") is not None:
+                row["transcript"] = str(result["transcript_path"])
+            if result.get("glossary_path") is not None:
+                row["glossary"] = str(result["glossary_path"])
             if result.get("asr_hypotheses_path") is not None:
                 row["asr_hypotheses"] = str(result["asr_hypotheses_path"])
             summary["n_ok"] += 1

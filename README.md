@@ -59,9 +59,13 @@ stage2-asr run --input mode_c.json --audio prepared.wav --work-dir out --backend
 #    Writes mode_c_asr_final_merged.json + mode_c_polished.json (unit grid).
 #    Does not overwrite the per-turn WER file mode_c_asr_final.json.
 stage2-asr run --input mode_c.json --audio prepared.wav --work-dir out --backend real --enable-real --stage polish
+
+# 4) Display publish (fluency / ITN / inline math / glossary) on polished or merged final.
+#    Writes mode_c_published.json + transcript.md + glossary.json. Does not overwrite WER or polish.
+stage2-asr run --input mode_c.json --audio prepared.wav --work-dir out --backend real --enable-real --stage publish
 ```
 
-Available stages: `all` (default; includes polish), `asr`, `pass_a`, `pass_b`, `llm` (Pass A+B only, no polish), `polish`  
+Available stages: `all` (default; includes polish **and** publish), `asr`, `pass_a`, `pass_b`, `llm` (Pass A+B only, no polish/publish), `polish`, `publish`  
 ASR model subsets: `moss`, `qwen`, `firered` (comma-separated via `--asr-models`)
 
 FireRed system config used by the adapter:
@@ -192,7 +196,7 @@ third_party/         # optional local clones (gitignored)
 
 ## Artifacts
 
-`asr_units.json` (reloaded on `pass_a`/`pass_b`/`llm` so unit_ids stay stable), `asr_hypotheses.json` (hyps merge across `asr` and `all` re-runs), `mode_c_draft.json` (Pass A **pre-merge**, original Mode-C turn grid), `mode_c_draft_merged.json` (Pass A **post-merge**, one row per ASR unit), `mode_c_asr_final.json` (Pass B pre-merge; phonetic WER/CPWER deliverable), `mode_c_asr_final_merged.json` (Pass B post-merge), `mode_c_polished.json` (polish on the **merged** unit grid), `llm_edits.jsonl` (Pass A preserved when re-running `pass_b`; polish lines replaced when re-running `polish`; polish rows include `anchor` + `evidence`), `pass_stats.json` (merged across staged passes), `llm_infer.jsonl` (LLM request/response traces for Pass A/B and polish), `asr_cache/`, `crops/` (reused across ASR model runs; not rewritten if present)
+`asr_units.json` (reloaded on `pass_a`/`pass_b`/`llm` so unit_ids stay stable), `asr_hypotheses.json` (hyps merge across `asr` and `all` re-runs), `mode_c_draft.json` (Pass A **pre-merge**, original Mode-C turn grid), `mode_c_draft_merged.json` (Pass A **post-merge**, one row per ASR unit), `mode_c_asr_final.json` (Pass B pre-merge; phonetic WER/CPWER deliverable), `mode_c_asr_final_merged.json` (Pass B post-merge), `mode_c_polished.json` (polish on the **merged** unit grid), `mode_c_published.json` / `transcript.md` / `glossary.json` (publish display pass; never overwrites the WER or polish files), `llm_edits.jsonl` (Pass A preserved when re-running `pass_b`; polish lines replaced when re-running `polish`; polish rows include `anchor` + `evidence`), `pass_stats.json` (merged across staged passes), `llm_infer.jsonl` (LLM request/response traces for Pass A/B, polish, and publish), `asr_cache/`, `crops/` (reused across ASR model runs; not rewritten if present)
 
 ### Polish policy (post round-1 WER regression)
 

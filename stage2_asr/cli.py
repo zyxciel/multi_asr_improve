@@ -8,6 +8,7 @@ from pathlib import Path
 from stage2_asr.batch import build_runners, run_batch
 from stage2_asr.hotwords import load_hotwords
 from stage2_asr.pipeline import run_pipeline
+from stage2_asr.publish import load_glossary
 from stage2_asr.types import PipelineConfig
 
 
@@ -28,8 +29,8 @@ def _add_common_run_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--stage",
         default="all",
-        choices=["all", "asr", "pass_a", "pass_b", "llm", "polish"],
-        help="Execution stage: all | asr | pass_a | pass_b | llm | polish",
+        choices=["all", "asr", "pass_a", "pass_b", "llm", "polish", "publish"],
+        help="Execution stage: all | asr | pass_a | pass_b | llm | polish | publish",
     )
     p.add_argument(
         "--asr-models",
@@ -106,6 +107,27 @@ def _add_common_run_args(p: argparse.ArgumentParser) -> None:
         ),
     )
     p.add_argument(
+        "--glossary",
+        default=None,
+        help="Seed glossary JSON for --stage publish (terms + optional latex)",
+    )
+    p.add_argument(
+        "--publish-batch-size",
+        type=int,
+        default=1,
+        help="Publish meeting pack size (1 = one meeting at a time)",
+    )
+    p.add_argument(
+        "--no-publish-eval",
+        action="store_true",
+        help="Skip the publish faithfulness LLM judge",
+    )
+    p.add_argument(
+        "--no-publish-eval-thinking",
+        action="store_true",
+        help="Run the publish quality judge with thinking off",
+    )
+    p.add_argument(
         "--vllm-tp-size",
         type=int,
         default=1,
@@ -167,6 +189,7 @@ def _resolve_backend(args: argparse.Namespace) -> str | None:
             "pass_b",
             "llm",
             "polish",
+            "publish",
         }:
             print(
                 "--llm-backend vllm (HTTP) requires --llm-base-url. "
@@ -196,11 +219,19 @@ def _vllm_flags(args: argparse.Namespace) -> dict:
 
 
 def _pipeline_config(args: argparse.Namespace) -> PipelineConfig:
+    glossary = None
+    raw_glossary = getattr(args, "glossary", None)
+    if raw_glossary:
+        glossary = load_glossary(Path(raw_glossary))
     return PipelineConfig(
         max_asr_seconds=float(args.max_asr_seconds),
         pass_a_batch_size=max(1, int(args.pass_a_batch_size)),
         pass_b_batch_size=max(1, int(getattr(args, "pass_b_batch_size", 1))),
         polish_batch_size=max(1, int(getattr(args, "polish_batch_size", 1))),
+        publish_batch_size=max(1, int(getattr(args, "publish_batch_size", 1))),
+        publish_eval=not bool(getattr(args, "no_publish_eval", False)),
+        publish_eval_thinking=not bool(getattr(args, "no_publish_eval_thinking", False)),
+        glossary=glossary,
     )
 
 
@@ -268,6 +299,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
         payload["llm_log"] = str(result["llm_log_path"])
     if result.get("polished_path") is not None:
         payload["polished"] = str(result["polished_path"])
+    if result.get("published_path") is not None:
+        payload["published"] = str(result["published_path"])
+    if result.get("transcript_path") is not None:
+        payload["transcript"] = str(result["transcript_path"])
+    if result.get("glossary_path") is not None:
+        payload["glossary"] = str(result["glossary_path"])
     if result.get("asr_hypotheses_path") is not None:
         payload["asr_hypotheses"] = str(result["asr_hypotheses_path"])
     if result.get("asr_models") is not None:

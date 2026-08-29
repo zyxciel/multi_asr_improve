@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from stage2_asr.pinyin_util import pinyin_edit_distance, to_pinyin
 from stage2_asr.polish import apply_polish_edits
 from stage2_asr.types import Hypothesis
@@ -207,3 +209,99 @@ class MockLlmJudge:
     def polish_many(self, jobs: list[dict], *, max_workers: int = 8) -> list[dict]:
         _ = max_workers
         return [self.polish(**job) for job in jobs]
+
+    def publish(
+        self,
+        *,
+        meeting: str,
+        hotwords: list | None = None,
+        glossary: dict | None = None,
+        unit_id: str = "",
+        **_kwargs,
+    ) -> dict:
+        from stage2_asr.publish import FILLERS, MARK_RE
+
+        _ = (hotwords, glossary, unit_id)
+        edits: list[dict] = []
+        skip = set(MARK_RE.findall(meeting or ""))
+        _ = skip
+        for tok in ("嗯", "啊", "那个", "就是说", "呃", "um", "uh", "ah"):
+            if tok in (meeting or ""):
+                edits.append({"span_asr": tok, "span_out": "", "kind": "filler"})
+        if "伍柒叁" in (meeting or ""):
+            edits.append({"span_asr": "伍柒叁", "span_out": "573", "kind": "itn"})
+        if "x平方" in (meeting or ""):
+            edits.append({"span_asr": "x平方", "span_out": "$x^{2}$", "kind": "latex"})
+        if "周二不周三" in (meeting or ""):
+            edits.append({"span_asr": "周二不周三", "span_out": "周三", "kind": "repair"})
+        if "Tuesday no Wednesday" in (meeting or ""):
+            edits.append(
+                {
+                    "span_asr": "Tuesday no Wednesday",
+                    "span_out": "Wednesday",
+                    "kind": "repair",
+                }
+            )
+        _ = FILLERS
+        return {"edits": edits}
+
+    def publish_many(self, jobs: list[dict], *, max_workers: int = 8) -> list[dict]:
+        _ = max_workers
+        return [self.publish(**job) for job in jobs]
+
+    def extract_terms(
+        self,
+        *,
+        meeting: str,
+        glossary: dict | None = None,
+        unit_id: str = "",
+        **_kwargs,
+    ) -> dict:
+        _ = (glossary, unit_id)
+        keywords = []
+        if re.search(r"GPU|gpu", meeting or ""):
+            keywords.append({"surface": "GPU", "score": 1.0})
+        new_terms = []
+        if "Windows产品" in (meeting or ""):
+            new_terms.append(
+                {
+                    "surface": "Windows产品",
+                    "aliases": [],
+                    "kind": "product",
+                    "latex": None,
+                }
+            )
+        return {"keywords": keywords, "rare_words": [], "new_terms": new_terms}
+
+    def eval_publish(
+        self,
+        *,
+        original: str,
+        published: str,
+        unit_id: str = "",
+        enable_thinking: bool = True,
+        **_kwargs,
+    ) -> dict:
+        from stage2_asr.publish import latin_runs
+
+        _ = (unit_id, enable_thinking)
+        faithful = True
+        if "伍柒叁" in (original or "") and "五百三十七" in (published or ""):
+            faithful = False
+        lost = latin_runs(original) - latin_runs(published)
+        if lost and not any(ch.isdigit() for ch in (published or "")):
+            if lost - {"um", "uh", "ah"}:
+                faithful = False
+        return {
+            "faithful": faithful,
+            "clearer": True,
+            "more_concise": True,
+            "easier": True,
+            "scores": {
+                "faithfulness": 1.0 if faithful else 0.0,
+                "clarity": 1.0,
+                "concision": 1.0,
+                "ease": 1.0,
+            },
+            "issues": [] if faithful else ["unfaithful"],
+        }

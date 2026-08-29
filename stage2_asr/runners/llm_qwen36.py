@@ -22,6 +22,14 @@ from stage2_asr.polish_prompt import (
     format_polish_hypotheses,
     render_polish_user_prompt,
 )
+from stage2_asr.publish_prompt import (
+    EXTRACT_SYSTEM_PROMPT,
+    EVAL_SYSTEM_PROMPT,
+    PUBLISH_SYSTEM_PROMPT,
+    render_extract_user_prompt,
+    render_eval_user_prompt,
+    render_publish_user_prompt,
+)
 from stage2_asr.llm_parse import parse_judgment_json
 from stage2_asr.runners.base import UnsupportedRunnerError
 from stage2_asr.runners.openai_compat import chat_completion, chat_completion_many
@@ -88,9 +96,10 @@ class Qwen36LlmJudge:
                 f"unsupported llm backend {backend!r}; expected {sorted(_BACKENDS)}"
             )
 
-    def _thinking_template_kwargs(self) -> dict[str, bool]:
-        kwargs = {"enable_thinking": self.enable_thinking}
-        if not self.enable_thinking:
+    def _thinking_template_kwargs(self, enable_thinking: bool | None = None) -> dict[str, bool]:
+        think = self.enable_thinking if enable_thinking is None else bool(enable_thinking)
+        kwargs = {"enable_thinking": think}
+        if not think:
             kwargs["preserve_thinking"] = False
         return kwargs
 
@@ -157,6 +166,75 @@ class Qwen36LlmJudge:
         )
         raw_text = self._generate(
             POLISH_SYSTEM_PROMPT, user, unit_id=unit_id, pass_name="polish"
+        )
+        return self._parse_json(raw_text)
+
+    def publish(
+        self,
+        *,
+        meeting: str,
+        hotwords: list | None = None,
+        glossary: dict | None = None,
+        unit_id: str = "",
+        **_kwargs,
+    ) -> dict:
+        user = render_publish_user_prompt(
+            meeting=str(meeting or ""),
+            hotwords=json.dumps(hotwords or [], ensure_ascii=False),
+            glossary=json.dumps(glossary or {}, ensure_ascii=False),
+        )
+        raw_text = self._generate(
+            PUBLISH_SYSTEM_PROMPT,
+            user,
+            unit_id=unit_id,
+            pass_name="publish",
+            enable_thinking=False,
+            max_tokens=2048,
+        )
+        return self._parse_json(raw_text)
+
+    def extract_terms(
+        self,
+        *,
+        meeting: str,
+        glossary: dict | None = None,
+        unit_id: str = "",
+        **_kwargs,
+    ) -> dict:
+        user = render_extract_user_prompt(
+            meeting=str(meeting or ""),
+            glossary=json.dumps(glossary or {}, ensure_ascii=False),
+        )
+        raw_text = self._generate(
+            EXTRACT_SYSTEM_PROMPT,
+            user,
+            unit_id=unit_id,
+            pass_name="extract",
+            enable_thinking=False,
+            max_tokens=1024,
+        )
+        return self._parse_json(raw_text)
+
+    def eval_publish(
+        self,
+        *,
+        original: str,
+        published: str,
+        unit_id: str = "",
+        enable_thinking: bool = True,
+        **_kwargs,
+    ) -> dict:
+        user = render_eval_user_prompt(
+            original=str(original or ""),
+            published=str(published or ""),
+        )
+        raw_text = self._generate(
+            EVAL_SYSTEM_PROMPT,
+            user,
+            unit_id=unit_id,
+            pass_name="publish_eval",
+            enable_thinking=bool(enable_thinking),
+            max_tokens=2048,
         )
         return self._parse_json(raw_text)
 
@@ -429,10 +507,21 @@ class Qwen36LlmJudge:
             )
         return self._engine
 
-    def _generate(self, system: str, user: str, *, unit_id: str = "", pass_name: str = "generate") -> str:
+    def _generate(
+        self,
+        system: str,
+        user: str,
+        *,
+        unit_id: str = "",
+        pass_name: str = "generate",
+        enable_thinking: bool | None = None,
+        max_tokens: int | None = None,
+    ) -> str:
         t0 = time.time()
         err: str | None = None
         text = ""
+        think = self.enable_thinking if enable_thinking is None else bool(enable_thinking)
+        tokens = self.max_tokens if max_tokens is None else int(max_tokens)
         try:
             if self.generate_fn is not None:
                 text = self.generate_fn(system, user)
@@ -448,7 +537,7 @@ class Qwen36LlmJudge:
                         tokenizer,
                         system,
                         user,
-                        enable_thinking=self.enable_thinking,
+                        enable_thinking=think,
                     )
                 else:
                     prompt = f"System: {system}\n\nUser: {user}\n\nAssistant:"
@@ -456,7 +545,7 @@ class Qwen36LlmJudge:
                     engine,
                     [prompt],
                     temperature=self.temperature,
-                    max_tokens=self.max_tokens,
+                    max_tokens=tokens,
                 )[0]
             elif self.backend == "vllm":
                 if not self.base_url:
@@ -472,13 +561,13 @@ class Qwen36LlmJudge:
                         {"role": "user", "content": user},
                     ],
                     temperature=self.temperature,
-                    max_tokens=self.max_tokens,
+                    max_tokens=tokens,
                     api_key=self.api_key,
                     timeout_s=self.timeout_s,
-                    chat_template_kwargs=self._thinking_template_kwargs(),
+                    chat_template_kwargs=self._thinking_template_kwargs(think),
                 )
             else:
-                text = self._generate_transformers(system, user)
+                text = self._generate_transformers(system, user, enable_thinking=think, max_tokens=tokens)
             return text
         except Exception as exc:
             err = str(exc)
@@ -497,11 +586,21 @@ class Qwen36LlmJudge:
                     "error": err,
                     "user": user[:_LOG_TEXT_MAX],
                     "response": text[:_LOG_TEXT_MAX] if text else None,
-                    "enable_thinking": self.enable_thinking,
+                    "enable_thinking": think,
+                    "max_tokens": tokens,
                 }
             )
 
-    def _generate_transformers(self, system: str, user: str) -> str:
+    def _generate_transformers(
+        self,
+        system: str,
+        user: str,
+        *,
+        enable_thinking: bool | None = None,
+        max_tokens: int | None = None,
+    ) -> str:
+        think = self.enable_thinking if enable_thinking is None else bool(enable_thinking)
+        tokens = self.max_tokens if max_tokens is None else int(max_tokens)
         if self._pipe is None:
             try:
                 from transformers import AutoModelForCausalLM, AutoTokenizer  # type: ignore
@@ -519,7 +618,7 @@ class Qwen36LlmJudge:
                 messages,
                 tokenize=False,
                 add_generation_prompt=True,
-                enable_thinking=self.enable_thinking,
+                enable_thinking=think,
             )
         except TypeError:
             prompt = tok.apply_chat_template(
@@ -528,7 +627,7 @@ class Qwen36LlmJudge:
         inputs = tok([prompt], return_tensors="pt").to(model.device)
         out = model.generate(
             **inputs,
-            max_new_tokens=self.max_tokens,
+            max_new_tokens=tokens,
             do_sample=self.temperature > 0,
             temperature=max(self.temperature, 1e-5),
         )

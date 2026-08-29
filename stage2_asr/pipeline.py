@@ -12,6 +12,7 @@ from stage2_asr.llm_log import LlmInferLogger
 from stage2_asr.pass_a import run_pass_a_batch, run_pass_a_for_unit
 from stage2_asr.pass_b import run_pass_b
 from stage2_asr.polish import hyps_by_merged_from_records, hyps_by_turn_from_records, run_polish
+from stage2_asr.publish import load_glossary, render_transcript, run_publish
 from stage2_asr.text_map import (
     distribute_unit_text,
     join_turn_texts,
@@ -204,6 +205,20 @@ def _summarize_polish(audits: list[dict]) -> dict[str, Any]:
     }
 
 
+def _summarize_publish(audits: list[dict]) -> dict[str, Any]:
+    kinds: dict[str, int] = {}
+    for a in audits:
+        if a.get("kind"):
+            k = str(a["kind"])
+            kinds[k] = kinds.get(k, 0) + 1
+    return {
+        "n_audits": len(audits),
+        "n_reverted": sum(1 for a in audits if a.get("path") == "reverted"),
+        "n_fallback": sum(1 for a in audits if a.get("fallback")),
+        "by_kind": kinds,
+    }
+
+
 def _rewrite_edits_keep_other_passes(
     edits_path: Path, pass_name: str, new_audits: list[dict]
 ) -> None:
@@ -303,6 +318,107 @@ def _persist_polish(
         "n_units": n_units,
         "pass_stats": pass_stats,
     }
+
+
+def _turns_from_mode_c_path(path: Path) -> tuple[list[Turn], dict[str, Any]]:
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(doc, dict):
+        raise ValueError(f"{path} is not a mode-c object")
+    turns = [Turn.from_dict(t) for t in doc.get("turns", []) if isinstance(t, dict)]
+    return turns, doc
+
+
+def _persist_publish(
+    *,
+    work_dir: Path,
+    llm_judge,
+    hotwords: list[str],
+    cfg: PipelineConfig,
+    n_units: int,
+    llm_log_path: Path | None,
+) -> dict[str, Any]:
+    polished_path = work_dir / "mode_c_polished.json"
+    merged_path = work_dir / "mode_c_asr_final_merged.json"
+    if polished_path.exists():
+        turns, raw_doc = _turns_from_mode_c_path(polished_path)
+        source = polished_path
+    elif merged_path.exists():
+        turns, raw_doc = _turns_from_mode_c_path(merged_path)
+        source = merged_path
+    else:
+        raise FileNotFoundError(
+            f"{polished_path} and {merged_path} missing; run stage=polish or pass_b first."
+        )
+    _log(f"[publish] start: {len(turns)} turns from {source.name} work_dir={work_dir}")
+    texts = {i: t.text for i, t in enumerate(turns)}
+    glossary = cfg.glossary if isinstance(getattr(cfg, "glossary", None), dict) else load_glossary(None)
+    published_map, audits, glossary_out, eval_payload = run_publish(
+        turns,
+        texts,
+        llm_judge=llm_judge,
+        hotwords=hotwords,
+        glossary=glossary,
+        config=cfg,
+    )
+    published_turns = []
+    for i, t in enumerate(turns):
+        text = published_map.get(i, t.text)
+        published_turns.append(
+            Turn(
+                start=t.start,
+                end=t.end,
+                speaker_id=t.speaker_id,
+                text=text,
+                asr_status=t.asr_status,
+                source=t.source,
+                confidence=t.confidence,
+            )
+        )
+    meta = {**(raw_doc.get("meta") or {}), "stage": "publish"}
+    published_doc = {
+        "meta": meta,
+        "turns": [t.to_dict() for t in published_turns],
+    }
+    published_path = work_dir / "mode_c_published.json"
+    published_path.write_text(
+        json.dumps(published_doc, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    transcript_path = work_dir / "transcript.md"
+    transcript_path.write_text(
+        render_transcript(published_turns, published_map), encoding="utf-8"
+    )
+    glossary_path = work_dir / "glossary.json"
+    glossary_path.write_text(
+        json.dumps(glossary_out, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    eval_path = None
+    if eval_payload is not None:
+        eval_path = work_dir / "publish_eval.json"
+        eval_path.write_text(
+            json.dumps(eval_payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    by_pass: dict[str, list[dict]] = {}
+    for a in audits:
+        name = str(a.get("pass") or "publish")
+        by_pass.setdefault(name, []).append(a)
+    for name, rows in by_pass.items():
+        _rewrite_edits_keep_other_passes(work_dir / "llm_edits.jsonl", name, rows)
+    stats_path = work_dir / "pass_stats.json"
+    pass_stats = _merge_pass_stats(stats_path, {"publish": _summarize_publish(audits)})
+    _log(f"[publish] done: {len(audits)} audits wrote {published_path}")
+    extra = {
+        "published_path": published_path,
+        "transcript_path": transcript_path,
+        "glossary_path": glossary_path,
+        "stats_path": stats_path,
+        "llm_log_path": llm_log_path,
+        "n_turns": len(published_turns),
+        "n_units": n_units,
+        "pass_stats": pass_stats,
+    }
+    if eval_path is not None:
+        extra["publish_eval_path"] = eval_path
+    return extra
 
 
 def _unit_by_id(units: list) -> dict[str, Any]:
@@ -441,12 +557,13 @@ def run_pipeline(
     - pass_b: run Pass B only from mode_c_draft.json.
     - llm: run Pass A then Pass B from saved ASR hypotheses/cache (no ASR inference).
     - polish: merge same-speaker ASR units from mode_c_asr_final.json, then polish; writes mode_c_polished.json on the unit grid.
-    - all: full pipeline in one run (ASR + Pass A/B + polish).
+    - publish: display fluency/ITN/latex/glossary on polished (else merged final); does not overwrite WER or polish files.
+    - all: full pipeline in one run (ASR + Pass A/B + polish + publish).
     """
     cfg = config or PipelineConfig()
     hotwords = hotwords or []
     stage = str(stage).lower()
-    allowed_stages = {"all", "asr", "pass_a", "pass_b", "llm", "polish"}
+    allowed_stages = {"all", "asr", "pass_a", "pass_b", "llm", "polish", "publish"}
     if stage not in allowed_stages:
         raise ValueError(f"unknown stage {stage!r}; expected one of {sorted(allowed_stages)}")
     normalized_models = [m.strip().lower() for m in (asr_models or ["moss", "qwen", "firered"]) if m.strip()]
@@ -461,7 +578,7 @@ def run_pipeline(
 
     llm_logger: LlmInferLogger | None = None
     llm_log_path: Path | None = None
-    if stage in {"all", "pass_a", "pass_b", "llm", "polish"}:
+    if stage in {"all", "pass_a", "pass_b", "llm", "polish", "publish"}:
         llm_log_path = work_dir / "llm_infer.jsonl"
         llm_logger = LlmInferLogger(llm_log_path)
         _attach_llm_logger(llm_judge, llm_logger)
@@ -536,6 +653,19 @@ def _run_pipeline_body(
             grid="merged",
         )
         return {"stage": "polish", "final_path": final_path, **extra}
+
+    if stage == "publish":
+        loaded = _load_units(work_dir / "asr_units.json")
+        n_units = len(loaded) if loaded is not None else 0
+        extra = _persist_publish(
+            work_dir=work_dir,
+            llm_judge=llm_judge,
+            hotwords=hotwords,
+            cfg=cfg,
+            n_units=n_units,
+            llm_log_path=llm_log_path,
+        )
+        return {"stage": "publish", **extra}
 
     raw_turns, raw_doc = load_mode_c(input_json)
     turns, skipped = validate_turns(raw_turns, cfg)
@@ -955,8 +1085,18 @@ def _run_pipeline_body(
             member_indices=merged_members,
             grid="merged",
         )
+        extra.update(
+            _persist_publish(
+                work_dir=work_dir,
+                llm_judge=llm_judge,
+                hotwords=hotwords,
+                cfg=cfg,
+                n_units=len(merged_final),
+                llm_log_path=llm_log_path,
+            )
+        )
 
-    return {
+    result = {
         "stage": stage,
         "final_path": final_path,
         "draft_path": draft_path,
@@ -967,5 +1107,13 @@ def _run_pipeline_body(
         "n_turns": len(final_turns),
         "n_units": len(units),
         "pass_stats": extra.get("pass_stats", pass_stats),
-        **({"polished_path": extra["polished_path"]} if extra.get("polished_path") else {}),
     }
+    if extra.get("polished_path"):
+        result["polished_path"] = extra["polished_path"]
+    if extra.get("published_path"):
+        result["published_path"] = extra["published_path"]
+        result["transcript_path"] = extra.get("transcript_path")
+        result["glossary_path"] = extra.get("glossary_path")
+        if extra.get("publish_eval_path"):
+            result["publish_eval_path"] = extra["publish_eval_path"]
+    return result
