@@ -18,9 +18,48 @@ from stage2_asr.publish import (
 
 def test_concat_split_roundtrip_keeps_turn_texts():
     texts = {0: "嗯你好", 1: "um hello"}
-    meeting = concat_meeting(texts)
-    assert "⟦t0⟧" in meeting and "⟦t1⟧" in meeting
+    speakers = {0: "s0", 1: "s1"}
+    meeting = concat_meeting(texts, speakers)
+    assert "⟦t0|s0⟧" in meeting and "⟦t1|s1⟧" in meeting
     assert split_meeting(meeting) == texts
+
+
+def test_concat_speaker_markers_keep_dialogue_boundaries():
+    texts = {0: "我们明天", 1: "不行改后天"}
+    meeting = concat_meeting(texts, {0: "alice", 1: "bob"})
+    assert meeting.index("⟦t0|alice⟧") < meeting.index("我们明天")
+    assert meeting.index("我们明天") < meeting.index("⟦t1|bob⟧")
+    assert "我们明天不行改后天" not in meeting
+
+
+def test_cross_speaker_repair_is_not_contiguous():
+    meeting = concat_meeting({0: "周二", 1: "不周三"}, {0: "s0", 1: "s1"})
+    kept, _ = filter_publish_edits(
+        [{"span_asr": "周二不周三", "span_out": "周三", "kind": "repair"}],
+        meeting=meeting,
+        glossary_terms=[],
+    )
+    assert kept == []
+    split = split_meeting(meeting)
+    assert split[0] == "周二"
+    assert split[1] == "不周三"
+
+
+def test_filler_does_not_wipe_whole_turn_backchannel():
+    meeting = concat_meeting(
+        {0: "我们开会", 1: "嗯", 2: "好的"},
+        {0: "s0", 1: "s1", 2: "s0"},
+    )
+    kept, _ = filter_publish_edits(
+        [{"span_asr": "嗯", "span_out": "", "kind": "filler"}],
+        meeting=meeting,
+        glossary_terms=[],
+    )
+    out, _ = apply_publish_edits(meeting, kept)
+    split = split_meeting(out)
+    assert split[1] == "嗯"
+    assert split[0] == "我们开会"
+    assert split[2] == "好的"
 
 
 def test_filler_edits_drop_bilingual_fillers():
@@ -204,6 +243,22 @@ def test_run_publish_drops_fillers_and_itn():
     assert any(a.get("pass") == "publish" for a in audits)
     assert any(k.get("surface") == "GPU" for k in glossary.get("keywords") or [])
     assert ev is not None and ev.get("faithful") is True
+
+
+def test_run_publish_keeps_other_speaker_backchannel():
+    from stage2_asr.runners.mock_llm import MockLlmJudge
+    from stage2_asr.types import Turn
+
+    turns = [
+        Turn(start=0, end=1, speaker_id="s0", text="我们用GPU"),
+        Turn(start=1, end=2, speaker_id="s1", text="嗯"),
+    ]
+    out, _, _, ev = run_publish(
+        turns, {0: turns[0].text, 1: turns[1].text}, llm_judge=MockLlmJudge()
+    )
+    assert "GPU" in out[0]
+    assert out[1] == "嗯"
+    assert ev is None or ev.get("faithful") is True
 
 
 def test_run_publish_eval_reverts_unfaithful():

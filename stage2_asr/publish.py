@@ -9,7 +9,7 @@ from stage2_asr.publish_itn import itn_edit_allowed
 from stage2_asr.types import PipelineConfig, Turn
 
 ALLOWED_KINDS = frozenset({"filler", "repair", "punc", "latex", "itn"})
-MARK_RE = re.compile(r"⟦t(\d+)⟧")
+MARK_RE = re.compile(r"⟦t(\d+)(?:\|[^⟧]*)?⟧")
 LATIN_RUN_RE = re.compile(r"[A-Za-z]{2,}")
 TEX_CMD_RE = re.compile(r"\\([a-zA-Z]+)")
 MATH_HINTS = ("平方", "squared", "下标", "subscript")
@@ -41,14 +41,21 @@ def _digits(s: str) -> list[str]:
     return re.findall(r"\d", s or "")
 
 
-def marker_for(i: int) -> str:
-    return f"⟦t{int(i)}⟧"
+def _sanitize_speaker(speaker_id: Any) -> str:
+    raw = re.sub(r"[⟦⟧|]", "", str(speaker_id or "").strip())
+    raw = re.sub(r"\s+", " ", raw).strip()
+    return raw[:64] or "?"
 
 
-def concat_meeting(texts: dict[int, str]) -> str:
+def marker_for(i: int, speaker_id: str | None = None) -> str:
+    return f"⟦t{int(i)}|{_sanitize_speaker(speaker_id)}⟧"
+
+
+def concat_meeting(texts: dict[int, str], speakers: dict[int, str] | None = None) -> str:
+    speakers = speakers or {}
     parts: list[str] = []
     for i in sorted(texts):
-        parts.append(marker_for(i))
+        parts.append(marker_for(i, speakers.get(i)))
         parts.append(str(texts[i] or ""))
     return "".join(parts)
 
@@ -69,6 +76,16 @@ def latin_runs(s: str) -> set[str]:
 
 def _marker_spans(meeting: str) -> list[tuple[int, int]]:
     return [(m.start(), m.end()) for m in MARK_RE.finditer(meeting or "")]
+
+
+def _owning_turn_span(meeting: str, start: int, end: int) -> tuple[int, int] | None:
+    markers = list(MARK_RE.finditer(meeting or ""))
+    for idx, m in enumerate(markers):
+        t_start = m.end()
+        t_end = markers[idx + 1].start() if idx + 1 < len(markers) else len(meeting)
+        if t_start <= start and end <= t_end:
+            return t_start, t_end
+    return None
 
 
 def _overlaps(start: int, end: int, occupied: list[tuple[int, int]]) -> bool:
@@ -290,6 +307,15 @@ def filter_publish_edits(
         if kind == "filler":
             if not _filler_ok(span_asr, span_out, glossary_terms):
                 continue
+            bounds = _owning_turn_span(meeting, start, end)
+            if bounds is not None:
+                t0, t1 = bounds
+                body = meeting[t0:t1]
+                rel_s = start - t0
+                rel_e = end - t0
+                new_body = body[:rel_s] + span_out + body[rel_e:]
+                if _core(body) and not _core(new_body):
+                    continue
         elif kind == "repair":
             if span_out not in span_asr or len(span_out) >= len(span_asr):
                 continue
@@ -397,13 +423,16 @@ def run_publish(
     seed = glossary if isinstance(glossary, dict) else {"terms": []}
     terms = seed.get("terms") if isinstance(seed.get("terms"), list) else []
     out = dict(texts)
+    speakers = {
+        i: (turns[i].speaker_id if 0 <= i < len(turns) else "?") for i in out
+    }
     audits: list[dict] = []
     eval_payload: dict | None = None
 
     if llm_judge is None or not hasattr(llm_judge, "publish"):
         return out, audits, merge_glossary(seed, None), None
 
-    original_meeting = concat_meeting(out)
+    original_meeting = concat_meeting(out, speakers)
     accepted = None
     last_err = None
     for _attempt in range(int(cfg.llm_max_retries) + 1):
@@ -461,7 +490,7 @@ def run_publish(
             try:
                 eval_payload = llm_judge.eval_publish(
                     original=original_meeting,
-                    published=concat_meeting(out),
+                    published=concat_meeting(out, speakers),
                     unit_id="publish_eval",
                     enable_thinking=bool(getattr(cfg, "publish_eval_thinking", True)),
                 )
@@ -500,7 +529,7 @@ def run_publish(
         for _attempt in range(int(cfg.llm_max_retries) + 1):
             try:
                 extract_raw = llm_judge.extract_terms(
-                    meeting=concat_meeting(out),
+                    meeting=concat_meeting(out, speakers),
                     glossary=seed,
                     unit_id="publish_extract",
                 )

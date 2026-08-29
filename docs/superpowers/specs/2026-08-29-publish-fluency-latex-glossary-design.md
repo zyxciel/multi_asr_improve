@@ -60,7 +60,7 @@ mode_c.json + wav
 
 New module beside `stage2_asr/polish.py`. One meeting = one document.
 
-1. Concatenate merged-turn texts with frozen markers `⟦t{i}⟧` before each turn `i`.
+1. Concatenate merged-turn texts with frozen markers `⟦t{i}|{speaker_id}⟧` before each turn `i` (`speaker_id` is sanitized: no `⟦⟧|`). Different speakers stay visible to the LLM so a multi-person meeting is not one unlabeled stream.
 2. Call LLM `publish(...)` (**thinking off**, JSON only). Prompt includes the full meeting, seed glossary, and hotwords.
 3. Validate and apply span edits. `judgment.text` / a whole-string rewrite without edits is untrusted (same contract as polish).
 4. Split the edited string back to turns by the markers.
@@ -77,7 +77,9 @@ New judge method: `publish` / `publish_many` (mirror `polish` / `polish_many`). 
 | `latex` | `span_out` contains `$...$`; symbols/commands from seed glossary or the built-in math lexicon | `x平方` → `$x^{2}$`; `x squared` → `$x^{2}$` |
 | `itn` | Compact written form of the **same** number; serial and place-value readings must not be swapped (see §2.1) | `伍柒叁` → `573`; `五百三十七` → `537`; `百分之五十` → `50%`; `five hundred thirty-seven` → `537` |
 
-Publish does not merge or split turns. “Stitching” is punctuation inside a turn (`punc`). Cross-turn self-corrections are allowed only because both sides sit in the concatenated meeting string; the kept correction is written back onto the turn that held `span_asr`. Publish does **not** redo polish `entity` / `codeswitch` repairs, and must **not undo** them.
+Publish does not merge or split turns. “Stitching” is punctuation inside a turn (`punc`). A span cannot cross a marker, so two speakers cannot be fused into one edit. Self-corrections that already sit in **one** same-speaker merged turn still apply (`周二不周三` → `周三`). If A says `周二` and B says `不周三`, that is two turns, not a repair. Publish does **not** redo polish `entity` / `codeswitch` repairs, and must **not undo** them.
+
+**Multi-speaker:** consecutive same-speaker turns are already merged before polish. The publish concat is therefore typically A, B, A, B. The LLM must treat `speaker_id` changes as hard boundaries (no monologue punctuation, no borrowing B’s words to finish A). A filler must not wipe a turn whose remaining `_core` would be empty (listener backchannels such as a whole-turn `嗯` / `um` stay).
 
 **Filler lexicon:** closed **bilingual** list in code — Chinese `嗯` / `啊` / `那个` / `就是说` / `呃` and English `um` / `uh` / `ah` / `er` / `you know` / `like` (discourse `like` only when the span is exactly that token, not `I like this`). Plus any glossary entries with `"kind": "filler"`. A filler span must be **only** lexicon tokens (optional surrounding punctuation). Content words in either language (`会议`, `meeting`, `GPU`, `Windows`, `Qwen`) are never fillers.
 
@@ -110,12 +112,12 @@ Other locks:
 
 - Edits not a list of dicts, or missing `span_asr` / `span_out` / `kind`.
 - Unknown `kind`.
-- Any edit whose span overlaps a marker `⟦tN⟧` or deletes/alters a marker.
+- Any edit whose span overlaps a marker `⟦tN|speaker⟧` or deletes/alters a marker.
 
 **Per-edit drop** (rest of payload may apply):
 
 - `span_asr` not found in the meeting string; overlapping spans; empty `span_asr` insertions.
-- `filler` whose `span_asr` is not in the lexicon.
+- `filler` whose `span_asr` is not in the lexicon, or whose application would leave that turn with an empty `_core` (whole-turn backchannel).
 - `repair` whose `span_out` is not a contiguous substring of `span_asr`, or not strictly shorter.
 - `punc` that changes `_core` (letters / CJK / digits).
 - `latex` with unknown TeX command/symbol (not in glossary `latex` fields and not in the built-in lexicon).
@@ -158,7 +160,7 @@ Scores are floats in `[0, 1]`. Booleans are the gate/report bits; do not infer b
 
 **Faithfulness gate:** if `faithful` is false, **revert published turns to the unsmoothed input** for that meeting. Markdown and glossary are produced from the reverted text. Log `publish_eval.rejected`. Clarity / concision / ease are reported only; they never revert.
 
-Deleting, translating, or wrapping a code-switch term in `$...$` without a formula glossary hit **must** set `faithful: false`.
+Deleting, translating, or wrapping a code-switch term in `$...$` without a formula glossary hit **must** set `faithful: false`. Fusing two speakers, or deleting a listener’s only backchannel turn, **must** also set `faithful: false`.
 
 `--no-publish-eval` skips this call (no gate). `--no-publish-eval-thinking` keeps the judge but sets `enable_thinking=False` (debug / latency). Judge JSON invalid: retry, then do not revert (treat as no score).
 
@@ -292,7 +294,8 @@ Mock tests (no weights), next to `tests/test_polish.py`:
 2. Repair contiguous-substring applied for CN (`周二不周三` → `周三`) and EN (`Tuesday no Wednesday` → `Wednesday`); non-substring rejected.
 3. LaTeX from glossary / built-in lexicon applied for `x平方` and `x squared`; unknown TeX dropped.
 3b. ITN: `伍柒叁` → `573` and `五百三十七` → `537` apply; `伍柒叁` → `五百三十七` and `伍柒叁` → `五百七十三` dropped; `573` → `five hundred seventy-three` dropped; bare `三点` kept.
-4. Edit touching `⟦t1⟧` dumps payload; turns unchanged after retries.
+4. Edit touching `⟦t1|s1⟧` dumps payload; turns unchanged after retries.
+4b. Multi-speaker: concat embeds `⟦t{i}|{speaker_id}⟧`; `周二` then other-speaker `不周三` is not a repair; a whole-turn listener `嗯` is not deleted.
 5. Extract merge: seed `surface` wins; bad JSON → seed-only. Mixed term stays one `surface`.
 6. Quality judge `faithful: false` reverts; `faithful: true` keeps edits. Judge output with a `<think>` wrapper still parses JSON.
 7. Bilingual / code-switch: `Windows产品` / `GPU` / English content words survive filler+punc; `GPU`→`显卡` and `会议`→`meeting` are dropped; wrapping `Windows` in `$...$` is dropped unless glossary formula.
