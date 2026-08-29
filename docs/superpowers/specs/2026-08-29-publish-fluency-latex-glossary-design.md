@@ -16,7 +16,7 @@ Publish must:
 - Load a **seed glossary JSON** (terms + special spellings + optional `latex`) and write an **enriched** glossary with LLM-extracted keywords, rare words, and new terms.
 - Preserve timestamps and `speaker_id` on a per-turn published JSON **and** emit a concatenated `transcript.md`.
 
-Chinese is first-class (`嗯` / `啊` / `那个`, `周二——不，周三`). English appears as code-switch / terms. Accents and dialects are handled by existing multi-ASR plus glossary **aliases**, not by a new ASR model in this spec.
+Chinese is first-class (`嗯` / `啊` / `那个`, `周二——不，周三`). **Code-switch is a hard constraint, not a nicety:** Latin tokens and mixed CN–EN terms that survived polish must survive publish (see below). Accents and dialects are handled by existing multi-ASR plus glossary **aliases**, not by a new ASR model in this spec.
 
 ## Non-goals (v1)
 
@@ -27,6 +27,7 @@ Chinese is first-class (`嗯` / `啊` / `那个`, `周二——不，周三`). E
 - Do not replace `docs/hotwords.txt`; hotwords remain ASR / Pass A/B / polish hints.
 - Do not shard a single meeting across multiple LLM prompts (`--publish-batch-size` > 1 packs **meetings**, not turns).
 - Do not add DSP / waveform smoothing.
+- Do not enable thinking on publish span-edits or extract (quality judge thinking is on; see §5.1).
 
 ## Architecture
 
@@ -60,7 +61,7 @@ mode_c.json + wav
 New module beside `stage2_asr/polish.py`. One meeting = one document.
 
 1. Concatenate merged-turn texts with frozen markers `⟦t{i}⟧` before each turn `i`.
-2. Call LLM `publish(...)` (thinking off, JSON only). Prompt includes the full meeting, seed glossary, and hotwords.
+2. Call LLM `publish(...)` (**thinking off**, JSON only). Prompt includes the full meeting, seed glossary, and hotwords.
 3. Validate and apply span edits. `judgment.text` / a whole-string rewrite without edits is untrusted (same contract as polish).
 4. Split the edited string back to turns by the markers.
 
@@ -75,9 +76,9 @@ New judge method: `publish` / `publish_many` (mirror `polish` / `polish_many`). 
 | `punc` | Word/CJK/digit skeleton unchanged | `大家好明天见` → `大家好，明天见` |
 | `latex` | `span_out` contains `$...$`; symbols/commands from seed glossary or the built-in math lexicon | `x平方` → `$x^{2}$` |
 
-Publish does not merge or split turns. “Stitching” is punctuation inside a turn (`punc`). Cross-turn self-corrections are allowed only because both sides sit in the concatenated meeting string; the kept correction is written back onto the turn that held `span_asr`. Entity / codeswitch remain polish-only; publish does not re-open them.
+Publish does not merge or split turns. “Stitching” is punctuation inside a turn (`punc`). Cross-turn self-corrections are allowed only because both sides sit in the concatenated meeting string; the kept correction is written back onto the turn that held `span_asr`. Publish does **not** redo polish `entity` / `codeswitch` repairs, and must **not undo** them.
 
-**Filler lexicon:** closed Chinese-primary list in code, plus any glossary entries with `"kind": "filler"`.
+**Filler lexicon:** closed Chinese-primary list in code (`嗯` / `啊` / `那个` / `就是说`, plus English `um` / `uh` / `ah` as extras), plus any glossary entries with `"kind": "filler"`. A filler span must be **only** lexicon tokens (optional surrounding punctuation). Isolated Latin content words (`GPU`, `Windows`, `Qwen`) are never fillers.
 
 **Built-in math lexicon (small, in code):** spoken patterns such as `平方` → `^2`, `下标` → `_`, plus glossary `kind=symbol` / `kind=formula` with a `latex` field (e.g. `阿尔法` → `\alpha`).
 
@@ -97,10 +98,11 @@ Publish does not merge or split turns. “Stitching” is punctuation inside a t
 - `punc` that changes `_core` (letters / CJK / digits).
 - `latex` with unknown TeX command/symbol (not in glossary `latex` fields and not in the built-in lexicon).
 - Number ITN (digit sequence change), including under `punc` / `latex`.
+- **Code-switch break** (any kind): a Latin run of length ≥ 2 present in `span_asr` is missing from `span_out` (case-insensitive), except a `latex` edit whose `span_asr` is a glossary `kind=symbol|formula` surface or a built-in math token. Translating English → Chinese or Chinese → English in publish is always dropped. Mixed terms (`Windows产品`) must stay mixed; `punc` must not delete spaces inside a Latin token.
 
 ### 4. LLM extract
 
-Second call, on the **already-smoothed** meeting (fillers and retracted repairs gone).
+Second call, on the **already-smoothed** meeting (fillers and retracted repairs gone). **Thinking off.** Schema:
 
 Schema:
 
@@ -112,11 +114,13 @@ Schema:
 }
 ```
 
+Mixed CN–EN terms are **one** `surface` (`Windows产品`, `Qwen3.8`), not split into Chinese / English rows. Latin-only product names stay Latin.
+
 Merge into `glossary.json`: seed `surface` wins on collision. Extracted-only rows get `"source": "extract"`; seed rows keep `"source": "seed"`. Invalid extract JSON: retry, then write seed-only glossary with empty extract lists.
 
 ### 5. LLM quality judge (default on)
 
-Third call. Compares unsmoothed concatenation vs published meeting. Does **not** rewrite.
+Third call. Compares unsmoothed concatenation vs published meeting. Does **not** rewrite. **Thinking is on** for this call only (semantic faithfulness). JSON after `</think>` drives the gate; leaked think blocks are stripped the same way as Pass A/B.
 
 ```json
 {
@@ -133,9 +137,32 @@ Scores are floats in `[0, 1]`. Booleans are the gate/report bits; do not infer b
 
 **Faithfulness gate:** if `faithful` is false, **revert published turns to the unsmoothed input** for that meeting. Markdown and glossary are produced from the reverted text. Log `publish_eval.rejected`. Clarity / concision / ease are reported only; they never revert.
 
-`--no-publish-eval` skips this call (no gate). Judge JSON invalid: retry, then do not revert (treat as no score).
+Deleting, translating, or wrapping a code-switch term in `$...$` without a formula glossary hit **must** set `faithful: false`.
+
+`--no-publish-eval` skips this call (no gate). `--no-publish-eval-thinking` keeps the judge but sets `enable_thinking=False` (debug / latency). Judge JSON invalid: retry, then do not revert (treat as no score).
 
 Write `publish_eval.json` always when the judge ran.
+
+### 5.1 LLM inference (locked)
+
+Publish uses the same Qwen3.8 judge process as Pass A/B / polish. Do **not** raise temperature. Do **not** turn thinking on for span edits.
+
+| Call | `enable_thinking` | Temperature | `max_tokens` |
+|------|-------------------|-------------|--------------|
+| publish (span edits) | **false** | 0.1 | **2048** |
+| extract | **false** | 0.1 | **1024** |
+| quality judge | **true** (default) | 0.1 | **2048** |
+
+- 2048 on publish: whole-meeting edit lists exceed the Pass A/B default of 1024.
+- 2048 on the quality judge: thinking tokens would starve a 512 budget; JSON must still fit after CoT.
+- `--llm-enable-thinking` continues to control **Pass A/B / polish only**. It does **not** enable thinking on publish edits or extract. Eval thinking is the `--no-publish-eval-thinking` switch above.
+- Existing JSON extract (`extract_json_and_reasoning`) stays the only parser. Thinking never becomes the edit list.
+
+### 5.2 Code-switch preservation
+
+Invariant after applying publish edits (before eval): every Latin run of length ≥ 2 in the unsmoothed meeting still occurs in the published meeting (case-insensitive), except runs fully covered by an allowed `latex` edit. Mixed CN–EN spans keep both scripts.
+
+Prompt few-shots **must** include mixed examples (`以前那个 Windows产品`, `用 GPU 训练`, `Qwen3.8`) so a Chinese-primary prompt does not translate or delete them.
 
 ### 6. Markdown renderer
 
@@ -161,6 +188,7 @@ stage2-asr run-batch \
 | `--glossary` | unset (empty seed) | Seed glossary JSON path |
 | `--publish-batch-size` | `1` | Meetings packed into one `publish_many` (and matching extract/eval batches). `1` = one meeting at a time. |
 | `--no-publish-eval` | off | Skip quality judge |
+| `--no-publish-eval-thinking` | off | Quality judge with thinking off |
 
 `run-batch --stage publish` is a normal stage: each `{dataset}/{stem}` reuses that sample’s `work-dir`. Cross-sample packing uses `--publish-batch-size N` the same way polish uses `--polish-batch-size` (snapshot N samples). v1 does not split one long meeting.
 
@@ -229,9 +257,10 @@ Mock tests (no weights), next to `tests/test_polish.py`:
 3. LaTeX from glossary / built-in lexicon applied; unknown TeX dropped.
 4. Edit touching `⟦t1⟧` dumps payload; turns unchanged after retries.
 5. Extract merge: seed `surface` wins; bad JSON → seed-only.
-6. Quality judge `faithful: false` reverts; `faithful: true` keeps edits.
-7. `--stage publish` writes published JSON + `transcript.md` + `glossary.json` and does not overwrite `mode_c_asr_final.json` or `mode_c_polished.json`.
-8. `run-batch --stage publish --limit 1` in mock: one sample dir contains the three files.
+6. Quality judge `faithful: false` reverts; `faithful: true` keeps edits. Judge output with a `<think>` wrapper still parses JSON.
+7. Code-switch: `Windows产品` / `GPU` survive filler+punc; translating `GPU`→`显卡` is dropped; wrapping `Windows` in `$...$` is dropped unless glossary formula.
+8. `--stage publish` writes published JSON + `transcript.md` + `glossary.json` and does not overwrite `mode_c_asr_final.json` or `mode_c_polished.json`.
+9. `run-batch --stage publish --limit 1` in mock: one sample dir contains the three files.
 
 Success for this spec:
 
@@ -243,5 +272,6 @@ Success for this spec:
 
 - Reuse LLM JSON extract, infer log, retry, and `PipelineConfig` patterns from polish.
 - Do not relax polish validators or prompts.
-- Default filler list is Chinese-primary; English `um` / `ah` may be included as extras but are not the design target.
-- Prompt language: Chinese instructions + Chinese few-shots for filler/repair; English code-switch examples only where needed for latex/terms.
+- Judge adapter must support **per-call** `enable_thinking` / `max_tokens` (eval on + 2048; publish/extract off). Do not reuse a process-wide thinking flag for all three calls.
+- Default filler list is Chinese-primary; English `um` / `uh` / `ah` are extras only.
+- Prompt language: Chinese instructions + Chinese few-shots for filler/repair, **and** mixed CN–EN few-shots so code-switch is not translated away.
