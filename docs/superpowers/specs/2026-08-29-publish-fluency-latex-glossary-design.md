@@ -1,0 +1,247 @@
+# Stage-2 Publish: Fluency, Inline Math, Glossary (Design)
+
+**Date:** 2026-08-29  
+**Status:** Approved for implementation (pending spec review)  
+**Repo:** Stage-2 Multi-ASR + LLM Fusion  
+**Related:** [Architecture](../../2026-07-24-stage2-multi-asr-llm-fusion-design.md), [README polish policy](../../../README.md)
+
+## Goal
+
+Turn a phonetic meeting transcript into **accurate, fluent, display-formatted Chinese text** without touching WER artifacts.
+
+Publish must:
+
+- Smooth the **whole recording** (moderate): drop fillers, resolve explicit self-corrections, stitch readable sentences with necessary punctuation. Keep spoken wording; do not paraphrase into publication prose.
+- Insert **inline LaTeX math** (`$...$`) for spoken formulas. Whole-recording file is **Markdown + math**, not a `.tex` document.
+- Load a **seed glossary JSON** (terms + special spellings + optional `latex`) and write an **enriched** glossary with LLM-extracted keywords, rare words, and new terms.
+- Preserve timestamps and `speaker_id` on a per-turn published JSON **and** emit a concatenated `transcript.md`.
+
+Chinese is first-class (`嗯` / `啊` / `那个`, `周二——不，周三`). English appears as code-switch / terms. Accents and dialects are handled by existing multi-ASR plus glossary **aliases**, not by a new ASR model in this spec.
+
+## Non-goals (v1)
+
+- Do not overwrite `mode_c_asr_final.json` or `mode_c_polished.json`.
+- Do not compute corpus CER / cpCER on published text.
+- Do not do number ITN (`三点` → `3点`, `0.61` → “zero point sixty-one”).
+- Do not emit a compile-ready `.tex` file or Unicode-only symbol substitution as the math path.
+- Do not replace `docs/hotwords.txt`; hotwords remain ASR / Pass A/B / polish hints.
+- Do not shard a single meeting across multiple LLM prompts (`--publish-batch-size` > 1 packs **meetings**, not turns).
+- Do not add DSP / waveform smoothing.
+
+## Architecture
+
+Keep evidenced polish frozen. Add `--stage publish` after it.
+
+```text
+mode_c.json + wav
+  → ASR → Pass A → Pass B
+  → mode_c_asr_final.json              # WER / cpCER (never overwritten)
+  → merge same-speaker units
+  → evidenced polish (unchanged)
+  → mode_c_polished.json               # optional; used if present
+  → --stage publish
+       1. LLM span edits (filler / repair / punc / latex)
+       2. LLM extract (keywords / rare_words / new_terms)
+       3. LLM quality judge (faithfulness gate)
+       → mode_c_published.json
+       → transcript.md
+       → glossary.json
+       → publish_eval.json
+```
+
+`--stage all` runs publish after polish. `--stage llm` stays Pass A+B only. `--stage publish` is rerunnable from work-dir artifacts (no ASR / Pass A/B / polish reload).
+
+**Input priority:** `mode_c_polished.json` if present, else `mode_c_asr_final_merged.json`. If both are missing, fail the sample with a path error (same style as polish requiring Pass B).
+
+## Components
+
+### 1. `run_publish`
+
+New module beside `stage2_asr/polish.py`. One meeting = one document.
+
+1. Concatenate merged-turn texts with frozen markers `⟦t{i}⟧` before each turn `i`.
+2. Call LLM `publish(...)` (thinking off, JSON only). Prompt includes the full meeting, seed glossary, and hotwords.
+3. Validate and apply span edits. `judgment.text` / a whole-string rewrite without edits is untrusted (same contract as polish).
+4. Split the edited string back to turns by the markers.
+
+New judge method: `publish` / `publish_many` (mirror `polish` / `polish_many`). Mock judge implements both.
+
+### 2. Edit kinds (closed set)
+
+| kind | Rule | Example |
+|------|------|---------|
+| `filler` | `span_out` is empty; `span_asr` ∈ filler lexicon | `嗯` / `啊` / `那个` / `就是说` |
+| `repair` | `span_out` is a **contiguous substring** of `span_asr` and strictly shorter; both the retracted words and the correction appear in `span_asr` | `周二不周三` → `周三` |
+| `punc` | Word/CJK/digit skeleton unchanged | `大家好明天见` → `大家好，明天见` |
+| `latex` | `span_out` contains `$...$`; symbols/commands from seed glossary or the built-in math lexicon | `x平方` → `$x^{2}$` |
+
+Publish does not merge or split turns. “Stitching” is punctuation inside a turn (`punc`). Cross-turn self-corrections are allowed only because both sides sit in the concatenated meeting string; the kept correction is written back onto the turn that held `span_asr`. Entity / codeswitch remain polish-only; publish does not re-open them.
+
+**Filler lexicon:** closed Chinese-primary list in code, plus any glossary entries with `"kind": "filler"`.
+
+**Built-in math lexicon (small, in code):** spoken patterns such as `平方` → `^2`, `下标` → `_`, plus glossary `kind=symbol` / `kind=formula` with a `latex` field (e.g. `阿尔法` → `\alpha`).
+
+### 3. Validator
+
+**Whole-payload reject** (retry, then skip smoothing for the meeting):
+
+- Edits not a list of dicts, or missing `span_asr` / `span_out` / `kind`.
+- Unknown `kind`.
+- Any edit whose span overlaps a marker `⟦tN⟧` or deletes/alters a marker.
+
+**Per-edit drop** (rest of payload may apply):
+
+- `span_asr` not found in the meeting string; overlapping spans; empty `span_asr` insertions.
+- `filler` whose `span_asr` is not in the lexicon.
+- `repair` whose `span_out` is not a contiguous substring of `span_asr`, or not strictly shorter.
+- `punc` that changes `_core` (letters / CJK / digits).
+- `latex` with unknown TeX command/symbol (not in glossary `latex` fields and not in the built-in lexicon).
+- Number ITN (digit sequence change), including under `punc` / `latex`.
+
+### 4. LLM extract
+
+Second call, on the **already-smoothed** meeting (fillers and retracted repairs gone).
+
+Schema:
+
+```json
+{
+  "keywords": [{"surface": "...", "score": 0.0}],
+  "rare_words": [{"surface": "...", "count": 1}],
+  "new_terms": [{"surface": "...", "aliases": [], "kind": "product|symbol|formula|other", "latex": null}]
+}
+```
+
+Merge into `glossary.json`: seed `surface` wins on collision. Extracted-only rows get `"source": "extract"`; seed rows keep `"source": "seed"`. Invalid extract JSON: retry, then write seed-only glossary with empty extract lists.
+
+### 5. LLM quality judge (default on)
+
+Third call. Compares unsmoothed concatenation vs published meeting. Does **not** rewrite.
+
+```json
+{
+  "faithful": true,
+  "clearer": true,
+  "more_concise": true,
+  "easier": true,
+  "scores": {"faithfulness": 0.0, "clarity": 0.0, "concision": 0.0, "ease": 0.0},
+  "issues": []
+}
+```
+
+Scores are floats in `[0, 1]`. Booleans are the gate/report bits; do not infer booleans from scores.
+
+**Faithfulness gate:** if `faithful` is false, **revert published turns to the unsmoothed input** for that meeting. Markdown and glossary are produced from the reverted text. Log `publish_eval.rejected`. Clarity / concision / ease are reported only; they never revert.
+
+`--no-publish-eval` skips this call (no gate). Judge JSON invalid: retry, then do not revert (treat as no score).
+
+Write `publish_eval.json` always when the judge ran.
+
+### 6. Markdown renderer
+
+`transcript.md`: for each published turn, a heading with `speaker_id` and `[start–end]`, then that turn’s `text` (inline `$math$` already in the string). `mode_c_published.json` uses the same turn grid as the merge input; `text` is the smoothed string. No separate `latex_text` field (inline-only choice).
+
+## CLI and batch
+
+Additive flags; existing polish / Pass A/B flags unchanged.
+
+```text
+stage2-asr run ... --stage publish \
+  --glossary docs/glossary.json \
+  --publish-batch-size 1
+
+stage2-asr run-batch \
+  --wav-benchmark ... --mode-c-benchmark ... --work-root ... \
+  --backend real --enable-real --stage publish \
+  --glossary docs/glossary.json
+```
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--glossary` | unset (empty seed) | Seed glossary JSON path |
+| `--publish-batch-size` | `1` | Meetings packed into one `publish_many` (and matching extract/eval batches). `1` = one meeting at a time. |
+| `--no-publish-eval` | off | Skip quality judge |
+
+`run-batch --stage publish` is a normal stage: each `{dataset}/{stem}` reuses that sample’s `work-dir`. Cross-sample packing uses `--publish-batch-size N` the same way polish uses `--polish-batch-size` (snapshot N samples). v1 does not split one long meeting.
+
+Empty turns and turns below `min_asr_seconds` keep original text but still get a marker so indices stay aligned.
+
+## Artifacts
+
+Per sample `work-dir`:
+
+| File | Role |
+|------|------|
+| `mode_c_published.json` | Merged turn grid; `text` = published (or reverted) |
+| `transcript.md` | Whole-recording Markdown + `$math$` |
+| `glossary.json` | Seed ∪ extract |
+| `publish_eval.json` | Quality-judge payload (absent if `--no-publish-eval`) |
+| `llm_edits.jsonl` | Append `pass=publish` / `pass=extract` / `pass=publish_eval` |
+| `llm_infer.jsonl` | Same traces as Pass A/B / polish |
+| `pass_stats.json` | Add `publish`, `extract`, `publish_eval` counts (`n_edits` by kind, `n_reverted`, `n_fallback`) |
+
+## Seed glossary schema
+
+```json
+{
+  "terms": [
+    {
+      "surface": "Qwen3.8",
+      "aliases": ["千问三点八"],
+      "kind": "product",
+      "latex": null
+    },
+    {
+      "surface": "alpha",
+      "aliases": ["阿尔法"],
+      "kind": "symbol",
+      "latex": "\\alpha"
+    }
+  ]
+}
+```
+
+`keywords` / `rare_words` may be omitted in the seed; publish always writes them on output (`[]` if extract failed).
+
+Hotwords file is still passed via `--hotwords` and included in the publish prompt as extra term hints. It is not merged into `glossary.json` unless a hotword also appears as an extracted `new_term` / keyword.
+
+## Error policy (summary)
+
+| Failure | Behavior |
+|---------|----------|
+| Missing polished and missing merged final | Fail sample |
+| Publish schema / marker violation | Retry ≤2; then skip smoothing (published = input turns) |
+| Per-edit rule fail | Drop that edit |
+| Extract invalid JSON | Retry; seed-only glossary |
+| Eval invalid JSON | Retry; do not revert |
+| Eval `faithful: false` | Revert turns; still write all artifacts from reverted text |
+
+`llm_max_retries` from `PipelineConfig` applies to each of the three calls independently.
+
+## Testing
+
+Do **not** score WER on published text.
+
+Mock tests (no weights), next to `tests/test_polish.py`:
+
+1. Filler removed when in lexicon; unknown filler dropped.
+2. Repair contiguous-substring applied; non-substring rejected.
+3. LaTeX from glossary / built-in lexicon applied; unknown TeX dropped.
+4. Edit touching `⟦t1⟧` dumps payload; turns unchanged after retries.
+5. Extract merge: seed `surface` wins; bad JSON → seed-only.
+6. Quality judge `faithful: false` reverts; `faithful: true` keeps edits.
+7. `--stage publish` writes published JSON + `transcript.md` + `glossary.json` and does not overwrite `mode_c_asr_final.json` or `mode_c_polished.json`.
+8. `run-batch --stage publish --limit 1` in mock: one sample dir contains the three files.
+
+Success for this spec:
+
+1. Phonetic WER artifacts unchanged.
+2. Mock tests above pass.
+3. One mock meeting round-trips to published JSON + Markdown + enriched glossary + `publish_eval.json`.
+
+## Implementation notes (for the plan)
+
+- Reuse LLM JSON extract, infer log, retry, and `PipelineConfig` patterns from polish.
+- Do not relax polish validators or prompts.
+- Default filler list is Chinese-primary; English `um` / `ah` may be included as extras but are not the design target.
+- Prompt language: Chinese instructions + Chinese few-shots for filler/repair; English code-switch examples only where needed for latex/terms.
