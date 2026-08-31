@@ -21,17 +21,31 @@ def cap_neighbors(
     turn_index: int,
     cfg: PipelineConfig,
 ) -> list[dict]:
-    """Cap meeting neighbors (~4096 tokens ≈ 8192 chars, neighbor_max_turns)."""
-    neighbors = [row for row in meeting if row["turn_index"] != turn_index]
+    """Nearest other turns within ±window, capped by neighbor_max_turns and ~8k chars."""
+    current = next((row for row in meeting if int(row["turn_index"]) == int(turn_index)), None)
+    if current is None:
+        return []
+    center = 0.5 * (float(current["start"]) + float(current["end"]))
+    window = float(cfg.neighbor_window_seconds)
+    cands: list[tuple[float, int, dict]] = []
+    for row in meeting:
+        idx = int(row["turn_index"])
+        if idx == int(turn_index):
+            continue
+        mid = 0.5 * (float(row["start"]) + float(row["end"]))
+        dist = abs(mid - center)
+        if dist > window:
+            continue
+        cands.append((dist, idx, row))
+    cands.sort(key=lambda item: (item[0], item[1]))
+
     char_budget = 4096 * 2
     used = 0
     capped: list[dict] = []
-    for row in neighbors:
+    for _, _, row in cands[: cfg.neighbor_max_turns]:
         cost = len(str(row.get("text", ""))) + 32
         if capped and used + cost > char_budget:
             break
         capped.append(row)
         used += cost
-        if len(capped) >= cfg.neighbor_max_turns:
-            break
     return capped
