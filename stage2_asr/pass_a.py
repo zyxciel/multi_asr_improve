@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from stage2_asr.agreement import all_hyps_agree, pick_best_hyp
-from stage2_asr.text_map import distribute_unit_text
-from stage2_asr.types import AsrUnit, Hypothesis, PipelineConfig, Turn
+from stage2_asr.agreement import all_hyps_agree, normalize_for_cer, pick_best_hyp
+from stage2_asr.text_map import assign_unit_text
+from stage2_asr.types import AsrUnit, Edit, Hypothesis, PipelineConfig, Turn
 from stage2_asr.validators import (
     judgment_from_payload,
     validate_edits_evidence_ladder,
@@ -81,6 +81,44 @@ def _try_judge(
     return raw, None
 
 
+def _apply_edits_to_text(text: str, edits: list[Edit]) -> str:
+    out = text
+    for e in edits:
+        if e.span_asr and e.span_asr in out:
+            out = out.replace(e.span_asr, e.span_out, 1)
+    return out
+
+
+def _hyp_for_model(hyps: list[Hypothesis], model: str) -> Hypothesis | None:
+    for h in hyps:
+        if h.model == model and (h.text or "").strip():
+            return h
+    return None
+
+
+def _text_matches_any_hyp(text: str, hyps: list[Hypothesis]) -> bool:
+    norm = normalize_for_cer(text)
+    return any(normalize_for_cer(h.text) == norm for h in hyps if (h.text or "").strip())
+
+
+def _commit_unit_text(
+    draft_texts: dict[int, str],
+    unit: AsrUnit,
+    text: str,
+    turns: list[Turn],
+    written: set[int],
+) -> None:
+    assign_unit_text(
+        draft_texts,
+        turn_indices=unit.turn_indices,
+        text=text,
+        turns=turns,
+        unit_start=unit.start,
+        unit_end=unit.end,
+        written=written,
+    )
+
+
 def run_pass_a_for_unit(
     *,
     unit: AsrUnit,
@@ -124,16 +162,13 @@ def run_pass_a_for_unit(
             last_err = err
             audit["retries"] = attempt + 1
             continue
-        judgment = judgment_from_payload(raw)
-        if prefer_moss and judgment.base_model != "moss" and any(h.model == "moss" for h in hyps):
-            if not judgment.edits:
-                moss = pick_best_hyp(hyps, prefer_moss_on_overlap=True)
-                text = moss.text if moss else judgment.text
-                audit["forced_moss_base"] = True
-                audit["judgment"] = judgment.raw
-                return text, audit
-        audit["judgment"] = judgment.raw
-        return judgment.text, audit
+        return _finalize_from_raw(
+            raw=raw,
+            unit=unit,
+            hyps=hyps,
+            prefer_moss=prefer_moss,
+            audit=audit,
+        )
 
     if fallback_judge is not None:
         audit["fallback_judge"] = getattr(fallback_judge, "name", "fallback")
@@ -145,19 +180,15 @@ def run_pass_a_for_unit(
             unit=unit,
         )
         if raw is not None:
-            judgment = judgment_from_payload(raw)
-            if prefer_moss and judgment.base_model != "moss" and any(
-                h.model == "moss" for h in hyps
-            ):
-                if not judgment.edits:
-                    moss = pick_best_hyp(hyps, prefer_moss_on_overlap=True)
-                    text = moss.text if moss else judgment.text
-                    audit["forced_moss_base"] = True
-                    audit["judgment"] = judgment.raw
-                    return text, audit
-            audit["judgment"] = judgment.raw
+            text, audit = _finalize_from_raw(
+                raw=raw,
+                unit=unit,
+                hyps=hyps,
+                prefer_moss=prefer_moss,
+                audit=audit,
+            )
             audit["fallback_judge_ok"] = True
-            return judgment.text, audit
+            return text, audit
         last_err = err or last_err
 
     best = pick_best_hyp(hyps, prefer_moss_on_overlap=prefer_moss)
@@ -182,8 +213,19 @@ def _finalize_from_raw(
             audit["forced_moss_base"] = True
             audit["judgment"] = judgment.raw
             return text, audit
+    base = _hyp_for_model(hyps, judgment.base_model) or pick_best_hyp(
+        hyps, prefer_moss_on_overlap=prefer_moss
+    )
+    base_text = base.text if base else ""
+    if not judgment.edits:
+        if _text_matches_any_hyp(judgment.text, hyps):
+            audit["judgment"] = judgment.raw
+            return judgment.text, audit
+        audit["empty_edits_reject"] = True
+        audit["judgment"] = judgment.raw
+        return base_text, audit
     audit["judgment"] = judgment.raw
-    return judgment.text, audit
+    return _apply_edits_to_text(base_text, judgment.edits), audit
 
 
 def run_pass_a_batch(
@@ -204,6 +246,7 @@ def run_pass_a_batch(
     first-attempt and retry LLM calls are issued via judge_many (batched).
     """
     batch_size = max(1, int(getattr(config, "pass_a_batch_size", 1) or 1))
+    written: set[int] = set()
     # Fast path: sequential (preserves per-unit draft updates between units).
     if batch_size <= 1 or len(items) <= 1 or not hasattr(llm_judge, "judge_many"):
         out_seq: list[tuple[str, dict]] = []
@@ -219,8 +262,7 @@ def run_pass_a_batch(
                 fallback_judge=fallback_judge,
             )
             out_seq.append((text, audit))
-            for ti, piece in _distribute_placeholder(item["unit"], text, turns):
-                draft_texts[ti] = piece
+            _commit_unit_text(draft_texts, item["unit"], text, turns, written)
         return out_seq
 
     # Snapshot neighbors from current draft for the whole micro-batch.
@@ -388,13 +430,5 @@ def run_pass_a_batch(
         assert results[i] is not None
         text, audit = results[i]  # type: ignore[misc]
         out.append((text, audit))
-        for ti, piece in _distribute_placeholder(item["unit"], text, turns):
-            draft_texts[ti] = piece
+        _commit_unit_text(draft_texts, item["unit"], text, turns, written)
     return out
-
-
-def _distribute_placeholder(unit: AsrUnit, text: str, turns: list[Turn]):
-    """Yield (turn_index, text_piece) using the shared unit map-back."""
-    mapped = distribute_unit_text(unit.turn_indices, text, turns)
-    for idx, piece in mapped.items():
-        yield idx, piece

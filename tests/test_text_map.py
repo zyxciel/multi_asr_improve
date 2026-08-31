@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from stage2_asr.text_map import (
+    assign_unit_text,
     distribute_unit_text,
     join_turn_texts,
     merge_consecutive_turns,
@@ -96,6 +97,128 @@ def test_merge_keeps_overlapping_speakers_and_their_timestamps():
     assert merged[0].start == 0.0 and merged[0].end == 5.0
     assert merged[1].start == 2.0 and merged[1].end == 6.0
     assert members == [[0], [1]]
+
+
+def test_assign_unit_text_concatenates_slices_of_same_turn():
+    turns = [Turn(0.0, 40.0, "s0", "原始整句。")]
+    dest = {0: "原始整句。"}
+    written: set[int] = set()
+    assign_unit_text(
+        dest,
+        turn_indices=[0],
+        text="前一半内容。",
+        turns=turns,
+        unit_start=0.0,
+        unit_end=20.0,
+        written=written,
+    )
+    assign_unit_text(
+        dest,
+        turn_indices=[0],
+        text="后一半内容。",
+        turns=turns,
+        unit_start=20.0,
+        unit_end=40.0,
+        written=written,
+    )
+    assert dest[0] == "前一半内容。后一半内容。"
+
+
+def test_assign_unit_text_full_span_replaces_mode_c():
+    turns = [Turn(0.0, 5.0, "s0", "原始整句。")]
+    dest = {0: "原始整句。"}
+    written: set[int] = set()
+    assign_unit_text(
+        dest,
+        turn_indices=[0],
+        text="新文本。",
+        turns=turns,
+        unit_start=0.0,
+        unit_end=5.0,
+        written=written,
+    )
+    assert dest[0] == "新文本。"
+
+
+def test_assign_unit_text_does_not_double_full_turn_text_on_slices():
+    # The moss hyp is the FULL Mode-C turn text on every split slice — must not double.
+    full = "第一句内容。第二句内容。第三句内容。第四句内容。"
+    turns = [Turn(0.0, 40.0, "s0", full)]
+    dest = {0: full}
+    written: set[int] = set()
+    assign_unit_text(
+        dest,
+        turn_indices=[0],
+        text=full,
+        turns=turns,
+        unit_start=0.0,
+        unit_end=20.0,
+        written=written,
+    )
+    assign_unit_text(
+        dest,
+        turn_indices=[0],
+        text=full,
+        turns=turns,
+        unit_start=20.0,
+        unit_end=40.0,
+        written=written,
+    )
+    assert dest[0] == full
+
+
+def test_assign_unit_text_full_slice_supersedes_partial():
+    full = "第一句内容。第二句内容。第三句内容。第四句内容。"
+    turns = [Turn(0.0, 40.0, "s0", full)]
+    dest = {0: full}
+    written: set[int] = set()
+    # first slice: partial ASR crop text
+    assign_unit_text(
+        dest,
+        turn_indices=[0],
+        text="前一半内容。",
+        turns=turns,
+        unit_start=0.0,
+        unit_end=20.0,
+        written=written,
+    )
+    # second slice: full moss text — must supersede the partial, not append
+    assign_unit_text(
+        dest,
+        turn_indices=[0],
+        text=full,
+        turns=turns,
+        unit_start=20.0,
+        unit_end=40.0,
+        written=written,
+    )
+    assert dest[0] == full
+
+
+def test_assign_unit_text_partial_after_full_keeps_full():
+    full = "第一句内容。第二句内容。第三句内容。第四句内容。"
+    turns = [Turn(0.0, 40.0, "s0", full)]
+    dest = {0: full}
+    written: set[int] = set()
+    assign_unit_text(
+        dest,
+        turn_indices=[0],
+        text=full,
+        turns=turns,
+        unit_start=0.0,
+        unit_end=20.0,
+        written=written,
+    )
+    assign_unit_text(
+        dest,
+        turn_indices=[0],
+        text="后一半内容。",
+        turns=turns,
+        unit_start=20.0,
+        unit_end=40.0,
+        written=written,
+    )
+    assert dest[0] == full
 
 
 def test_merge_splits_overlong_turn_into_equal_chunks():

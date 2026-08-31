@@ -78,6 +78,10 @@ def _marker_spans(meeting: str) -> list[tuple[int, int]]:
     return [(m.start(), m.end()) for m in MARK_RE.finditer(meeting or "")]
 
 
+def _span_has_marker(span: str) -> bool:
+    return any(ch in (span or "") for ch in ("⟦", "⟧")) or bool(MARK_RE.search(span or ""))
+
+
 def _owning_turn_span(meeting: str, start: int, end: int) -> tuple[int, int] | None:
     markers = list(MARK_RE.finditer(meeting or ""))
     for idx, m in enumerate(markers):
@@ -261,7 +265,8 @@ def validate_publish_payload(raw: Any, *, meeting: str) -> tuple[bool, str | Non
         if kind not in ALLOWED_KINDS:
             return False, f"bad kind {kind!r}"
         span_asr = str(e.get("span_asr", ""))
-        if any(m in span_asr for m in ("⟦", "⟧")) or MARK_RE.search(span_asr):
+        span_out = str(e.get("span_out", ""))
+        if _span_has_marker(span_asr) or _span_has_marker(span_out):
             return False, "edit touches turn marker"
         loc = _locate(meeting, span_asr, e.get("start_char")) if span_asr else None
         if loc and _overlaps(loc[0], loc[1], markers):
@@ -290,6 +295,8 @@ def filter_publish_edits(
         span_asr = str(raw.get("span_asr", ""))
         span_out = str(raw.get("span_out", ""))
         if kind != "filler" and span_asr == span_out:
+            continue
+        if _span_has_marker(span_asr) or _span_has_marker(span_out):
             continue
         if kind == "filler" and span_asr == "":
             continue

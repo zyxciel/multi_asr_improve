@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 
+from stage2_asr.agreement import normalize_for_cer
 from stage2_asr.types import AsrStatus, Turn
 
 JOINER = "。"
@@ -157,6 +158,59 @@ def _duration_split(text: str, unit_turn_indices: list[int], turns: list[Turn]) 
             cursor += take
         out[idx] = piece.strip(JOINER).replace(JOINER + JOINER, JOINER)
     return out
+
+
+def _is_partial_turn_slice(
+    turn: Turn, *, unit_start: float, unit_end: float, n_indices: int
+) -> bool:
+    if n_indices != 1:
+        return False
+    return float(unit_start) > float(turn.start) + 1e-6 or float(unit_end) < float(turn.end) - 1e-6
+
+
+def _merge_slice_text(existing: str, piece: str, turn: Turn | None) -> str:
+    """Merge slice texts of one long turn without duplicating full-turn content.
+
+    A split unit's hyp may already carry the complete turn text (e.g. the moss
+    hyp built from Mode-C text, which is never split). In that case the piece
+    (or the existing dest value) supersedes partial slices instead of joining.
+    """
+    turn_text = (turn.text or "") if turn is not None else ""
+    p_norm = normalize_for_cer(piece)
+    e_norm = normalize_for_cer(existing)
+    t_norm = normalize_for_cer(turn_text)
+    if t_norm and p_norm == t_norm:
+        return piece
+    if t_norm and e_norm == t_norm:
+        return existing
+    if e_norm and p_norm == e_norm:
+        return existing
+    return join_turn_texts([existing, piece])
+
+
+def assign_unit_text(
+    dest: dict[int, str],
+    *,
+    turn_indices: list[int],
+    text: str,
+    turns: list[Turn],
+    unit_start: float,
+    unit_end: float,
+    written: set[int],
+) -> None:
+    """Map unit text onto original turns, concatenating slices of one long turn."""
+    mapped = distribute_unit_text(turn_indices, text, turns)
+    n_indices = len(list(dict.fromkeys(turn_indices)))
+    for idx, piece in mapped.items():
+        turn = turns[idx] if 0 <= idx < len(turns) else None
+        is_slice = turn is not None and _is_partial_turn_slice(
+            turn, unit_start=unit_start, unit_end=unit_end, n_indices=n_indices
+        )
+        if is_slice and idx in written:
+            dest[idx] = _merge_slice_text(dest.get(idx, ""), piece, turn)
+        else:
+            dest[idx] = piece
+        written.add(idx)
 
 
 def distribute_unit_text(

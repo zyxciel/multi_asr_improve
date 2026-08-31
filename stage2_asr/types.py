@@ -5,6 +5,13 @@ from enum import Enum
 from typing import Any
 
 
+def _as_float(value: Any, default: float = float("nan")) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 class AsrStatus(str, Enum):
     PROVISIONAL = "provisional"
     FINAL = "final"
@@ -42,13 +49,13 @@ class Turn:
         else:
             asr_status = AsrStatus(str(status))
         return cls(
-            start=float(d["start"]),
-            end=float(d["end"]),
-            speaker_id=str(d["speaker_id"]),
+            start=_as_float(d.get("start")),
+            end=_as_float(d.get("end")),
+            speaker_id=str(d.get("speaker_id") or "?"),
             text=str(d.get("text", "")),
             asr_status=asr_status,
             source=str(d.get("source", "fused")),
-            confidence=float(d.get("confidence", 1.0)),
+            confidence=_as_float(d.get("confidence", 1.0), default=1.0),
         )
 
 

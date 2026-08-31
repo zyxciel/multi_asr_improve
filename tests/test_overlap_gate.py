@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from stage2_asr.types import PipelineConfig, Turn
+from stage2_asr.types import Turn
 from stage2_asr.units import build_asr_units, overlap_ratio_for_span
 
 

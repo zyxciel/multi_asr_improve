@@ -3,7 +3,7 @@ from __future__ import annotations
 """Combine MOSS provisional text with Qwen + FireRed runners."""
 
 from stage2_asr.text_map import join_turn_texts
-from stage2_asr.types import AsrStatus, AsrUnit, Hypothesis, Turn
+from stage2_asr.types import AsrUnit, Hypothesis, Turn
 
 
 class EnsembleAsrRunner:
@@ -42,7 +42,6 @@ class EnsembleAsrRunner:
             hyps.append(moss)
         if moss_exclusive:
             return hyps
-        kwargs = {"crop_path": crop_path} if crop_path is not None else {}
         # Prefer calling with crop_path if runners accept it
         if "qwen" in selected:
             try:

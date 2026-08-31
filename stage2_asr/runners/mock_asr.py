@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 from stage2_asr.text_map import join_turn_texts
-from stage2_asr.types import AsrStatus, AsrUnit, Hypothesis, Turn
+from stage2_asr.types import AsrUnit, Hypothesis, Turn
 
 
 class MockAsrRunner:

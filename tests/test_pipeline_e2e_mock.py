@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from stage2_asr.pipeline import run_pipeline
+from stage2_asr.pipeline import _merge_hyps, run_pipeline
 from stage2_asr.prompt import SYSTEM_PROMPT, render_user_prompt
 from stage2_asr.runners.base import UnsupportedRunnerError
 from stage2_asr.runners.firered_asr2s import FireRedAsr2sConfig, FireRedAsr2sRunner
@@ -191,6 +191,83 @@ def test_stage_asr_can_accumulate_different_models(tmp_path: Path):
     models = {h["model"] for r in non_skipped for h in r.get("hyps", [])}
     assert "qwen" in models
     assert "firered" in models
+    for record in non_skipped:
+        names = [h["model"] for h in record.get("hyps") or []]
+        if "qwen" in names and "firered" in names:
+            assert names.index("qwen") < names.index("firered")
+
+
+def test_merge_hyps_uses_moss_qwen_firered_priority():
+    merged = _merge_hyps(
+        [{"model": "qwen", "text": "q"}],
+        [{"model": "firered", "text": "f"}, {"model": "moss", "text": "m"}],
+    )
+    assert [h["model"] for h in merged] == ["moss", "qwen", "firered"]
+    oneshot = _merge_hyps(
+        [],
+        [
+            {"model": "moss", "text": "m"},
+            {"model": "qwen", "text": "q"},
+            {"model": "firered", "text": "f"},
+        ],
+    )
+    staged = _merge_hyps(
+        _merge_hyps([{"model": "qwen", "text": "q"}], [{"model": "firered", "text": "f"}]),
+        [{"model": "moss", "text": "m"}],
+    )
+    assert [h["model"] for h in oneshot] == ["moss", "qwen", "firered"]
+    assert [h["model"] for h in staged] == ["moss", "qwen", "firered"]
+
+
+def test_split_long_turn_keeps_both_slice_texts(tmp_path: Path):
+    mode_c = tmp_path / "mode_c.json"
+    mode_c.write_text(
+        json.dumps(
+            {
+                "turns": [
+                    {
+                        "start": 0.0,
+                        "end": 40.0,
+                        "speaker_id": "speaker_0",
+                        "text": "原始整句。",
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    out = tmp_path / "work"
+    kwargs = dict(
+        input_json=mode_c,
+        audio_path=tmp_path / "missing.wav",
+        work_dir=out,
+        asr_runner=MockAsrRunner(
+            fixture={
+                "by_unit_id": {
+                    "unit_0000": {
+                        "moss": "前一半内容。",
+                        "qwen": "前一半内容。",
+                        "firered": "前一半内容。",
+                    },
+                    "unit_0001": {
+                        "moss": "后一半内容。",
+                        "qwen": "后一半内容。",
+                        "firered": "后一半内容。",
+                    },
+                }
+            }
+        ),
+        llm_judge=MockLlmJudge(),
+        config=PipelineConfig(max_asr_seconds=20.0),
+        asr_models=["moss", "qwen", "firered"],
+    )
+    run_pipeline(**kwargs, stage="asr")
+    run_pipeline(**kwargs, stage="pass_a")
+    draft = json.loads((out / "mode_c_draft.json").read_text(encoding="utf-8"))
+    text = draft["turns"][0]["text"]
+    assert "前一半内容" in text
+    assert "后一半内容" in text
 
 
 def test_stage_asr_moss_merges_into_existing_qwen_firered(tmp_path: Path):

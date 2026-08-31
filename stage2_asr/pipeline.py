@@ -9,11 +9,12 @@ import numpy as np
 
 from stage2_asr.audio_io import crop_unit_wav, load_wav_mono16k
 from stage2_asr.llm_log import LlmInferLogger
-from stage2_asr.pass_a import run_pass_a_batch, run_pass_a_for_unit
+from stage2_asr.pass_a import run_pass_a_batch
 from stage2_asr.pass_b import run_pass_b
 from stage2_asr.polish import hyps_by_merged_from_records, hyps_by_turn_from_records, run_polish
 from stage2_asr.publish import load_glossary, render_transcript, run_publish
 from stage2_asr.text_map import (
+    assign_unit_text,
     distribute_unit_text,
     join_turn_texts,
     merge_consecutive_turns,
@@ -66,7 +67,8 @@ def _load_audio_optional(audio_path: Path, sr: int) -> np.ndarray | None:
     try:
         audio, _ = load_wav_mono16k(audio_path, target_sr=sr)
         return audio
-    except Exception:
+    except Exception as exc:  # noqa: BLE001 — mock-friendly; log so production damage is visible
+        _log(f"[audio] failed to load {audio_path}: {exc}; long-turn split will use midpoint")
         return None
 
 
@@ -475,13 +477,19 @@ def _record_index(records: list[dict]) -> dict[str, dict]:
     return out
 
 
+_HYP_PRIORITY = {"moss": 0, "qwen": 1, "firered": 2}
+
+
 def _merge_hyps(existing: list[dict], new: list[dict]) -> list[dict]:
     by_model = {str(item.get("model")): item for item in existing if item.get("model")}
     for item in new:
         model = str(item.get("model", ""))
         if model:
             by_model[model] = item
-    return [by_model[key] for key in sorted(by_model)]
+    return [
+        by_model[key]
+        for key in sorted(by_model, key=lambda m: (_HYP_PRIORITY.get(m, 99), m))
+    ]
 
 
 def _moss_hypothesis_from_turns(unit: AsrUnit, turns: list[Turn]) -> Hypothesis | None:
@@ -520,10 +528,13 @@ def _ensure_moss_hyp(
 def _rebuild_overlap_metadata(
     records: list[dict],
     turns: list[Turn],
+    units: list[AsrUnit] | None = None,
 ) -> tuple[set[int], set[int], dict[int, str]]:
     overlap_turn_indices: set[int] = set()
     heavy_overlap_turn_indices: set[int] = set()
     moss_texts: dict[int, str] = {}
+    units_by_id = {u.unit_id: u for u in (units or [])}
+    written: set[int] = set()
     for record in records:
         turn_indices = [int(i) for i in record.get("turn_indices") or []]
         if record.get("contains_overlap"):
@@ -538,7 +549,20 @@ def _rebuild_overlap_metadata(
             ),
             None,
         )
-        if moss is not None:
+        if moss is None:
+            continue
+        unit = units_by_id.get(str(record.get("unit_id", "")))
+        if unit is not None:
+            assign_unit_text(
+                moss_texts,
+                turn_indices=turn_indices or unit.turn_indices,
+                text=str(moss.get("text", "")),
+                turns=turns,
+                unit_start=unit.start,
+                unit_end=unit.end,
+                written=written,
+            )
+        else:
             moss_texts.update(
                 _distribute_text(
                     turn_indices,
@@ -848,7 +872,7 @@ def _run_pipeline_body(
         _log(f"[stage={stage}] loaded {len(hyp_records)} ASR hyp records from {hyp_path}")
 
     overlap_turn_indices, heavy_overlap_turn_indices, moss_texts = _rebuild_overlap_metadata(
-        hyp_records, turns
+        hyp_records, turns, units
     )
 
     if stage == "pass_b":

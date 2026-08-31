@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from stage2_asr.agreement import all_hyps_agree, char_error_rate, normalize_for_cer
+from stage2_asr.agreement import all_hyps_agree, char_error_rate
 from stage2_asr.pinyin_util import pinyin_edit_distance, pinyin_equal, to_pinyin
 from stage2_asr.types import Edit, Hypothesis
 from stage2_asr.validators import validate_edits_span_local, validate_judgment_schema

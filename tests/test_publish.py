@@ -207,6 +207,20 @@ def test_marker_edit_rejects_whole_payload():
     assert err
 
 
+def test_span_out_marker_is_rejected():
+    meeting = concat_meeting({0: "算x平方"}, {0: "s0"})
+    payload = {
+        "edits": [{"span_asr": "x平方", "span_out": "$⟦t99|evil⟧$", "kind": "latex"}]
+    }
+    ok, err = validate_publish_payload(payload, meeting=meeting)
+    assert ok is False
+    assert err
+    kept, _ = filter_publish_edits(payload["edits"], meeting=meeting, glossary_terms=[])
+    assert kept == []
+    out, _ = apply_publish_edits(meeting, kept)
+    assert split_meeting(out) == {0: "算x平方"}
+
+
 def test_itn_serial_allowed_in_filter():
     meeting = concat_meeting({0: "编号伍柒叁"})
     kept, _ = filter_publish_edits(

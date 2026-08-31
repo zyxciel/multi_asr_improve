@@ -152,14 +152,9 @@ def _add_common_run_args(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument(
         "--vllm-enforce-eager",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=True,
-        help="Pass enforce_eager=True to vllm.LLM (default on; stabilizes Ascend bring-up)",
-    )
-    p.add_argument(
-        "--no-vllm-enforce-eager",
-        action="store_true",
-        help="Disable enforce_eager for vllm_engine",
+        help="Pass enforce_eager to vllm.LLM (default on; --no-vllm-enforce-eager to disable)",
     )
     p.add_argument(
         "--vllm-use-v1",
@@ -201,9 +196,7 @@ def _resolve_backend(args: argparse.Namespace) -> str | None:
 
 
 def _vllm_flags(args: argparse.Namespace) -> dict:
-    enforce = True
-    if getattr(args, "no_vllm_enforce_eager", False):
-        enforce = False
+    enforce = bool(getattr(args, "vllm_enforce_eager", True))
     use_v1: bool | None = False
     if getattr(args, "vllm_use_v1", False):
         use_v1 = True

@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 
-from stage2_asr.audio_io import crop_unit_wav, make_silent_wav, write_wav_mono16k
+from stage2_asr.audio_io import crop_unit_wav, write_wav_mono16k
 from stage2_asr.eval_metrics import cer, corpus_cer, cp_cer
 from stage2_asr.runners.base import UnsupportedRunnerError
 from stage2_asr.runners.ensemble import EnsembleAsrRunner
