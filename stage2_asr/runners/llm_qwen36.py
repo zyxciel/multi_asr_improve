@@ -176,6 +176,7 @@ class Qwen36LlmJudge:
         unit_id: str,
         hypotheses: list | None = None,
         meeting_hyps: str | None = None,
+        cluster_mappings: str = "(none)",
         **_kwargs,
     ) -> dict:
         user = render_polish_user_prompt(
@@ -185,6 +186,7 @@ class Qwen36LlmJudge:
             turn_index=int(turn_index),
             hypotheses=format_polish_hypotheses(hypotheses),
             meeting_hyps=str(meeting_hyps or "(none)"),
+            cluster_mappings=str(cluster_mappings or "(none)"),
         )
         raw_text = self._generate(
             POLISH_SYSTEM_PROMPT,

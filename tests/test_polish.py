@@ -908,3 +908,236 @@ def test_pipeline_polish_stage_requires_asr_final(tmp_path: Path):
             config=PipelineConfig(),
             stage="polish",
         )
+
+
+# --- Task 5: wire run_polish with homophone-cluster partition ---
+
+
+def test_run_polish_allow_list_empty_when_mock_partition_false():
+    """Full-run hyps 找张三丰/签张三丰 cluster; mock partition says same_entity: false.
+
+    The polish LLM may still try 找张三丰 → 签张三丰, but with an empty cluster
+    allow-list and no validator evidence the texts must stay unchanged and no
+    cluster-channel edit may be applied.
+    """
+    hyp_records = [
+        {
+            "unit_id": "u0",
+            "turn_indices": [0],
+            "hyps": [{"model": "qwen", "text": "找张三丰"}],
+        },
+        {
+            "unit_id": "u1",
+            "turn_indices": [1],
+            "hyps": [{"model": "moss", "text": "签张三丰"}],
+        },
+    ]
+
+    class SpanTryJudge:
+        def partition_cluster(self, **kwargs):
+            return {
+                "subsets": [
+                    {
+                        "surfaces": ["找张三丰", "签张三丰"],
+                        "canonical": None,
+                        "same_entity": False,
+                        "reason": "different verbs",
+                    }
+                ]
+            }
+
+        def polish(self, **kwargs):
+            text = kwargs["text"]
+            if "找张三丰" in text:
+                return {
+                    "text": text.replace("找张三丰", "签张三丰"),
+                    "edits": [
+                        {
+                            "span_asr": "找张三丰",
+                            "span_out": "签张三丰",
+                            "kind": "entity",
+                            "anchor": "meeting_hyp",
+                            "evidence": "claimed other-turn hyp",
+                        }
+                    ],
+                }
+            return {"text": text, "edits": []}
+
+    turns = [Turn(0, 2, "s0", "找张三丰签字"), Turn(2, 4, "s1", "人还没到齐")]
+    texts = {0: turns[0].text, 1: turns[1].text}
+    out, audits = run_polish(
+        turns, texts, llm_judge=SpanTryJudge(), hyp_records=hyp_records
+    )
+    assert out[0] == "找张三丰签字"
+    assert out[1] == "人还没到齐"
+    assert not any(a.get("cluster_channel") for a in audits)
+    assert any(a.get("pass") == "polish_cluster" for a in audits)
+
+
+def test_run_polish_cluster_does_not_clobber_asr_final(tmp_path: Path):
+    """stage=polish with cluster wiring active must not rewrite mode_c_asr_final.json."""
+    out = tmp_path / "work"
+    out.mkdir(parents=True, exist_ok=True)
+    final_doc = {
+        "meta": {"stage": "pass_b_final"},
+        "turns": [
+            {
+                "start": 0.0,
+                "end": 2.0,
+                "speaker_id": "s0",
+                "text": "找张三风签字",
+                "asr_status": "final",
+            },
+            {
+                "start": 2.0,
+                "end": 4.0,
+                "speaker_id": "s1",
+                "text": "人还没到齐",
+                "asr_status": "final",
+            },
+        ],
+    }
+    (out / "mode_c_asr_final.json").write_text(
+        json.dumps(final_doc, ensure_ascii=False), encoding="utf-8"
+    )
+    (out / "asr_hypotheses.json").write_text(
+        json.dumps(
+            {
+                "records": [
+                    {
+                        "unit_id": "u0",
+                        "turn_indices": [0],
+                        "hyps": [
+                            {"model": "qwen", "text": "张三风"},
+                            {"model": "moss", "text": "张三风"},
+                        ],
+                    },
+                    {
+                        "unit_id": "u1",
+                        "turn_indices": [1],
+                        "hyps": [
+                            {"model": "qwen", "text": "涨三丰"},
+                            {"model": "moss", "text": "张三风"},
+                        ],
+                    },
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    before = (out / "mode_c_asr_final.json").read_bytes()
+
+    judge = MockLlmJudge()
+    judge.partition_fn = lambda **kwargs: {
+        "subsets": [
+            {
+                "surfaces": ["张三风", "涨三丰"],
+                "canonical": "涨三丰",
+                "same_entity": True,
+                "reason": "same person",
+            }
+        ]
+    }
+    run_pipeline(
+        input_json=FIXTURES / "mode_c.json",
+        audio_path=tmp_path / "missing.wav",
+        work_dir=out,
+        asr_runner=MockAsrRunner(),
+        llm_judge=judge,
+        config=PipelineConfig(),
+        stage="polish",
+    )
+    assert (out / "mode_c_asr_final.json").read_bytes() == before
+    assert (out / "mode_c_polished.json").exists()
+    edits = [
+        json.loads(line)
+        for line in (out / "llm_edits.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    cluster_rows = [e for e in edits if e.get("pass") == "polish_cluster"]
+    assert cluster_rows
+    assert any(e.get("path") == "leftover_mix" for e in cluster_rows)
+
+
+def test_run_polish_leftover_warns_without_revert():
+    """Approved subset canonical 涨三丰; polish edits only turn 0.
+
+    Turn 0 keeps the landed canonical edit (hard check passes, no revert);
+    turn 1 still shows 张三风 and is reported as a leftover_mix warning.
+    """
+    hyp_records = [
+        {
+            "unit_id": "u0",
+            "turn_indices": [0],
+            "hyps": [
+                {"model": "qwen", "text": "张三风"},
+                {"model": "moss", "text": "张三风"},
+            ],
+        },
+        {
+            "unit_id": "u1",
+            "turn_indices": [1],
+            "hyps": [
+                {"model": "qwen", "text": "涨三丰"},
+                {"model": "moss", "text": "张三风"},
+            ],
+        },
+    ]
+
+    class ClusterPolishJudge:
+        def partition_cluster(self, **kwargs):
+            return {
+                "subsets": [
+                    {
+                        "surfaces": ["张三风", "涨三丰"],
+                        "canonical": "涨三丰",
+                        "same_entity": True,
+                        "reason": "same person",
+                    }
+                ]
+            }
+
+        def polish(self, **kwargs):
+            text = kwargs["text"]
+            if kwargs.get("turn_index") == 0 and "张三风" in text:
+                return {
+                    "text": text.replace("张三风", "涨三丰"),
+                    "edits": [
+                        {
+                            "span_asr": "张三风",
+                            "span_out": "涨三丰",
+                            "kind": "entity",
+                            "anchor": "meeting_hyp",
+                            "evidence": "u1 qwen hyp contains 涨三丰",
+                        }
+                    ],
+                }
+            return {"text": text, "edits": []}
+
+    turns = [Turn(0, 2, "s0", "请张三风发言"), Turn(2, 4, "s1", "张三风还没到")]
+    texts = {0: turns[0].text, 1: turns[1].text}
+    hyps = {
+        0: [Hypothesis("qwen", "张三风"), Hypothesis("moss", "张三风")],
+        1: [Hypothesis("qwen", "涨三丰"), Hypothesis("moss", "张三风")],
+    }
+    out, audits = run_polish(
+        turns,
+        texts,
+        llm_judge=ClusterPolishJudge(),
+        hyp_by_turn=hyps,
+        hyp_records=hyp_records,
+    )
+    assert out[0] == "请涨三丰发言"
+    assert out[1] == "张三风还没到"
+    hit = next(
+        a for a in audits if a.get("path") == "llm" and a.get("span_asr") == "张三风"
+    )
+    assert hit["span_out"] == "涨三丰"
+    assert hit["cluster_channel"] is True
+    leftover = [a for a in audits if a.get("path") == "leftover_mix"]
+    assert leftover
+    assert leftover[0]["pass"] == "polish_cluster"
+    assert leftover[0]["turn_index"] == 1
+    assert leftover[0]["surfaces"] == ["张三风"]
+    assert leftover[0]["canonical"] == "涨三丰"

@@ -320,6 +320,7 @@ def _persist_polish(
         hotwords=hotwords,
         config=cfg,
         hyp_by_turn=hyp_by_turn,
+        hyp_records=hyp_records,
     )
     _log(f"[polish] done: {len(audits)} audits")
     polished_turns = []
@@ -353,9 +354,13 @@ def _persist_polish(
     polished_path.write_text(
         json.dumps(polished_doc, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    _rewrite_edits_keep_other_passes(work_dir / "llm_edits.jsonl", "polish", audits)
+    polish_rows = [a for a in audits if a.get("pass") != "polish_cluster"]
+    cluster_rows = [a for a in audits if a.get("pass") == "polish_cluster"]
+    edits_path = work_dir / "llm_edits.jsonl"
+    _rewrite_edits_keep_other_passes(edits_path, "polish", polish_rows)
+    _rewrite_edits_keep_other_passes(edits_path, "polish_cluster", cluster_rows)
     stats_path = work_dir / "pass_stats.json"
-    pass_stats = _merge_pass_stats(stats_path, {"polish": _summarize_polish(audits)})
+    pass_stats = _merge_pass_stats(stats_path, {"polish": _summarize_polish(polish_rows)})
     _log(f"[polish] wrote {polished_path}")
     return {
         "polished_path": polished_path,

@@ -150,6 +150,9 @@ class PipelineConfig:
     # Polish: 1 = sequential (later turns see earlier polish edits).
     # >1 = snapshot neighbors + polish_many. Independent of Pass A/B.
     polish_batch_size: int = 1
+    # Polish homophone clusters: run one partition call per multi-surface
+    # cluster and honor the resulting entity-subset allow-list.
+    polish_cluster: bool = True
     publish_batch_size: int = 1
     publish_eval: bool = True
     publish_eval_thinking: bool = True

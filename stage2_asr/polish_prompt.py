@@ -50,6 +50,8 @@ Write a short evidence string stating where span_out was found. Do not use world
 {hypotheses}
 - Other-turn ASR forms (meeting_hyp evidence; may be truncated):
 {meeting_hyps}
+- Approved mappings only (homophone-cluster unify permissions, `surface|surface → canonical`; do NOT unify anything not listed here):
+{cluster_mappings}
 - Hotwords: {hotwords}
 - Neighbor turns (same meeting, capped): {neighbor_draft}
 
@@ -118,6 +120,7 @@ def render_polish_user_prompt(
     turn_index: int,
     hypotheses: str = "(none)",
     meeting_hyps: str = "(none)",
+    cluster_mappings: str = "(none)",
 ) -> str:
     return POLISH_USER_TEMPLATE.format(
         turn_index=turn_index,
@@ -126,4 +129,5 @@ def render_polish_user_prompt(
         neighbor_draft=neighbor_draft,
         hypotheses=hypotheses,
         meeting_hyps=meeting_hyps,
+        cluster_mappings=cluster_mappings,
     )

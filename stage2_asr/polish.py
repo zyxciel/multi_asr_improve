@@ -7,6 +7,16 @@ from stage2_asr.agreement import normalize_for_cer
 from stage2_asr.llm_retry import sleep_before_retry
 from stage2_asr.neighbors import cap_neighbors, meeting_draft
 from stage2_asr.pinyin_util import pinyin_edit_distance
+from stage2_asr.polish_cluster import (
+    EntitySubset,
+    build_homophone_clusters,
+    cluster_allow_list,
+    cluster_channel_edit,
+    leftover_mentions,
+    parse_partition_payload,
+    revert_subset_edits,
+    subset_edit_texts_unique,
+)
 from stage2_asr.text_map import distribute_unit_text
 from stage2_asr.types import Hypothesis, PipelineConfig, Turn
 
@@ -470,6 +480,150 @@ def hyps_by_merged_from_records(
     return out
 
 
+# --- Homophone-cluster wiring (spec §2–§4) ---
+
+
+def _pretty_cluster_mappings(
+    subsets: list[EntitySubset], allow: dict[str, str]
+) -> str:
+    """Render approved mappings for the polish prompt: `张三风|涨三丰 → 涨三丰`.
+
+    Only surfaces still present in the (conflict-filtered) allow-list are
+    listed, so the prompt never grants a mapping the allow-list dropped.
+    """
+    lines: list[str] = []
+    for sub in subsets:
+        if not sub.same_entity or sub.canonical is None:
+            continue
+        surfaces = sorted(s for s in sub.surfaces if allow.get(s) == sub.canonical)
+        if not surfaces:
+            continue
+        lines.append(f"{'|'.join(surfaces)} → {sub.canonical}")
+    return "\n".join(lines) if lines else "(none)"
+
+
+def _cluster_partition(
+    llm_judge,
+    hyp_records: list[dict] | None,
+    cfg: PipelineConfig,
+    audits: list[dict],
+) -> tuple[dict[str, str], list[EntitySubset], str]:
+    """Run cluster construction + one partition call per kept cluster.
+
+    Returns (allow_list, approved_subsets, cluster_mappings_pretty).
+    Skips (current behavior) when the config disables it, the judge lacks
+    `partition_cluster`, or there are no hyp records. Invalid JSON / errors
+    retry with the polish backoff, then yield no subsets for that cluster.
+    """
+    if not getattr(cfg, "polish_cluster", True):
+        return {}, [], "(none)"
+    if not hasattr(llm_judge, "partition_cluster"):
+        return {}, [], "(none)"
+    if not hyp_records:
+        return {}, [], "(none)"
+
+    clusters = build_homophone_clusters(hyp_records)
+    allow: dict[str, str] = {}
+    conflicts: set[str] = set()
+    approved: list[EntitySubset] = []
+    backoff = float(getattr(cfg, "llm_retry_backoff_s", 0.0))
+    for cluster in clusters:
+        raw = None
+        last_err = None
+        ok = False
+        for attempt in range(cfg.llm_max_retries + 1):
+            sleep_before_retry(attempt, backoff)
+            try:
+                raw = llm_judge.partition_cluster(
+                    cluster=cluster, unit_id=cluster.cluster_id
+                )
+            except Exception as exc:  # noqa: BLE001
+                raw = None
+                last_err = str(exc)
+                continue
+            if isinstance(raw, dict):
+                ok = True
+                break
+            last_err = f"expected dict partition payload, got {type(raw).__name__}"
+            raw = None
+        subsets = parse_partition_payload(raw, cluster) if ok else []
+        covered: set[str] = set()
+        for sub in subsets:
+            covered |= set(sub.surfaces)
+        row: dict[str, Any] = {
+            "pass": "polish_cluster",
+            "path": "partition",
+            "cluster_id": cluster.cluster_id,
+            "surfaces": list(cluster.surfaces),
+            "subsets": [
+                {
+                    "surfaces": sorted(sub.surfaces),
+                    "canonical": sub.canonical,
+                    "same_entity": sub.same_entity,
+                    "reason": sub.reason,
+                }
+                for sub in subsets
+            ],
+            "uncovered": sorted(set(cluster.surfaces) - covered),
+            "tone_mismatch_pairs": [list(p) for p in cluster.tone_mismatch_pairs],
+            "ok": ok,
+        }
+        if not ok:
+            row["fallback"] = True
+            row["last_error"] = last_err
+        audits.append(row)
+
+        approved.extend(
+            sub for sub in subsets if sub.same_entity and sub.canonical is not None
+        )
+        # Merge this cluster's allow-list; a surface mapped to two different
+        # canonicals (across subsets/clusters) is dropped as a conflict.
+        for surface, canonical in cluster_allow_list(subsets).items():
+            if surface in conflicts:
+                continue
+            if surface in allow and allow[surface] != canonical:
+                del allow[surface]
+                conflicts.add(surface)
+            else:
+                allow[surface] = canonical
+    return allow, approved, _pretty_cluster_mappings(approved, allow)
+
+
+def _cluster_subset_sweep(
+    out: dict[int, str], audits: list[dict], subsets: list[EntitySubset]
+) -> dict[int, str]:
+    """Per approved subset: hard-check landed edits, revert that subset only
+    if its cluster-channel edits disagree, then report leftover mentions."""
+    applied = [
+        a
+        for a in audits
+        if a.get("pass") == "polish"
+        and a.get("path") == "llm"
+        and not a.get("fallback")
+        and isinstance(a.get("turn_index"), int)
+        and isinstance(a.get("start_char"), int)
+    ]
+    for sub in subsets:
+        if not sub.same_entity or sub.canonical is None:
+            continue
+        applied_for_s = [
+            a for a in applied if str(a.get("span_asr")) in sub.surfaces
+        ]
+        if applied_for_s and not subset_edit_texts_unique(applied_for_s, sub.canonical):
+            out = revert_subset_edits(out, applied_for_s, sub)
+            audits.append(
+                {
+                    "pass": "polish_cluster",
+                    "path": "subset_revert",
+                    "surfaces": sorted(sub.surfaces),
+                    "canonical": sub.canonical,
+                    "reason": "cluster-channel edits landed non-unique writings",
+                }
+            )
+        audits.extend(leftover_mentions(out, sub, applied_for_s))
+    return out
+
+
 def _validate_polish_raw(
     raw: Any,
     *,
@@ -523,6 +677,7 @@ def _try_polish(
     meeting_hyps: list | dict | None = None,
     meeting_drafts: list | None = None,
     meeting_hyps_prompt: str = "(none)",
+    cluster_mappings: str = "(none)",
 ) -> tuple[dict | None, str | None]:
     try:
         raw = llm_judge.polish(
@@ -533,6 +688,7 @@ def _try_polish(
             unit_id=unit_id,
             hypotheses=hypotheses or [],
             meeting_hyps=meeting_hyps_prompt,
+            cluster_mappings=cluster_mappings,
         )
     except Exception as exc:  # noqa: BLE001
         return None, str(exc)
@@ -556,6 +712,7 @@ def _apply_polish_accepted(
     text: str,
     accepted: dict,
     batched: bool = False,
+    allow: dict[str, str] | None = None,
 ) -> bool:
     extra = {"batched": True} if batched else {}
     edits = accepted.get("edits") or []
@@ -597,10 +754,13 @@ def _apply_polish_accepted(
             audits[-1]["anchor"] = loc["anchor"]
         if loc.get("evidence"):
             audits[-1]["evidence"] = loc["evidence"]
+        audits[-1]["cluster_channel"] = bool(cluster_channel_edit(loc, allow or {}))
     return True
 
 
-def _jobs_for(chunk: list[dict], hotwords: list[str]) -> list[dict]:
+def _jobs_for(
+    chunk: list[dict], hotwords: list[str], cluster_mappings: str = "(none)"
+) -> list[dict]:
     return [
         {
             "text": p["text"],
@@ -610,6 +770,7 @@ def _jobs_for(chunk: list[dict], hotwords: list[str]) -> list[dict]:
             "unit_id": p["unit_id"],
             "hypotheses": p.get("hyps") or [],
             "meeting_hyps": p.get("meeting_hyps_prompt") or "(none)",
+            "cluster_mappings": cluster_mappings,
         }
         for p in chunk
     ]
@@ -624,6 +785,8 @@ def _run_polish_batched(
     llm_judge,
     cfg: PipelineConfig,
     hyp_by_turn: dict[int, list[Hypothesis]] | None = None,
+    allow: dict[str, str] | None = None,
+    cluster_mappings: str = "(none)",
 ) -> tuple[dict[int, str], list[dict]]:
     meeting = meeting_draft(turns, out)
     batch_size = max(1, int(getattr(cfg, "polish_batch_size", 1) or 1))
@@ -687,6 +850,7 @@ def _run_polish_batched(
                 text=p["text"],
                 accepted=accepted,
                 batched=True,
+                allow=allow,
             )
         return deferred
 
@@ -696,7 +860,9 @@ def _run_polish_batched(
         pending = pending[batch_size:]
         still = _accept_or_defer(
             chunk,
-            llm_judge.polish_many(_jobs_for(chunk, hotwords), max_workers=batch_size),
+            llm_judge.polish_many(
+                _jobs_for(chunk, hotwords, cluster_mappings), max_workers=batch_size
+            ),
             attempt=1,
         )
         backoff = float(getattr(cfg, "llm_retry_backoff_s", 0.0))
@@ -706,7 +872,10 @@ def _run_polish_batched(
             sleep_before_retry(attempt - 1, backoff)
             still = _accept_or_defer(
                 still,
-                llm_judge.polish_many(_jobs_for(still, hotwords), max_workers=batch_size),
+                llm_judge.polish_many(
+                    _jobs_for(still, hotwords, cluster_mappings),
+                    max_workers=batch_size,
+                ),
                 attempt=attempt,
             )
         for p in still:
@@ -731,11 +900,18 @@ def run_polish(
     hotwords: list[str] | None = None,
     config: PipelineConfig | None = None,
     hyp_by_turn: dict[int, list[Hypothesis]] | None = None,
+    hyp_records: list[dict] | None = None,
 ) -> tuple[dict[int, str], list[dict]]:
     """Minimal evidenced polish on the phonetic-final ASR text.
 
     Pass A/B span-local and pinyin caps do not apply. Validated span edits
     only; judgment.text is untrusted when edits are empty. ITN is disabled.
+
+    When `hyp_records` are given (and `cfg.polish_cluster` is on and the
+    judge exposes `partition_cluster`), homophone clusters are partitioned
+    first; approved entity subsets feed the prompt's cluster-mappings block,
+    cluster-channel tagging, and the post-pass subset hard check / leftover
+    report.
     """
     cfg = config or PipelineConfig()
     hotwords = hotwords or []
@@ -746,9 +922,13 @@ def run_polish(
     if llm_judge is None or not hasattr(llm_judge, "polish"):
         return out, audits
 
+    allow, approved_subsets, cluster_mappings = _cluster_partition(
+        llm_judge, hyp_records, cfg, audits
+    )
+
     batch_size = max(1, int(getattr(cfg, "polish_batch_size", 1) or 1))
     if batch_size > 1 and hasattr(llm_judge, "polish_many"):
-        return _run_polish_batched(
+        out, audits = _run_polish_batched(
             turns=turns,
             out=out,
             audits=audits,
@@ -756,7 +936,11 @@ def run_polish(
             llm_judge=llm_judge,
             cfg=cfg,
             hyp_by_turn=hyp_by_turn,
+            allow=allow,
+            cluster_mappings=cluster_mappings,
         )
+        out = _cluster_subset_sweep(out, audits, approved_subsets)
+        return out, audits
 
     meeting = meeting_draft(turns, out)
     for i, turn in enumerate(turns):
@@ -797,6 +981,7 @@ def run_polish(
                 meeting_hyps=hyp_by_turn,
                 meeting_drafts=meeting,
                 meeting_hyps_prompt=hyp_prompt,
+                cluster_mappings=cluster_mappings,
             )
             if raw is None:
                 last_err = err
@@ -824,8 +1009,10 @@ def run_polish(
             text=text,
             accepted=accepted,
             batched=False,
+            allow=allow,
         )
         if changed:
             meeting = meeting_draft(turns, out)
 
+    out = _cluster_subset_sweep(out, audits, approved_subsets)
     return out, audits
