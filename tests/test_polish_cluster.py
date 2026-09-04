@@ -26,8 +26,8 @@ def test_zhang_vs_zhang_chapter_pairs():
 
 def test_identical_hyps_no_cluster():
     recs = [
-        {"unit_id": "u0", "turn_indices": [0], "hyps": [{"model": "qwen", "text": "张三丰来了"}]},
-        {"unit_id": "u1", "turn_indices": [1], "hyps": [{"model": "moss", "text": "张三丰走了"}]},
+        {"unit_id": "u0", "turn_indices": [0], "hyps": [{"model": "qwen", "text": "张三丰"}]},
+        {"unit_id": "u1", "turn_indices": [1], "hyps": [{"model": "moss", "text": "张三丰"}]},
     ]
     assert build_homophone_clusters(recs) == []
 

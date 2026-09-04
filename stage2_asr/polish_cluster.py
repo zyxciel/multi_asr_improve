@@ -161,20 +161,6 @@ def build_homophone_clusters(hyp_records: list[dict]) -> list[HomophoneCluster]:
         if len(keys) < 2:
             continue
 
-        # Name-variant gate: a real name variant differs at the first or last
-        # Han character (wrong surname char or wrong final char — see spec §1
-        # reasoning for pairing rule (3)). If every surface shares the same
-        # first Han char AND the same last Han char, the differences are
-        # internal/context (e.g. `张三丰来了` vs `张三丰走了` share name `张三丰`
-        # and differ only in trailing verbs) — not a name-writing disagreement,
-        # so the cluster is dropped. This is a cluster-level gate, not a
-        # pairwise re-filter (spec: do not re-check pairwise distance inside
-        # the cluster after union-find).
-        first_chars = {s[0] for s in member_set}
-        last_chars = {s[-1] for s in member_set}
-        if len(first_chars) == 1 and len(last_chars) == 1:
-            continue
-
         # Tone mismatch pairs: all distinct surface pairs where TONE3 differs.
         tone_mismatch_pairs: list[tuple[str, str]] = []
         members_sorted = sorted(member_set)
