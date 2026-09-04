@@ -119,3 +119,93 @@ def test_false_multi_surface_empty_allow_list():
     raw = {"subsets": [{"surfaces": ["找张三丰", "签张三丰"], "canonical": None, "same_entity": False, "reason": "verbs"}]}
     subs = parse_partition_payload(raw, _cluster("找张三丰", "签张三丰"))
     assert cluster_allow_list(subs) == {}
+
+
+# --- Task 3: subset hard check + leftover warning ---
+
+from stage2_asr.polish_cluster import (
+    EntitySubset,
+    cluster_channel_edit,
+    leftover_mentions,
+    revert_subset_edits,
+    subset_edit_texts_unique,
+)
+
+
+def _subset(surfaces, canonical):
+    return EntitySubset(
+        surfaces=frozenset(surfaces),
+        canonical=canonical,
+        same_entity=True,
+        reason="test",
+    )
+
+
+def test_hard_check_reverts_only_that_subset():
+    subset_s = _subset({"欧阳娜", "欧阳娜娜"}, "欧阳娜娜")
+    subset_t = _subset({"赵六兆", "赵六照"}, "赵六照")
+    allow = cluster_allow_list([subset_s, subset_t])
+
+    # S edits: turn 0 landed canonical; turn 1 had two mentions, one landed
+    # canonical (length-changing) and one landed a wrong writing -> hard-check
+    # failure for S. T edit on turn 2 is a different subset and must stay.
+    applied = [
+        {"turn_index": 0, "span_asr": "欧阳娜", "span_out": "欧阳娜娜",
+         "start_char": 1, "end_char": 5},
+        {"turn_index": 1, "span_asr": "欧阳娜", "span_out": "欧阳娜娜",
+         "start_char": 0, "end_char": 4},
+        {"turn_index": 1, "span_asr": "欧阳娜", "span_out": "欧阳哪",
+         "start_char": 5, "end_char": 8},
+        {"turn_index": 2, "span_asr": "赵六兆", "span_out": "赵六照",
+         "start_char": 0, "end_char": 3},
+    ]
+    texts_after = {
+        0: "请欧阳娜娜发言。",
+        1: "欧阳娜娜和欧阳哪都来了。",
+        2: "赵六照也在场。",
+    }
+
+    applied_for_s = [a for a in applied if a["span_asr"] in subset_s.surfaces]
+    assert subset_edit_texts_unique(applied_for_s, "欧阳娜娜") is False
+    assert cluster_channel_edit(applied[0], allow) is True
+    assert cluster_channel_edit(applied[2], allow) is False  # wrong landed writing
+
+    reverted = revert_subset_edits(texts_after, applied, subset_s)
+    assert reverted == {
+        0: "请欧阳娜发言。",
+        1: "欧阳娜和欧阳娜都来了。",
+        2: "赵六照也在场。",  # other subset's landed edit stays
+    }
+    # The caller's mapping is not mutated.
+    assert texts_after[1] == "欧阳娜娜和欧阳哪都来了。"
+
+
+def test_leftover_unedited_does_not_fail_unique():
+    subset_s = _subset({"张三风", "涨三丰"}, "涨三丰")
+    # 3 mentions: turns 0 and 1 edited to canonical, turn 2 left unedited.
+    texts = {
+        0: "涨三丰先到。",
+        1: "大家问涨三丰好。",
+        2: "张三风最后走。",
+    }
+    applied_for_s = [
+        {"turn_index": 0, "span_asr": "张三风", "span_out": "涨三丰",
+         "start_char": 0, "end_char": 3},
+        {"turn_index": 1, "span_asr": "张三风", "span_out": "涨三丰",
+         "start_char": 3, "end_char": 6},
+    ]
+
+    # All landed edits are canonical: hard check passes, nothing to revert.
+    assert subset_edit_texts_unique(applied_for_s, "涨三丰") is True
+
+    # The unedited mention is a leftover warning, not a failure.
+    rows = leftover_mentions(texts, subset_s, applied_for_s)
+    assert rows == [
+        {
+            "pass": "polish_cluster",
+            "path": "leftover_mix",
+            "surfaces": ["张三风"],
+            "turn_index": 2,
+            "canonical": "涨三丰",
+        }
+    ]

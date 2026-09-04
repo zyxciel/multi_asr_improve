@@ -177,6 +177,126 @@ def _tone_mismatch(a: str, b: str) -> bool:
     return to_pinyin(a, tone=True) != to_pinyin(b, tone=True)
 
 
+# --- Task 3: entity-subset hard check + leftover warning (spec §4) ---
+#
+# Applied-edit audits carry: turn_index, span_asr, span_out, start_char,
+# end_char (coordinates are AFTER the edit was applied to the turn text).
+
+
+def cluster_channel_edit(edit: dict, allow: dict[str, str]) -> bool:
+    """True iff the edit used the cluster allow-list exactly as granted.
+
+    ``span_asr`` must be an allow-listed surface and ``span_out`` must be the
+    canonical that surface maps to. An edit that touched a subset surface but
+    landed a different writing is NOT a cluster-channel edit by this
+    predicate (it is what the hard check exists to catch).
+    """
+    span_asr = str(edit.get("span_asr"))
+    if span_asr not in allow:
+        return False
+    return str(edit.get("span_out")) == allow[span_asr]
+
+
+def subset_edit_texts_unique(applied_for_s: list[dict], canonical: str) -> bool:
+    """Hard check: every landed cluster-channel edit for subset S is canonical."""
+    return all(str(a.get("span_out")) == canonical for a in applied_for_s)
+
+
+def revert_subset_edits(
+    texts: dict[int, str], applied: list[dict], subset: EntitySubset
+) -> dict[int, str]:
+    """Undo the cluster-channel edits of one subset, leave everything else.
+
+    For each audit whose ``span_asr`` is in ``subset.surfaces``, put
+    ``span_asr`` back at ``start_char``, replacing the ``len(span_out)``
+    characters that the edit landed. Audits are reverted per turn in
+    DESCENDING ``start_char`` order so that reverting a later span (whose
+    length may differ from the original) never shifts the coordinates of an
+    earlier span that is still pending revert. Audits from other subsets and
+    non-cluster edits are untouched. If the current text at the recorded
+    coordinates no longer equals ``span_out``, that audit is skipped (a blind
+    splice would corrupt drifted text).
+
+    Returns a new dict; ``texts`` is not mutated.
+    """
+    out = dict(texts)
+    per_turn: dict[int, list[dict]] = {}
+    for a in applied:
+        if str(a.get("span_asr")) not in subset.surfaces:
+            continue
+        turn = a.get("turn_index")
+        start = a.get("start_char")
+        if not isinstance(turn, int) or not isinstance(start, int):
+            continue
+        if turn not in out:
+            continue
+        per_turn.setdefault(turn, []).append(a)
+
+    for turn, audits in per_turn.items():
+        text = out[turn]
+        for a in sorted(audits, key=lambda x: x["start_char"], reverse=True):
+            start = a["start_char"]
+            span_asr = str(a.get("span_asr"))
+            span_out = str(a.get("span_out"))
+            end = start + len(span_out)
+            if text[start:end] != span_out:
+                continue
+            text = text[:start] + span_asr + text[end:]
+        out[turn] = text
+    return out
+
+
+def leftover_mentions(
+    texts: dict[int, str], subset: EntitySubset, applied_for_s: list[dict]
+) -> list[dict]:
+    """Warning rows for subset surfaces still visible in the final texts.
+
+    A turn is flagged when a non-canonical surface of ``subset`` still occurs
+    as a substring OUTSIDE spans that were replaced by cluster-channel edits
+    to canonical (those spans are fully replaced by definition). Unedited
+    mentions are mention autonomy, not a hard failure: they are reported, not
+    reverted. Occurrences of the canonical itself never flag a turn.
+    """
+    canonical = subset.canonical
+    # Spans per turn that were fully replaced by edits landing canonical.
+    replaced: dict[int, list[tuple[int, int]]] = {}
+    for a in applied_for_s:
+        span_out = str(a.get("span_out"))
+        if canonical is None or span_out != canonical:
+            continue
+        turn = a.get("turn_index")
+        start = a.get("start_char")
+        if not isinstance(turn, int) or not isinstance(start, int):
+            continue
+        replaced.setdefault(turn, []).append((start, start + len(span_out)))
+
+    candidates = sorted(s for s in subset.surfaces if s != canonical)
+    rows: list[dict] = []
+    for i in sorted(texts):
+        text = texts[i]
+        spans = replaced.get(i, [])
+        found: list[str] = []
+        for s in candidates:
+            idx = text.find(s)
+            while idx != -1:
+                covered = any(a <= idx and idx + len(s) <= b for a, b in spans)
+                if not covered:
+                    found.append(s)
+                    break
+                idx = text.find(s, idx + 1)
+        if found:
+            rows.append(
+                {
+                    "pass": "polish_cluster",
+                    "path": "leftover_mix",
+                    "surfaces": found,
+                    "turn_index": i,
+                    "canonical": canonical,
+                }
+            )
+    return rows
+
+
 class _UnionFind:
     def __init__(self) -> None:
         self.parent: dict[str, str] = {}
