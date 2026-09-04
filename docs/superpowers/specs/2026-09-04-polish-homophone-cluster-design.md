@@ -65,7 +65,7 @@ From each hyp text, take contiguous CJK **runs** (maximal sequences of Han chara
 - its CJK length ≥ 3, and
 - it appears as a **complete run** in at least one hyp in the meeting (the run as stored, not a proper substring of a longer run).
 
-Do **not** emit every 3–6 character sliding window. Windows share the suffix/prefix pattern of real name variants (`找张三丰` vs `签张三丰` matches first-char-diff / last-char-same / distance 1, the same shape as `涨三丰` / `张三丰`) and can pass the entity validator after rewriting a verb. Full-run filtering removes that class. True names that ASR emitted as their own run (`涨三丰`, `张三丰`) still qualify.
+Do **not** emit every 3–6 character sliding window. Windows share the suffix/prefix pattern of real name variants (`找张三丰` vs `签张三丰` as **substrings** of a longer run) and can pass the entity validator after rewriting a verb. Full-run filtering **removes the common sliding-window class**. Residual risk remains: if two engines emit `找张三丰` and `签张三丰` as **complete runs** (punctuation/tokenization boundaries), they can still pair; that case is left to partition (context snippets) and span edit (neighbors), not to construction. True names that ASR emitted as their own run (`涨三丰`, `张三风`) still qualify.
 
 Latin-only tokens are out of v1 (codeswitch already has `hyp` / `meeting_hyp`).
 
@@ -75,8 +75,10 @@ Two **eligible** surfaces `A`, `B` may share a cluster only if **all** of:
 
 1. CJK length ≥ 3 on both.
 2. Toneless `pinyin_edit_distance(A, B) ≤ 2` (same numeric cap as Pass A; uses existing `pinyin_util.pinyin_edit_distance`).
-3. They share a **character** prefix or suffix of at least one Han character (first char equal **or** last char equal). Homophone surnames written with different characters (`张` vs `章`) are **not** paired. Missed recall is accepted; false merge is not.
+3. They share a **toneless pinyin syllable** prefix or suffix: first syllable equal **or** last syllable equal (`to_pinyin(..., tone=False)` split on spaces). Compare syllables, not Han characters. This is what makes the flagship pair reachable: `张三风` / `涨三丰` share first syllable `zhang` even though 张≠涨 and 风≠丰. Character-level first-or-last would only recall mid-string edits and would **exclude** the typical ASR name pattern (wrong surname character or wrong final character).
 4. Extra brake: `dist / max(syllable_count(A), syllable_count(B), 1) ≤ 2/3`. Three-syllable pairs at distance 2 remain possible; long names at distance 2 stay easy.
+
+Short homophones stay out via length ≥ 3 (`会议` / `会意` are two characters). Construction does **not** block homophone surnames written with different characters (`张三丰` vs `章三丰`): first syllable `zhang` matches, last syllable `feng` matches, distance 0 → they **enter the cluster**. Partition plus span-edit context plus the validator decide whether that is two people or one name's variant. Hard-blocking 张/章 at construction would also block 张/涨.
 
 **Transitive closure** of pairing builds a cluster. Surfaces inside one cluster need **not** all pairwise satisfy (1)–(4): if A–B and B–C are legal edges, A and C join the same bag even when `pinyin_edit_distance(A, C) > 2`. That is intended. Partition splits the bag; implementations must **not** secretly drop A–C pairs by re-checking pairwise distance inside the cluster.
 
@@ -194,8 +196,10 @@ Subsets that never produced edits are not hard-checked for uniqueness (nothing t
 
 - Construction: 20 identical hyp surfaces → no cluster; two writings across units/engines → one cluster.
 - Length 2 homophones (`意图`/`音图`) never cluster.
-- `张` vs `章` names do not pair (character affix, not pinyin surname).
-- **Full-run filter:** hyp A `找张三丰签字`, hyp B `签张三丰` must **not** yield a cluster (or pair) on windows `找张三丰` / `签张三丰`. Eligible members if any are the full runs, which must fail pairing or the disagreement-of-names gate without creating a verb-rewrite cluster.
+- Flagship pair: full runs `张三风` and `涨三丰` (different engines or units) **must** form a kept cluster (first syllable `zhang`).
+- `张三丰` vs `章三丰` **do pair** into a cluster (same first/last syllable). Construction must not drop them. Partition (mock) may split; they must not be auto-unified without a `same_entity: true` subset.
+- **Full-run filter:** from hyp A `找张三丰签字` and hyp B `签张三丰`, sliding windows `找张三丰` / `签张三丰` are **not** members. Eligible surfaces are the full runs `找张三丰签字` and `签张三丰`, which do not pair (first syllables differ, last syllables 字 vs 丰 differ).
+- **Full-run residual:** hyps that **are** the complete runs `找张三丰` and `签张三丰` (last syllable `feng` matches) **may** cluster. A mock partition must be able to mark `same_entity: false` (or omit a unify subset). Tests must not require construction to drop this pair; they must require partition/span-edit to refuse verb rewrite.
 - **Transitive closure:** A–B and B–C legal, A–C distance > 2 → one cluster still; partition (or a mock partition) may split; construction must not drop C by pairwise revalidation.
 - Partition invalid canonical (not in subset surfaces) → subset dropped.
 - **Coverage:** partition omits a cluster surface → omitted surface has no allow-list permission.
@@ -216,3 +220,4 @@ Subsets that never produced edits are not hard-checked for uniqueness (nothing t
 5. Phonetic WER artifact is never written by this pass.
 6. Sliding-window substrings of a longer CJK run are never cluster members.
 7. Unlisted partition surfaces and `same_entity: false` surfaces have no cluster-channel unify permission.
+8. Pairing affix is toneless **pinyin syllable** (first or last), not Han character identity.
