@@ -290,6 +290,35 @@ def test_mock_partition_fn_override_used_when_set():
     assert allow == {"张三风": "涨三丰", "涨三丰": "涨三丰"}
 
 
+def test_qwen_polish_many_passes_cluster_mappings():
+    """Qwen36LlmJudge.polish_many threads cluster_mappings into the user prompt."""
+    from stage2_asr.runners.llm_qwen36 import Qwen36LlmJudge
+
+    captured_users: list[str] = []
+
+    def gen(system, user):
+        captured_users.append(user)
+        return '{"text": "涨三丰", "edits": []}'
+
+    judge = Qwen36LlmJudge(enabled=False, generate_fn=gen)
+    mapping = "张三风|涨三丰 → 涨三丰"
+    jobs = [
+        {
+            "unit_id": "u0",
+            "text": "张三风来了",
+            "neighbor_draft": [],
+            "hotwords": [],
+            "turn_index": 0,
+            "hypotheses": [],
+            "meeting_hyps": "(none)",
+            "cluster_mappings": mapping,
+        }
+    ]
+    judge.polish_many(jobs, max_workers=1)
+    assert captured_users
+    assert mapping in captured_users[0]
+
+
 def test_qwen_partition_cluster_uses_polish_cluster_pass_with_thinking_on():
     """Qwen36LlmJudge.partition_cluster calls _generate with
     pass_name='polish_cluster', enable_thinking=True, max_tokens=2048."""

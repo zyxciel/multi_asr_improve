@@ -353,6 +353,7 @@ class Qwen36LlmJudge:
                 turn_index=int(job.get("turn_index") or 0),
                 hypotheses=format_polish_hypotheses(job.get("hypotheses")),
                 meeting_hyps=str(job.get("meeting_hyps") or "(none)"),
+                cluster_mappings=str(job.get("cluster_mappings") or "(none)"),
             )
             prompts_meta.append((str(job.get("unit_id", "")), user))
         return self._complete_many(
