@@ -111,6 +111,14 @@ def _add_common_run_args(p: argparse.ArgumentParser) -> None:
         ),
     )
     p.add_argument(
+        "--no-polish-cluster",
+        action="store_true",
+        help=(
+            "Disable homophone-cluster partition before polish (default: on for polish/all). "
+            "Restores pre-cluster (2026-09-04) polish for A/B display output."
+        ),
+    )
+    p.add_argument(
         "--glossary",
         default=None,
         help=(
@@ -235,6 +243,7 @@ def _pipeline_config(args: argparse.Namespace) -> PipelineConfig:
         pass_a_batch_size=max(1, int(args.pass_a_batch_size)),
         pass_b_batch_size=max(1, int(getattr(args, "pass_b_batch_size", 1))),
         polish_batch_size=max(1, int(getattr(args, "polish_batch_size", 1))),
+        polish_cluster=not bool(getattr(args, "no_polish_cluster", False)),
         publish_batch_size=max(1, int(getattr(args, "publish_batch_size", 1))),
         publish_eval=not bool(getattr(args, "no_publish_eval", False)),
         publish_eval_thinking=not bool(getattr(args, "no_publish_eval_thinking", False)),
