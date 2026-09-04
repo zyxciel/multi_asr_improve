@@ -93,7 +93,7 @@ Moss Mode-C text counts as a hyp model (`moss`) when present.
 
 ### Tone annotation (not a hard reject)
 
-`to_pinyin(text, tone=True)` (TONE3) already exists; Pass A stays `tone=False`. For each pair in a kept cluster, if toneless distance is small but TONE3 strings differ, mark the pair `tone_mismatch: true` in the partition prompt. Partition should be more willing to split those pairs. Do not drop them from recall solely for tone.
+`to_pinyin(text, tone=True)` (TONE3) already exists; Pass A stays `tone=False`. For each pair in a kept cluster, if toneless distance is small but TONE3 strings differ, mark the pair `tone_mismatch: true` in the partition prompt. Treat tone-mismatch as **one weak signal** among context and co-occurrence; **do not weight it above contextual evidence**. Surname variants often differ in tone (`张` zhang1 vs `涨` zhang3); instructing the model to prefer splitting on tone-mismatch would systematically suppress true unifications. Do not drop pairs from recall solely for tone.
 
 ## 2. Partition call (one per kept cluster)
 
@@ -199,7 +199,7 @@ Subsets that never produced edits are not hard-checked for uniqueness (nothing t
 - Flagship pair: full runs `张三风` and `涨三丰` (different engines or units) **must** form a kept cluster (first syllable `zhang`).
 - `张三丰` vs `章三丰` **do pair** into a cluster (same first/last syllable). Construction must not drop them. Partition (mock) may split; they must not be auto-unified without a `same_entity: true` subset.
 - **Full-run filter:** from hyp A `找张三丰签字` and hyp B `签张三丰`, sliding windows `找张三丰` / `签张三丰` are **not** members. Eligible surfaces are the full runs `找张三丰签字` and `签张三丰`, which do not pair (first syllables differ, last syllables 字 vs 丰 differ).
-- **Full-run residual:** hyps that **are** the complete runs `找张三丰` and `签张三丰` (last syllable `feng` matches) **may** cluster. A mock partition must be able to mark `same_entity: false` (or omit a unify subset). Tests must not require construction to drop this pair; they must require partition/span-edit to refuse verb rewrite.
+- **Full-run residual:** hyps that **are** the complete runs `找张三丰` and `签张三丰` (last syllable `feng` matches) **may** cluster. Drive the test with a **mock partition** that returns a `same_entity: false` group (or omits a unify subset). Assert the cluster-channel **allow-list is empty** for those surfaces — this is a permission test, not a live-LLM judgment. Do not require construction to drop the pair.
 - **Transitive closure:** A–B and B–C legal, A–C distance > 2 → one cluster still; partition (or a mock partition) may split; construction must not drop C by pairwise revalidation.
 - Partition invalid canonical (not in subset surfaces) → subset dropped.
 - **Coverage:** partition omits a cluster surface → omitted surface has no allow-list permission.
