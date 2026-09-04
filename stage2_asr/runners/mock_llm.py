@@ -43,6 +43,8 @@ class MockLlmJudge:
 
     def __init__(self):
         self._calls: dict[str, int] = {}
+        # Optional override for tests; when set, partition_cluster calls it.
+        self.partition_fn = None
 
     def judge(
         self,
@@ -224,6 +226,18 @@ class MockLlmJudge:
     def polish_many(self, jobs: list[dict], *, max_workers: int = 8) -> list[dict]:
         _ = max_workers
         return [self.polish(**job) for job in jobs]
+
+    def partition_cluster(self, **kwargs) -> dict:
+        """Mock partition: default empty subsets (no cluster-channel permission).
+
+        If `self.partition_fn` is set (a callable), it is invoked with the
+        kwargs and its return value is used; this lets tests drive specific
+        partition outcomes (e.g. `same_entity: true` for an approved subset,
+        or a `same_entity: false` multi-surface group).
+        """
+        if self.partition_fn is not None:
+            return self.partition_fn(**kwargs)
+        return {"subsets": []}
 
     def publish(
         self,

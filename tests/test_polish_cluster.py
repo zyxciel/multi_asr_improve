@@ -209,3 +209,111 @@ def test_leftover_unedited_does_not_fail_unique():
             "canonical": "涨三丰",
         }
     ]
+
+
+# --- Task 4: partition prompt + judge methods ---
+
+from stage2_asr.polish_cluster_prompt import (
+    PARTITION_SYSTEM_PROMPT,
+    render_partition_user_prompt,
+)
+from stage2_asr.runners.mock_llm import MockLlmJudge
+
+
+def _cluster_with_hits(*surfaces: str) -> HomophoneCluster:
+    hits = []
+    for i, s in enumerate(surfaces):
+        hits.append(
+            {
+                "surface": s,
+                "model": "qwen" if i % 2 == 0 else "moss",
+                "unit_id": f"u{i}",
+                "turn_indices": [i],
+                "hyp_text": s,
+            }
+        )
+    return HomophoneCluster(
+        cluster_id="c0",
+        surfaces=tuple(surfaces),
+        hits=hits,
+        tone_mismatch_pairs=[(surfaces[0], surfaces[1])] if len(surfaces) >= 2 else [],
+    )
+
+
+def test_partition_prompt_tone_is_weak():
+    """The partition prompt blob must treat tone-mismatch as a WEAK signal.
+
+    It must contain `weak` and `do not weight` (English) and must NOT contain
+    the forbidden phrase `more willing to split` (which would push the model
+    to split on tone alone, suppressing true surname-variant unifications).
+    """
+    cluster = _cluster_with_hits("张三风", "涨三丰")
+    user = render_partition_user_prompt(cluster=cluster)
+    blob = (PARTITION_SYSTEM_PROMPT + "\n" + user).lower()
+
+    assert "weak" in blob
+    assert "do not weight" in blob
+    assert "more willing to split" not in blob
+
+
+def test_mock_partition_default_empty_allow_list():
+    """MockLlmJudge.partition_cluster default -> empty subsets -> empty allow-list."""
+    cluster = _cluster_with_hits("张三风", "涨三丰")
+    mock = MockLlmJudge()
+    raw = mock.partition_cluster(cluster=cluster, unit_id="u0")
+    subsets = parse_partition_payload(raw, cluster)
+    assert cluster_allow_list(subsets) == {}
+    assert raw == {"subsets": []}
+
+
+def test_mock_partition_fn_override_used_when_set():
+    """When self.partition_fn is set, MockLlmJudge.partition_cluster calls it."""
+    cluster = _cluster_with_hits("张三风", "涨三丰")
+
+    def fake_fn(**kwargs):
+        return {
+            "subsets": [
+                {
+                    "surfaces": ["张三风", "涨三丰"],
+                    "canonical": "涨三丰",
+                    "same_entity": True,
+                    "reason": "same person",
+                }
+            ]
+        }
+
+    mock = MockLlmJudge()
+    mock.partition_fn = fake_fn
+    raw = mock.partition_cluster(cluster=cluster, unit_id="u0")
+    subsets = parse_partition_payload(raw, cluster)
+    allow = cluster_allow_list(subsets)
+    assert allow == {"张三风": "涨三丰", "涨三丰": "涨三丰"}
+
+
+def test_qwen_partition_cluster_uses_polish_cluster_pass_with_thinking_on():
+    """Qwen36LlmJudge.partition_cluster calls _generate with
+    pass_name='polish_cluster', enable_thinking=True, max_tokens=2048."""
+    from stage2_asr.runners.llm_qwen36 import Qwen36LlmJudge
+
+    logs: list[dict] = []
+    captured: dict = {}
+
+    def gen(system, user):
+        captured["system"] = system
+        captured["user"] = user
+        return '{"subsets": []}'
+
+    judge = Qwen36LlmJudge(enabled=True, generate_fn=gen, log_fn=logs.append)
+    cluster = _cluster_with_hits("张三风", "涨三丰")
+    out = judge.partition_cluster(cluster=cluster, unit_id="pc0")
+    assert out == {"subsets": []}
+
+    pc_logs = [e for e in logs if e.get("pass") == "polish_cluster"]
+    assert pc_logs, "expected a polish_cluster log row"
+    assert pc_logs[0].get("enable_thinking") is True
+    assert pc_logs[0].get("max_tokens") == 2048
+    assert pc_logs[0].get("unit_id") == "pc0"
+    # The prompt blob must still carry the weak-signal instruction.
+    blob = (captured["system"] + "\n" + captured["user"]).lower()
+    assert "weak" in blob
+    assert "do not weight" in blob

@@ -23,6 +23,11 @@ from stage2_asr.polish_prompt import (
     format_polish_hypotheses,
     render_polish_user_prompt,
 )
+from stage2_asr.polish_cluster import HomophoneCluster
+from stage2_asr.polish_cluster_prompt import (
+    PARTITION_SYSTEM_PROMPT,
+    render_partition_user_prompt,
+)
 from stage2_asr.publish_prompt import (
     EXTRACT_SYSTEM_PROMPT,
     EVAL_SYSTEM_PROMPT,
@@ -186,6 +191,42 @@ class Qwen36LlmJudge:
             user,
             unit_id=unit_id,
             pass_name="polish",
+            max_tokens=2048,
+        )
+        return self._parse_json(raw_text)
+
+    def partition_cluster(
+        self,
+        *,
+        cluster: "HomophoneCluster | dict",
+        unit_id: str = "",
+    ) -> dict:
+        """Partition one homophone cluster into entity subsets (spec §2).
+
+        One LLM call per cluster. Thinking is ON for this pass only
+        (`pass_name="polish_cluster"`, `enable_thinking=True`,
+        `max_tokens=2048`), independent of polish span-edit generation which
+        keeps thinking off.
+
+        Callers should pass a `HomophoneCluster` (preferred) so occurrences
+        and snippets can be rendered. A dict is accepted minimally: it must
+        expose the same attributes (`cluster_id`, `surfaces`, `hits`,
+        `tone_mismatch_pairs`) and is wrapped into a `HomophoneCluster`.
+        """
+        if isinstance(cluster, dict):
+            cluster = HomophoneCluster(
+                cluster_id=str(cluster.get("cluster_id", "")),
+                surfaces=tuple(cluster.get("surfaces", ())),
+                hits=list(cluster.get("hits", [])),
+                tone_mismatch_pairs=list(cluster.get("tone_mismatch_pairs", [])),
+            )
+        user = render_partition_user_prompt(cluster=cluster)
+        raw_text = self._generate(
+            PARTITION_SYSTEM_PROMPT,
+            user,
+            unit_id=unit_id,
+            pass_name="polish_cluster",
+            enable_thinking=True,
             max_tokens=2048,
         )
         return self._parse_json(raw_text)
