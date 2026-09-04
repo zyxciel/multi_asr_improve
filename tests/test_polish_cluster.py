@@ -82,3 +82,40 @@ def test_transitive_closure_keeps_distant_pair():
     clusters = build_homophone_clusters(recs)
     assert len(clusters) == 1
     assert set(clusters[0].surfaces) == {"张三风", "涨三丰", "章三丰"}
+
+
+# --- Task 2: parse partition payload -> allow-list ---
+
+from stage2_asr.polish_cluster import (
+    HomophoneCluster,
+    cluster_allow_list,
+    parse_partition_payload,
+)
+
+
+def _cluster(*surfaces: str) -> HomophoneCluster:
+    return HomophoneCluster(
+        cluster_id="c0",
+        surfaces=tuple(surfaces),
+        hits=[],
+        tone_mismatch_pairs=[],
+    )
+
+
+def test_parse_drops_canonical_not_in_subset():
+    raw = {"subsets": [{"surfaces": ["张三风", "涨三丰"], "canonical": "张三丰", "same_entity": True, "reason": "x"}]}
+    assert parse_partition_payload(raw, _cluster("张三风", "涨三丰")) == []
+
+
+def test_parse_unlisted_surface_not_in_allow_list():
+    raw = {"subsets": [{"surfaces": ["张三风", "涨三丰"], "canonical": "涨三丰", "same_entity": True, "reason": "x"}]}
+    subs = parse_partition_payload(raw, _cluster("张三风", "涨三丰", "张三峰"))
+    allow = cluster_allow_list(subs)
+    assert allow.get("张三风") == "涨三丰"
+    assert "张三峰" not in allow
+
+
+def test_false_multi_surface_empty_allow_list():
+    raw = {"subsets": [{"surfaces": ["找张三丰", "签张三丰"], "canonical": None, "same_entity": False, "reason": "verbs"}]}
+    subs = parse_partition_payload(raw, _cluster("找张三丰", "签张三丰"))
+    assert cluster_allow_list(subs) == {}

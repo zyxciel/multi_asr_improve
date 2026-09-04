@@ -74,6 +74,105 @@ class HomophoneCluster:
     tone_mismatch_pairs: list[tuple[str, str]] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class EntitySubset:
+    """One subset of a homophone cluster after LLM partition.
+
+    - `surfaces`: the writings grouped together by the partitioner.
+    - `canonical`: the chosen canonical writing (None when `same_entity` is
+      False, or when the partitioner declined to pick one).
+    - `same_entity`: whether the subset is one entity (merge) or distinct
+      entities (do not merge).
+    - `reason`: free-form partitioner rationale (may be empty).
+    """
+
+    surfaces: frozenset[str]
+    canonical: str | None
+    same_entity: bool
+    reason: str
+
+
+def parse_partition_payload(
+    raw: dict | None, cluster: HomophoneCluster
+) -> list[EntitySubset]:
+    """Parse a partition payload into a list of `EntitySubset`.
+
+    Robust to malformed input: invalid JSON/type -> ``[]``.
+
+    Rules:
+    - `same_entity: true` without a `canonical` that is in that subset's
+      surfaces -> drop that subset.
+    - Surfaces not listed in any subset are not returned (implicit
+      no-permission singletons).
+    - `same_entity` accepts JSON true/false. Empty `reason` is ok. Unknown
+      keys are ignored.
+    """
+    if not isinstance(raw, dict):
+        return []
+    subsets_raw = raw.get("subsets")
+    if not isinstance(subsets_raw, list):
+        return []
+
+    cluster_surfaces = set(cluster.surfaces)
+    out: list[EntitySubset] = []
+    for entry in subsets_raw:
+        if not isinstance(entry, dict):
+            continue
+        surfaces_raw = entry.get("surfaces")
+        if not isinstance(surfaces_raw, list):
+            continue
+        # Keep only string surfaces that are members of the cluster.
+        surfaces = frozenset(
+            s for s in surfaces_raw if isinstance(s, str) and s in cluster_surfaces
+        )
+        if not surfaces:
+            continue
+
+        canonical = entry.get("canonical")
+        if canonical is not None and not isinstance(canonical, str):
+            continue
+        if canonical is not None and canonical not in cluster_surfaces:
+            canonical = None
+
+        same_entity = entry.get("same_entity", False)
+        if not isinstance(same_entity, bool):
+            continue
+
+        reason = entry.get("reason", "")
+        if not isinstance(reason, str):
+            reason = ""
+
+        # same_entity=True requires a canonical that is in this subset's surfaces.
+        if same_entity and (canonical is None or canonical not in surfaces):
+            continue
+
+        out.append(
+            EntitySubset(
+                surfaces=surfaces,
+                canonical=canonical,
+                same_entity=same_entity,
+                reason=reason,
+            )
+        )
+    return out
+
+
+def cluster_allow_list(subsets: list[EntitySubset]) -> dict[str, str]:
+    """Build the polish allow-list from entity subsets.
+
+    For each `same_entity` subset, map every surface in the subset (including
+    the canonical itself, ``canonical -> canonical``) to the canonical.
+    `same_entity: false` surfaces are not included.
+    """
+    allow: dict[str, str] = {}
+    for sub in subsets:
+        if not sub.same_entity or sub.canonical is None:
+            continue
+        for s in sub.surfaces:
+            allow[s] = sub.canonical
+    return allow
+
+
 def _tone_mismatch(a: str, b: str) -> bool:
     return to_pinyin(a, tone=True) != to_pinyin(b, tone=True)
 
