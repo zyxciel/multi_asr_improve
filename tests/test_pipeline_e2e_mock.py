@@ -119,7 +119,32 @@ def test_pass_a_retry_then_fallback():
         config=PipelineConfig(llm_max_retries=2),
     )
     assert text == "你好"
-    assert audit["retries"] >= 1
+    assert audit["retries"] == 1
+
+
+def test_pass_a_exhausted_retries_equals_max_retries():
+    from stage2_asr.pass_a import run_pass_a_for_unit
+    from stage2_asr.types import Hypothesis, Turn
+
+    unit = AsrUnit("u", 0, 1, "s0", [0])
+    turns = [Turn(0, 1, "s0", "你好")]
+    hyps = [Hypothesis("moss", "你好"), Hypothesis("qwen", "您好")]
+
+    class AlwaysBad:
+        def judge(self, **kwargs):
+            return {"text": "only"}
+
+    _, audit = run_pass_a_for_unit(
+        unit=unit,
+        turns=turns,
+        hyps=hyps,
+        draft_texts={0: "你好"},
+        llm_judge=AlwaysBad(),
+        hotwords=[],
+        config=PipelineConfig(llm_max_retries=2),
+    )
+    assert audit["fallback"] is True
+    assert audit["retries"] == 2
 
 
 def _read_hyp_records(path: Path) -> list[dict]:
@@ -420,3 +445,192 @@ def test_pass_b_stage_preserves_pass_a_artifacts(tmp_path: Path):
     assert any(e.get("pass") == "A" for e in edits)
     stats = json.loads((out / "pass_stats.json").read_text(encoding="utf-8"))
     assert "pass_a" in stats and "pass_b" in stats
+
+
+def test_stage_llm_keeps_polish_audits_and_stats(tmp_path: Path):
+    out = tmp_path / "work"
+    common = dict(
+        input_json=FIXTURES / "mode_c.json",
+        audio_path=tmp_path / "missing.wav",
+        work_dir=out,
+        asr_runner=MockAsrRunner(),
+        llm_judge=MockLlmJudge(),
+        config=PipelineConfig(),
+        hotwords=["单框架|单方接"],
+    )
+    run_pipeline(**common, stage="all")
+    edits_path = out / "llm_edits.jsonl"
+    with edits_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({"pass": "polish", "path": "seed", "turn_index": 0}, ensure_ascii=False) + "\n")
+    stats_path = out / "pass_stats.json"
+    stats_before = json.loads(stats_path.read_text(encoding="utf-8"))
+    stats_before.setdefault("polish", {"n_audits": 1})
+    stats_path.write_text(json.dumps(stats_before, ensure_ascii=False, indent=2), encoding="utf-8")
+    before = [
+        json.loads(line)
+        for line in edits_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert any(e.get("pass") == "polish" for e in before)
+
+    run_pipeline(**common, stage="llm")
+    after = [
+        json.loads(line)
+        for line in (out / "llm_edits.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert any(e.get("pass") == "polish" for e in after)
+    assert any(e.get("pass") == "A" for e in after)
+    stats = json.loads((out / "pass_stats.json").read_text(encoding="utf-8"))
+    assert "polish" in stats
+    assert "pass_a" in stats and "pass_b" in stats
+
+
+def test_asr_cache_hit_refreshes_moss_from_mode_c(tmp_path: Path):
+    out = tmp_path / "work"
+    audio = tmp_path / "missing.wav"
+    run_pipeline(
+        input_json=FIXTURES / "mode_c.json",
+        audio_path=audio,
+        work_dir=out,
+        asr_runner=MockAsrRunner(),
+        llm_judge=MockLlmJudge(),
+        config=PipelineConfig(),
+        stage="asr",
+        asr_models=["moss"],
+    )
+    cache_dir = out / "asr_cache"
+    stale = "STALE_MOSS_CACHE_TEXT"
+    for cache in cache_dir.glob("*.json"):
+        payload = json.loads(cache.read_text(encoding="utf-8"))
+        for h in payload:
+            if isinstance(h, dict) and h.get("model") == "moss":
+                h["text"] = stale
+        cache.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    run_pipeline(
+        input_json=FIXTURES / "mode_c.json",
+        audio_path=audio,
+        work_dir=out,
+        asr_runner=MockAsrRunner(),
+        llm_judge=MockLlmJudge(),
+        config=PipelineConfig(),
+        stage="asr",
+        asr_models=["moss"],
+    )
+    records = _read_hyp_records(out / "asr_hypotheses.json")
+    moss_texts = [
+        h.get("text")
+        for r in records
+        if not r.get("skipped")
+        for h in (r.get("hyps") or [])
+        if h.get("model") == "moss"
+    ]
+    assert moss_texts
+    assert all(stale not in (t or "") for t in moss_texts)
+    mode_c = json.loads((FIXTURES / "mode_c.json").read_text(encoding="utf-8"))
+    first = (mode_c["turns"][0]["text"] or "").strip()
+    assert any(first and first in (t or "") for t in moss_texts)
+
+
+def test_asr_rebuilds_units_when_mode_c_gains_a_turn(tmp_path: Path):
+    src = json.loads((FIXTURES / "mode_c.json").read_text(encoding="utf-8"))
+    first = tmp_path / "mode_c.json"
+    first.write_text(json.dumps(src, ensure_ascii=False), encoding="utf-8")
+    out = tmp_path / "work"
+    audio = tmp_path / "missing.wav"
+    common = dict(
+        audio_path=audio,
+        work_dir=out,
+        asr_runner=MockAsrRunner(),
+        llm_judge=MockLlmJudge(),
+        config=PipelineConfig(),
+        stage="asr",
+        asr_models=["moss"],
+    )
+    run_pipeline(input_json=first, **common)
+    units1 = json.loads((out / "asr_units.json").read_text(encoding="utf-8"))
+    n1 = len(units1["units"])
+    assert units1.get("source_fingerprint")
+
+    src["turns"].append(
+        {
+            "start": 100.0,
+            "end": 102.0,
+            "speaker_id": "speaker_new",
+            "text": "新增一句用于指纹失效",
+            "asr_status": "provisional",
+            "source": "fused",
+            "confidence": 0.9,
+        }
+    )
+    second = tmp_path / "mode_c2.json"
+    second.write_text(json.dumps(src, ensure_ascii=False), encoding="utf-8")
+    run_pipeline(input_json=second, **common)
+    units2 = json.loads((out / "asr_units.json").read_text(encoding="utf-8"))
+    assert units2.get("source_fingerprint") != units1.get("source_fingerprint")
+    assert len(units2["units"]) > n1
+    records = _read_hyp_records(out / "asr_hypotheses.json")
+    moss_blob = " ".join(
+        h.get("text") or ""
+        for r in records
+        for h in (r.get("hyps") or [])
+        if h.get("model") == "moss"
+    )
+    assert "新增一句用于指纹失效" in moss_blob
+
+
+def test_pass_a_rejects_stale_units_fingerprint(tmp_path: Path):
+    src = json.loads((FIXTURES / "mode_c.json").read_text(encoding="utf-8"))
+    first = tmp_path / "mode_c.json"
+    first.write_text(json.dumps(src, ensure_ascii=False), encoding="utf-8")
+    out = tmp_path / "work"
+    audio = tmp_path / "missing.wav"
+    common = dict(
+        audio_path=audio,
+        work_dir=out,
+        asr_runner=MockAsrRunner(),
+        llm_judge=MockLlmJudge(),
+        config=PipelineConfig(),
+    )
+    run_pipeline(input_json=first, **common, stage="asr", asr_models=["moss"])
+    src["turns"][0]["text"] = "改过输入后不应静默用旧单元"
+    second = tmp_path / "mode_c2.json"
+    second.write_text(json.dumps(src, ensure_ascii=False), encoding="utf-8")
+    try:
+        run_pipeline(input_json=second, **common, stage="pass_a")
+        raise AssertionError("expected fingerprint mismatch error")
+    except RuntimeError as exc:
+        assert "fingerprint" in str(exc).lower()
+
+
+def test_force_refresh_allows_stale_units_on_pass_a(tmp_path: Path):
+    src = json.loads((FIXTURES / "mode_c.json").read_text(encoding="utf-8"))
+    first = tmp_path / "mode_c.json"
+    first.write_text(json.dumps(src, ensure_ascii=False), encoding="utf-8")
+    out = tmp_path / "work"
+    audio = tmp_path / "missing.wav"
+    run_pipeline(
+        input_json=first,
+        audio_path=audio,
+        work_dir=out,
+        asr_runner=MockAsrRunner(),
+        llm_judge=MockLlmJudge(),
+        config=PipelineConfig(),
+        stage="asr",
+        asr_models=["moss"],
+    )
+    src["turns"][0]["text"] = "改过输入仍可用 --force-refresh"
+    second = tmp_path / "mode_c2.json"
+    second.write_text(json.dumps(src, ensure_ascii=False), encoding="utf-8")
+    result = run_pipeline(
+        input_json=second,
+        audio_path=audio,
+        work_dir=out,
+        asr_runner=MockAsrRunner(),
+        llm_judge=MockLlmJudge(),
+        config=PipelineConfig(force_refresh=True),
+        stage="pass_a",
+    )
+    assert result["stage"] == "pass_a"
+    assert (out / "mode_c_draft.json").exists()

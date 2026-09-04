@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from stage2_asr.llm_retry import sleep_before_retry
 from stage2_asr.neighbors import cap_neighbors, meeting_draft
 from stage2_asr.pinyin_util import pinyin_edit_distance
 from stage2_asr.types import Edit, Hypothesis, PipelineConfig, Turn
@@ -292,9 +293,11 @@ def _run_pass_b_batched(
             llm_judge.judge_many(_jobs_for(chunk), max_workers=batch_size),
             attempt=1,
         )
+        backoff = float(getattr(cfg, "llm_retry_backoff_s", 0.0))
         for attempt in range(2, cfg.llm_max_retries + 2):
             if not still:
                 break
+            sleep_before_retry(attempt - 1, backoff)
             still = _accept_or_defer(
                 still,
                 llm_judge.judge_many(_jobs_for(still), max_workers=batch_size),
@@ -380,7 +383,7 @@ def run_pass_b(
     2) Optional LLM Tier B/C scan with full meeting_draft as neighbors
        (sequential by default; `--pass-b-batch-size N` snapshots neighbors and batches)
     3) MOSS-aware: heavy-overlap turns prefer / force moss provisional text
-    4) Optional fallback_judge (e.g. DeepSeek) after primary retries fail
+    4) Optional fallback_judge after primary retries fail
     """
     cfg = config or PipelineConfig()
     hotwords = hotwords or []
@@ -439,7 +442,9 @@ def run_pass_b(
         accepted = None
         last_err = None
         used_fallback = False
+        backoff = float(getattr(cfg, "llm_retry_backoff_s", 0.0))
         for _attempt in range(cfg.llm_max_retries + 1):
+            sleep_before_retry(_attempt, backoff)
             raw, err = _try_pass_b_judge(
                 llm_judge,
                 hyps=hyps,

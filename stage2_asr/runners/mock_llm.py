@@ -140,6 +140,7 @@ class MockLlmJudge:
         turn_index: int,
         unit_id: str,
         hypotheses: list | None = None,
+        meeting_hyps: str | list | None = None,
         **_kwargs,
     ) -> dict:
         """Deterministic polish: evidenced entity/codeswitch only. No ITN or trailing 。."""
@@ -148,6 +149,10 @@ class MockLlmJudge:
         edits: list[dict] = []
         hyp_blob = _blob_from_hyps(hypotheses)
         neighbor_blob = _blob_from_neighbors(neighbor_draft)
+        if isinstance(meeting_hyps, str):
+            meeting_blob = meeting_hyps
+        else:
+            meeting_blob = _blob_from_hyps(meeting_hyps)
         if "温度的问题" in original and "windows产品" in hyp_blob.lower():
             edits.append(
                 {
@@ -176,6 +181,16 @@ class MockLlmJudge:
                     "kind": "entity",
                     "anchor": "neighbor_draft",
                     "evidence": "neighbor contains 张三丰",
+                }
+            )
+        elif "张三风" in original and "张三丰" in meeting_blob:
+            edits.append(
+                {
+                    "span_asr": "张三风",
+                    "span_out": "张三丰",
+                    "kind": "entity",
+                    "anchor": "meeting_hyp",
+                    "evidence": "other-turn qwen hyp contains 张三丰",
                 }
             )
         if "爱情" in original and "娃娃亲" in neighbor_blob:
@@ -219,12 +234,8 @@ class MockLlmJudge:
         unit_id: str = "",
         **_kwargs,
     ) -> dict:
-        from stage2_asr.publish import FILLERS, MARK_RE
-
         _ = (hotwords, glossary, unit_id)
         edits: list[dict] = []
-        skip = set(MARK_RE.findall(meeting or ""))
-        _ = skip
         for tok in ("嗯", "啊", "那个", "就是说", "呃", "um", "uh", "ah"):
             if tok in (meeting or ""):
                 edits.append({"span_asr": tok, "span_out": "", "kind": "filler"})
@@ -242,7 +253,6 @@ class MockLlmJudge:
                     "kind": "repair",
                 }
             )
-        _ = FILLERS
         return {"edits": edits}
 
     def publish_many(self, jobs: list[dict], *, max_workers: int = 8) -> list[dict]:

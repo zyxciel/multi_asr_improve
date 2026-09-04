@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
 from stage2_asr.eval_metrics import cer, corpus_cer, cp_cer
+from stage2_asr.pipeline import load_mode_c
 from stage2_asr.types import Turn
 
 
 def _load_turns(path: Path) -> list[Turn]:
-    data = json.loads(path.read_text(encoding="utf-8"))
-    return [Turn.from_dict(t) for t in data.get("turns", [])]
+    turns, _ = load_mode_c(path)
+    return turns
 
 
 def evaluate_b0(*, hyp_path: Path, ref_path: Path) -> dict[str, Any]:

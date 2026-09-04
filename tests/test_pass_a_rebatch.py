@@ -69,4 +69,4 @@ def test_pass_a_retries_are_rebatched_not_serial():
     # First attempt + one retry, both size-3 batches; no serial judge().
     assert judge.judge_many_sizes == [3, 3]
     assert judge.judge_calls == 0
-    assert all(a.get("retries", 0) >= 1 for _, a in results)
+    assert all(a.get("retries", 0) == 1 for _, a in results)

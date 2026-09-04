@@ -11,6 +11,7 @@ Backends:
   - generate_fn: injected for tests
 """
 
+import concurrent.futures
 import json
 import time
 from typing import Any, Callable
@@ -44,6 +45,20 @@ LogFn = Callable[[dict[str, Any]], None]
 _BACKENDS = {"transformers", "vllm", "vllm_engine"}
 # Cap stored prompt/response text in llm_infer.jsonl (full length still in *_chars).
 _LOG_TEXT_MAX = 16000
+
+
+def call_with_timeout(fn, timeout_s: float):
+    """Run fn with a wall-clock timeout. Cannot kill a stuck generate thread."""
+    if timeout_s is None or float(timeout_s) <= 0:
+        return fn()
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    fut = ex.submit(fn)
+    try:
+        return fut.result(timeout=float(timeout_s))
+    except concurrent.futures.TimeoutError as exc:
+        raise TimeoutError(f"LLM generate exceeded timeout_s={timeout_s}") from exc
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
 
 
 class Qwen36LlmJudge:
@@ -155,6 +170,7 @@ class Qwen36LlmJudge:
         turn_index: int,
         unit_id: str,
         hypotheses: list | None = None,
+        meeting_hyps: str | None = None,
         **_kwargs,
     ) -> dict:
         user = render_polish_user_prompt(
@@ -163,9 +179,14 @@ class Qwen36LlmJudge:
             hotwords=json.dumps(hotwords, ensure_ascii=False),
             turn_index=int(turn_index),
             hypotheses=format_polish_hypotheses(hypotheses),
+            meeting_hyps=str(meeting_hyps or "(none)"),
         )
         raw_text = self._generate(
-            POLISH_SYSTEM_PROMPT, user, unit_id=unit_id, pass_name="polish"
+            POLISH_SYSTEM_PROMPT,
+            user,
+            unit_id=unit_id,
+            pass_name="polish",
+            max_tokens=2048,
         )
         return self._parse_json(raw_text)
 
@@ -189,7 +210,7 @@ class Qwen36LlmJudge:
             unit_id=unit_id,
             pass_name="publish",
             enable_thinking=False,
-            max_tokens=2048,
+            max_tokens=4096,
         )
         return self._parse_json(raw_text)
 
@@ -211,7 +232,7 @@ class Qwen36LlmJudge:
             unit_id=unit_id,
             pass_name="extract",
             enable_thinking=False,
-            max_tokens=1024,
+            max_tokens=2048,
         )
         return self._parse_json(raw_text)
 
@@ -234,7 +255,7 @@ class Qwen36LlmJudge:
             unit_id=unit_id,
             pass_name="publish_eval",
             enable_thinking=bool(enable_thinking),
-            max_tokens=2048,
+            max_tokens=8192,
         )
         return self._parse_json(raw_text)
 
@@ -288,6 +309,7 @@ class Qwen36LlmJudge:
                 hotwords=json.dumps(job.get("hotwords") or [], ensure_ascii=False),
                 turn_index=int(job.get("turn_index") or 0),
                 hypotheses=format_polish_hypotheses(job.get("hypotheses")),
+                meeting_hyps=str(job.get("meeting_hyps") or "(none)"),
             )
             prompts_meta.append((str(job.get("unit_id", "")), user))
         return self._complete_many(
@@ -625,14 +647,18 @@ class Qwen36LlmJudge:
                 messages, tokenize=False, add_generation_prompt=True
             )
         inputs = tok([prompt], return_tensors="pt").to(model.device)
-        out = model.generate(
-            **inputs,
-            max_new_tokens=tokens,
-            do_sample=self.temperature > 0,
-            temperature=max(self.temperature, 1e-5),
-        )
-        gen = out[0][inputs["input_ids"].shape[-1] :]
-        return tok.decode(gen, skip_special_tokens=True)
+
+        def _run() -> str:
+            out = model.generate(
+                **inputs,
+                max_new_tokens=tokens,
+                do_sample=self.temperature > 0,
+                temperature=max(self.temperature, 1e-5),
+            )
+            gen = out[0][inputs["input_ids"].shape[-1] :]
+            return tok.decode(gen, skip_special_tokens=True)
+
+        return call_with_timeout(_run, self.timeout_s)
 
     def _parse_json(self, text: str) -> dict:
         payload, reasoning = parse_judgment_json(text)

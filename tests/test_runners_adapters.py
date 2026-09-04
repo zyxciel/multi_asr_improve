@@ -9,10 +9,9 @@ from stage2_asr.eval_metrics import cer, corpus_cer, cp_cer
 from stage2_asr.runners.base import UnsupportedRunnerError
 from stage2_asr.runners.ensemble import EnsembleAsrRunner
 from stage2_asr.runners.firered_asr2s import FireRedAsr2sConfig, FireRedAsr2sRunner
-from stage2_asr.runners.llm_deepseek import DeepSeekLlmJudge
 from stage2_asr.runners.llm_qwen36 import Qwen36LlmJudge
 from stage2_asr.runners.qwen3_asr import Qwen3AsrRunner
-from stage2_asr.types import AsrStatus, AsrUnit, Turn
+from stage2_asr.types import AsrStatus, AsrUnit, Hypothesis, Turn
 
 
 class _FakeQwenModel:
@@ -100,6 +99,44 @@ def test_ensemble_selected_models():
     assert {h.model for h in hyps} == {"moss", "firered"}
 
 
+def test_ensemble_does_not_retry_internal_typeerror():
+    class BoomQwen:
+        def __init__(self):
+            self.n = 0
+
+        def transcribe_unit(self, unit, turns, audio_path, *, moss_exclusive=False, crop_path=None):
+            self.n += 1
+            raise TypeError("'NoneType' object is not subscriptable")
+
+    boom = BoomQwen()
+    ens = EnsembleAsrRunner(boom, FireRedAsr2sRunner(system=_FakeFireRedSystem()))
+    turns = [Turn(0, 1, "s0", "来自MOSS", asr_status=AsrStatus.PROVISIONAL)]
+    unit = AsrUnit("u", 0, 1, "s0", [0])
+    import pytest
+
+    with pytest.raises(TypeError, match="not subscriptable"):
+        ens.transcribe_unit(unit, turns, "x.wav", moss_exclusive=False, crop_path="crop.wav")
+    assert boom.n == 1
+
+
+def test_ensemble_strips_unsupported_crop_path_without_second_call():
+    class NoCrop:
+        def __init__(self):
+            self.n = 0
+
+        def transcribe_unit(self, unit, turns, audio_path, *, moss_exclusive=False):
+            self.n += 1
+            return [Hypothesis("qwen", "hi")]
+
+    inner = NoCrop()
+    ens = EnsembleAsrRunner(inner, FireRedAsr2sRunner(system=_FakeFireRedSystem()))
+    turns = [Turn(0, 1, "s0", "来自MOSS", asr_status=AsrStatus.PROVISIONAL)]
+    unit = AsrUnit("u", 0, 1, "s0", [0])
+    hyps = ens.transcribe_unit(unit, turns, "x.wav", moss_exclusive=False, crop_path="crop.wav")
+    assert inner.n == 1
+    assert any(h.model == "qwen" for h in hyps)
+
+
 def test_llm_judge_with_generate_fn():
     payload = {
         "text": "你好",
@@ -125,40 +162,21 @@ def test_llm_judge_with_generate_fn():
     assert out["text"] == "你好"
 
 
-def test_deepseek_judge_disabled_raises():
-    import pytest
+def test_call_with_timeout_raises_without_waiting_for_fn():
+    import time
 
-    with pytest.raises(UnsupportedRunnerError):
-        DeepSeekLlmJudge().judge(
-            hypotheses=[],
-            neighbor_draft=[],
-            hotwords=[],
-            overlap=False,
-            heavy_overlap=False,
-            unit_id="u",
-        )
+    from stage2_asr.runners.llm_qwen36 import call_with_timeout
 
+    started = time.monotonic()
 
-def test_deepseek_judge_with_generate_fn():
-    payload = {
-        "text": "你好",
-        "base_model": "moss",
-        "edits": [],
-        "overlap": False,
-    }
+    def slow():
+        time.sleep(2.0)
+        return "done"
 
-    def gen(system, user):
-        assert "Few-shots" in user or "产用" in user
-        return __import__("json").dumps(payload, ensure_ascii=False)
-
-    judge = DeepSeekLlmJudge(generate_fn=gen)
-    out = judge.judge(
-        hypotheses=[],
-        neighbor_draft=[],
-        hotwords=[],
-        overlap=False,
-        heavy_overlap=False,
-        unit_id="u",
-    )
-    assert out["text"] == "你好"
-    assert judge.name == "deepseek"
+    try:
+        call_with_timeout(slow, 0.05)
+        raise AssertionError("expected TimeoutError")
+    except TimeoutError:
+        pass
+    elapsed = time.monotonic() - started
+    assert elapsed < 1.0

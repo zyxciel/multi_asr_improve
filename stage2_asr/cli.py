@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -44,12 +45,6 @@ def _add_common_run_args(p: argparse.ArgumentParser) -> None:
         default="Qwen/Qwen3.6-27B",
         help="Judge weights: Qwen/Qwen3.8-27B if the vLLM build can load it; else keep Qwen3.6-27B",
     )
-    p.add_argument("--deepseek-model-id", default="deepseek-ai/DeepSeek-V2.5")
-    p.add_argument(
-        "--no-deepseek-fallback",
-        action="store_true",
-        help="Disable DeepSeek judge fallback after Qwen retries",
-    )
     p.add_argument("--enable-real", action="store_true", help="Allow real runners to load models")
     p.add_argument(
         "--llm-backend",
@@ -69,18 +64,27 @@ def _add_common_run_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--llm-api-key",
         default=None,
-        help="Optional Bearer token for OpenAI-compat server",
+        help="Optional Bearer token (else STAGE2_LLM_API_KEY, then OPENAI_API_KEY)",
     )
     p.add_argument(
         "--llm-timeout-s",
         type=float,
         default=300.0,
-        help="HTTP timeout seconds for --llm-backend vllm",
+        help="HTTP timeout seconds for --llm-backend vllm; also caps transformers generate",
     )
     p.add_argument(
-        "--deepseek-base-url",
-        default=None,
-        help="Optional separate OpenAI-compat URL for DeepSeek fallback (else reuse --llm-base-url)",
+        "--llm-retry-backoff-s",
+        type=float,
+        default=0.25,
+        help="Sleep seconds before LLM retries (exponential: backoff, 2x, 4x, ...). 0 disables",
+    )
+    p.add_argument(
+        "--force-refresh",
+        action="store_true",
+        help=(
+            "ASR: rebuild units and skip asr_cache. "
+            "pass_a/pass_b/llm: allow stale asr_units.json after an input fingerprint mismatch"
+        ),
     )
     p.add_argument(
         "--pass-a-batch-size",
@@ -109,7 +113,10 @@ def _add_common_run_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--glossary",
         default=None,
-        help="Seed glossary JSON for --stage publish (terms + optional latex)",
+        help=(
+            "Seed glossary JSON for --stage publish; unioned with work_dir/glossary.json "
+            "(CLI covers the same surface)"
+        ),
     )
     p.add_argument(
         "--publish-batch-size",
@@ -211,6 +218,13 @@ def _vllm_flags(args: argparse.Namespace) -> dict:
     }
 
 
+def resolve_llm_api_key(cli_value: str | None) -> str | None:
+    """CLI flag wins, then STAGE2_LLM_API_KEY, then OPENAI_API_KEY. Never log the value."""
+    if cli_value:
+        return str(cli_value)
+    return os.environ.get("STAGE2_LLM_API_KEY") or os.environ.get("OPENAI_API_KEY") or None
+
+
 def _pipeline_config(args: argparse.Namespace) -> PipelineConfig:
     glossary = None
     raw_glossary = getattr(args, "glossary", None)
@@ -225,6 +239,8 @@ def _pipeline_config(args: argparse.Namespace) -> PipelineConfig:
         publish_eval=not bool(getattr(args, "no_publish_eval", False)),
         publish_eval_thinking=not bool(getattr(args, "no_publish_eval_thinking", False)),
         glossary=glossary,
+        llm_retry_backoff_s=float(getattr(args, "llm_retry_backoff_s", 0.0)),
+        force_refresh=bool(getattr(args, "force_refresh", False)),
     )
 
 
@@ -248,13 +264,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
         mock_hyps=mock_hyps,
         qwen_model_id=args.qwen_model_id,
         llm_model_id=args.llm_model_id,
-        deepseek_model_id=args.deepseek_model_id,
-        no_deepseek_fallback=bool(args.no_deepseek_fallback),
         llm_backend=args.llm_backend,
         llm_base_url=args.llm_base_url,
-        llm_api_key=args.llm_api_key,
+        llm_api_key=resolve_llm_api_key(args.llm_api_key),
         llm_timeout_s=float(args.llm_timeout_s),
-        deepseek_base_url=args.deepseek_base_url,
         **_vllm_flags(args),
     )
 
@@ -334,14 +347,11 @@ def _cmd_run_batch(args: argparse.Namespace) -> int:
         config=cfg,
         qwen_model_id=args.qwen_model_id,
         llm_model_id=args.llm_model_id,
-        deepseek_model_id=args.deepseek_model_id,
-        no_deepseek_fallback=bool(args.no_deepseek_fallback),
         continue_on_error=not bool(args.fail_fast),
         llm_backend=args.llm_backend,
         llm_base_url=args.llm_base_url,
-        llm_api_key=args.llm_api_key,
+        llm_api_key=resolve_llm_api_key(args.llm_api_key),
         llm_timeout_s=float(args.llm_timeout_s),
-        deepseek_base_url=args.deepseek_base_url,
         **_vllm_flags(args),
     )
     print(
@@ -416,7 +426,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "run-batch":
         return _cmd_run_batch(args)
     parser.error(f"unknown command {args.cmd}")
-    return 2
 
 
 if __name__ == "__main__":

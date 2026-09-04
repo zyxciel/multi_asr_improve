@@ -231,8 +231,8 @@ def test_pass_b_fallback_judge_after_primary_fails():
         def judge(self, **kwargs):
             return {"text": "broken"}  # missing required fields
 
-    class DeepSeekOk:
-        name = "deepseek"
+    class FallbackOk:
+        name = "fallback"
 
         def judge(self, **kwargs):
             text = kwargs["hypotheses"][0].text
@@ -256,7 +256,7 @@ def test_pass_b_fallback_judge_after_primary_fails():
         turns,
         draft,
         llm_judge=AlwaysBad(),
-        fallback_judge=DeepSeekOk(),
+        fallback_judge=FallbackOk(),
         config=PipelineConfig(llm_max_retries=1),
     )
     assert "蹦字" in out[0]

@@ -92,7 +92,6 @@ stage2-asr run-batch \
   --vllm-dtype bf16 \
   --vllm-max-model-len 8192 \
   --pass-a-batch-size 64 \
-  --no-deepseek-fallback \
   --hotwords docs/hotwords.txt
 ```
 

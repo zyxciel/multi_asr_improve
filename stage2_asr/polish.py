@@ -3,14 +3,21 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from stage2_asr.agreement import normalize_for_cer
+from stage2_asr.llm_retry import sleep_before_retry
 from stage2_asr.neighbors import cap_neighbors, meeting_draft
+from stage2_asr.pinyin_util import pinyin_edit_distance
 from stage2_asr.text_map import distribute_unit_text
 from stage2_asr.types import Hypothesis, PipelineConfig, Turn
 
 ALLOWED_KINDS = frozenset({"punc", "entity", "codeswitch"})
-ALLOWED_ANCHORS = frozenset({"hyp", "neighbor_draft", "meeting_draft", "hotword"})
+ALLOWED_ANCHORS = frozenset(
+    {"hyp", "neighbor_draft", "meeting_draft", "meeting_hyp", "hotword"}
+)
 # CN→CN entity repairs may grow/shrink by 1–2 characters (爱情→娃娃亲).
 CJK_CHAR_SLACK = 2
+PINYIN_NEAR = 2
+_MEETING_HYP_PROMPT_CHARS = 4096
 
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 _LATIN_RE = re.compile(r"[A-Za-z]")
@@ -113,23 +120,132 @@ def _hotword_blob(hotwords) -> str:
     return " ".join(str(h) for h in (hotwords or []))
 
 
+def _parse_hotword_index(hotwords: list[str] | None) -> tuple[list[str], dict[str, str]]:
+    """'canon|alt1|alt2' → canons + alt→canon. Length caps from Pass B do not apply."""
+    canons: list[str] = []
+    alias_to_canon: dict[str, str] = {}
+    for hw in hotwords or []:
+        parts = [p.strip() for p in str(hw).split("|") if p.strip()]
+        if not parts:
+            continue
+        canon = parts[0]
+        canons.append(canon)
+        for alt in parts[1:]:
+            alias_to_canon[alt] = canon
+    return canons, alias_to_canon
+
+
+def _canon_of(span_out: str, canons: list[str]) -> str | None:
+    needle = span_out.strip()
+    if not needle:
+        return None
+    for c in canons:
+        if needle == c or needle.lower() == c.lower():
+            return c
+    return None
+
+
+def _lexicon_hit(span_asr: str, span_out: str, hotwords: list[str] | None) -> bool:
+    canons, alias_to_canon = _parse_hotword_index(hotwords)
+    canon = _canon_of(span_out, canons)
+    if canon is None:
+        return False
+    if alias_to_canon.get(span_asr) == canon or alias_to_canon.get(span_asr.lower()) == canon:
+        return True
+    return pinyin_edit_distance(span_asr, canon) <= PINYIN_NEAR
+
+
+def _in_blob(needle: str, blob: str) -> bool:
+    if not needle or not blob:
+        return False
+    return needle in blob or needle.lower() in blob.lower()
+
+
+def meeting_hyp_blob(hyp_by_turn: dict[int, list] | None) -> str:
+    parts: list[str] = []
+    for hyps in (hyp_by_turn or {}).values():
+        blob = hyp_text_blob(hyps)
+        if blob.strip():
+            parts.append(blob)
+    return " ".join(parts)
+
+
+def format_meeting_hyps_prompt(
+    hyp_by_turn: dict[int, list] | None,
+    *,
+    skip_index: int,
+    this_text: str,
+    char_cap: int = _MEETING_HYP_PROMPT_CHARS,
+) -> str:
+    """Other-turn ASR forms, unique vs this turn, capped for the polish prompt."""
+    this_n = normalize_for_cer(this_text)
+    seen: set[str] = set()
+    lines: list[str] = []
+    for i, hyps in sorted((hyp_by_turn or {}).items()):
+        if int(i) == int(skip_index):
+            continue
+        for h in hyps or []:
+            if h is None:
+                continue
+            if isinstance(h, dict):
+                model = str(h.get("model") or "?")
+                text = str(h.get("text") or "").strip()
+            else:
+                model = str(getattr(h, "model", "?") or "?")
+                text = str(getattr(h, "text", "") or "").strip()
+            if not text:
+                continue
+            key = normalize_for_cer(text)
+            if not key or key == this_n or key in seen:
+                continue
+            seen.add(key)
+            lines.append(f"- t{i}/{model}: {text}")
+    if not lines:
+        return "(none)"
+    blob = "\n".join(lines)
+    if len(blob) > char_cap:
+        return blob[:char_cap] + "\n..."
+    return blob
+
+
+def _hyps_agree_with_draft(hyps: list | None, text: str) -> bool:
+    nonempty: list[str] = []
+    for h in hyps or []:
+        if h is None:
+            continue
+        raw = h.get("text") if isinstance(h, dict) else getattr(h, "text", "")
+        piece = str(raw or "").strip()
+        if piece:
+            nonempty.append(piece)
+    if len(nonempty) < 2:
+        return False
+    draft_n = normalize_for_cer(text)
+    return all(normalize_for_cer(t) == draft_n for t in nonempty)
+
+
 def _span_out_in_source(
     span_out: str,
     anchor: str,
     *,
     hyp_blob: str,
     neighbor_blob: str,
+    meeting_draft_blob: str,
+    meeting_hyp_blob: str,
     hotword_blob: str,
 ) -> bool:
     needle = span_out.strip()
     if not needle:
         return False
     if anchor == "hyp":
-        return needle in hyp_blob or needle.lower() in hyp_blob.lower()
-    if anchor in {"neighbor_draft", "meeting_draft"}:
-        return needle in neighbor_blob or needle.lower() in neighbor_blob.lower()
+        return _in_blob(needle, hyp_blob)
+    if anchor == "neighbor_draft":
+        return _in_blob(needle, neighbor_blob)
+    if anchor == "meeting_draft":
+        return _in_blob(needle, meeting_draft_blob)
+    if anchor == "meeting_hyp":
+        return _in_blob(needle, meeting_hyp_blob)
     if anchor == "hotword":
-        return needle in hotword_blob or needle.lower() in hotword_blob.lower()
+        return _in_blob(needle, hotword_blob)
     return False
 
 
@@ -140,12 +256,20 @@ def validate_polish_edits(
     hypotheses: list | None = None,
     neighbors: list | None = None,
     hotwords: list[str] | None = None,
+    meeting_hyps: list | dict | None = None,
+    meeting_drafts: list | None = None,
 ) -> tuple[bool, str | None]:
     """Reject undisciplined polish edits. Empty edits are schema-ok (applied later)."""
     if not isinstance(edits, list):
         return False, "edits must be list"
     hyp_blob = hyp_text_blob(hypotheses)
     neighbor_blob = neighbor_text_blob(neighbors)
+    meeting_hyp_src = (
+        meeting_hyp_blob(meeting_hyps)
+        if isinstance(meeting_hyps, dict)
+        else hyp_text_blob(meeting_hyps)
+    )
+    meeting_draft_blob = neighbor_text_blob(meeting_drafts)
     hw_blob = _hotword_blob(hotwords)
 
     for e in edits:
@@ -166,10 +290,11 @@ def validate_polish_edits(
             return False, "number rewrite forbidden"
         if _is_repeat_collapse(span_asr, span_out):
             return False, "repeat collapse forbidden"
+        lex_hit = _lexicon_hit(span_asr, span_out, hotwords)
         cjk_pair = _is_cjk_only(span_asr) and _is_cjk_only(span_out)
         if cjk_pair:
             delta = abs(len(_core(span_asr)) - len(_core(span_out)))
-            if delta > CJK_CHAR_SLACK:
+            if delta > CJK_CHAR_SLACK and not lex_hit:
                 return False, "cjk substitution exceeds ±2 character slack"
         else:
             if span_out.startswith(span_asr) and _core(span_out[len(span_asr) :]):
@@ -194,11 +319,16 @@ def validate_polish_edits(
         anchor = str(e.get("anchor") or "")
         if anchor not in ALLOWED_ANCHORS:
             return False, f"bad/missing anchor {anchor!r}"
-        if not _span_out_in_source(
+        if anchor == "hotword":
+            if not lex_hit:
+                return False, "span_out is not a pinyin-near/aliased hotword canonical"
+        elif not _span_out_in_source(
             span_out,
             anchor,
             hyp_blob=hyp_blob,
             neighbor_blob=neighbor_blob,
+            meeting_draft_blob=meeting_draft_blob,
+            meeting_hyp_blob=meeting_hyp_src,
             hotword_blob=hw_blob,
         ):
             return False, f"span_out not found in {anchor} evidence"
@@ -347,6 +477,8 @@ def _validate_polish_raw(
     hypotheses: list | None = None,
     neighbors: list | None = None,
     hotwords: list[str] | None = None,
+    meeting_hyps: list | dict | None = None,
+    meeting_drafts: list | None = None,
 ) -> tuple[dict | None, str | None]:
     if isinstance(raw, BaseException):
         return None, str(raw)
@@ -371,6 +503,8 @@ def _validate_polish_raw(
         hypotheses=hypotheses,
         neighbors=neighbors,
         hotwords=hotwords,
+        meeting_hyps=meeting_hyps,
+        meeting_drafts=meeting_drafts,
     )
     if not ok:
         return None, err
@@ -386,6 +520,9 @@ def _try_polish(
     turn_index: int,
     unit_id: str,
     hypotheses: list[Hypothesis] | None = None,
+    meeting_hyps: list | dict | None = None,
+    meeting_drafts: list | None = None,
+    meeting_hyps_prompt: str = "(none)",
 ) -> tuple[dict | None, str | None]:
     try:
         raw = llm_judge.polish(
@@ -395,6 +532,7 @@ def _try_polish(
             turn_index=turn_index,
             unit_id=unit_id,
             hypotheses=hypotheses or [],
+            meeting_hyps=meeting_hyps_prompt,
         )
     except Exception as exc:  # noqa: BLE001
         return None, str(exc)
@@ -404,6 +542,8 @@ def _try_polish(
         hypotheses=hypotheses,
         neighbors=neighbors,
         hotwords=hotwords,
+        meeting_hyps=meeting_hyps,
+        meeting_drafts=meeting_drafts,
     )
 
 
@@ -469,6 +609,7 @@ def _jobs_for(chunk: list[dict], hotwords: list[str]) -> list[dict]:
             "turn_index": p["i"],
             "unit_id": p["unit_id"],
             "hypotheses": p.get("hyps") or [],
+            "meeting_hyps": p.get("meeting_hyps_prompt") or "(none)",
         }
         for p in chunk
     ]
@@ -494,13 +635,28 @@ def _run_polish_batched(
             continue
         if turn.duration + 1e-9 < cfg.min_asr_seconds:
             continue
+        hyps = hyp_by_turn.get(i, [])
+        hyp_prompt = format_meeting_hyps_prompt(
+            hyp_by_turn, skip_index=i, this_text=text
+        )
+        if _hyps_agree_with_draft(hyps, text) and hyp_prompt == "(none)":
+            audits.append(
+                {
+                    "turn_index": i,
+                    "pass": "polish",
+                    "path": "hyps_agree_skip",
+                    "batched": True,
+                }
+            )
+            continue
         prepared.append(
             {
                 "i": i,
                 "turn": turn,
                 "text": text,
                 "neighbors": cap_neighbors(meeting, i, cfg),
-                "hyps": hyp_by_turn.get(i, []),
+                "hyps": hyps,
+                "meeting_hyps_prompt": hyp_prompt,
                 "unit_id": f"polish_t{i}",
                 "last_err": None,
             }
@@ -515,6 +671,8 @@ def _run_polish_batched(
                 hypotheses=p.get("hyps") or [],
                 neighbors=p["neighbors"],
                 hotwords=hotwords,
+                meeting_hyps=hyp_by_turn,
+                meeting_drafts=meeting,
             )
             if accepted is None:
                 p["last_err"] = err
@@ -541,9 +699,11 @@ def _run_polish_batched(
             llm_judge.polish_many(_jobs_for(chunk, hotwords), max_workers=batch_size),
             attempt=1,
         )
+        backoff = float(getattr(cfg, "llm_retry_backoff_s", 0.0))
         for attempt in range(2, cfg.llm_max_retries + 2):
             if not still:
                 break
+            sleep_before_retry(attempt - 1, backoff)
             still = _accept_or_defer(
                 still,
                 llm_judge.polish_many(_jobs_for(still, hotwords), max_workers=batch_size),
@@ -605,12 +765,27 @@ def run_polish(
             continue
         if turn.duration + 1e-9 < cfg.min_asr_seconds:
             continue
+        hyps = hyp_by_turn.get(i, [])
+        hyp_prompt = format_meeting_hyps_prompt(
+            hyp_by_turn, skip_index=i, this_text=text
+        )
+        if _hyps_agree_with_draft(hyps, text) and hyp_prompt == "(none)":
+            audits.append(
+                {
+                    "turn_index": i,
+                    "pass": "polish",
+                    "path": "hyps_agree_skip",
+                }
+            )
+            continue
 
         neighbors = cap_neighbors(meeting, i, cfg)
         unit_id = f"polish_t{i}"
         accepted = None
         last_err = None
+        backoff = float(getattr(cfg, "llm_retry_backoff_s", 0.0))
         for _attempt in range(cfg.llm_max_retries + 1):
+            sleep_before_retry(_attempt, backoff)
             raw, err = _try_polish(
                 llm_judge,
                 text=text,
@@ -618,7 +793,10 @@ def run_polish(
                 hotwords=hotwords,
                 turn_index=i,
                 unit_id=unit_id,
-                hypotheses=hyp_by_turn.get(i, []),
+                hypotheses=hyps,
+                meeting_hyps=hyp_by_turn,
+                meeting_drafts=meeting,
+                meeting_hyps_prompt=hyp_prompt,
             )
             if raw is None:
                 last_err = err

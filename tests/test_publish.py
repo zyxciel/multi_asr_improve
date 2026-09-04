@@ -238,6 +238,29 @@ def test_itn_serial_allowed_in_filter():
     assert kept_bad == []
 
 
+def test_apply_publish_edits_keeps_glossary_when_some_edits_lack_offsets():
+    meeting = concat_meeting({0: "阿尔法那个啥"})
+    start = meeting.find("阿尔法")
+    edits = [
+        {
+            "span_asr": "阿尔法",
+            "span_out": r"$\alpha$",
+            "kind": "latex",
+            "start_char": start,
+            "end_char": start + len("阿尔法"),
+        },
+        {"span_asr": "那个啥", "span_out": "", "kind": "filler"},
+    ]
+    terms = [
+        {"surface": "阿尔法", "kind": "symbol", "latex": r"\alpha"},
+        {"surface": "那个啥", "kind": "filler"},
+    ]
+    out, located = apply_publish_edits(meeting, edits, glossary_terms=terms)
+    assert r"$\alpha$" in out
+    assert "那个啥" not in split_meeting(out)[0]
+    assert {e["kind"] for e in located} == {"latex", "filler"}
+
+
 def test_run_publish_drops_fillers_and_itn():
     from stage2_asr.runners.mock_llm import MockLlmJudge
     from stage2_asr.types import Turn
@@ -275,6 +298,29 @@ def test_run_publish_keeps_other_speaker_backchannel():
     assert ev is None or ev.get("faithful") is True
 
 
+def test_qwen_publish_calls_use_raised_max_tokens():
+    from stage2_asr.runners.llm_qwen36 import Qwen36LlmJudge
+
+    logs: list[dict] = []
+
+    def gen(system, user):
+        _ = (system, user)
+        if "faithful" in system.lower() or "quality" in system.lower():
+            return '{"faithful": true, "clearer": true, "more_concise": true, "easier": true}'
+        if "keyword" in system.lower() or "extract" in system.lower() or "glossary" in system.lower():
+            return '{"keywords": [], "rare_words": [], "new_terms": []}'
+        return '{"edits": []}'
+
+    judge = Qwen36LlmJudge(enabled=True, generate_fn=gen, log_fn=logs.append)
+    judge.publish(meeting="你好", unit_id="p")
+    judge.extract_terms(meeting="你好", unit_id="e")
+    judge.eval_publish(original="你好", published="你好。", unit_id="v")
+    by_pass = {e["pass"]: e.get("max_tokens") for e in logs if e.get("max_tokens") is not None}
+    assert by_pass.get("publish") == 4096
+    assert by_pass.get("extract") == 2048
+    assert by_pass.get("publish_eval") == 8192
+
+
 def test_run_publish_eval_reverts_unfaithful():
     from stage2_asr.types import Turn
 
@@ -309,19 +355,76 @@ def test_run_publish_marker_payload_keeps_original():
     assert any(a.get("fallback") for a in audits)
 
 
-def test_merge_glossary_seed_wins():
+def test_merge_glossary_unions_and_extract_covers_same_surface():
     from stage2_asr.publish import merge_glossary
 
-    seed = {"terms": [{"surface": "GPU", "kind": "product", "aliases": ["显卡"]}]}
+    seed = {
+        "terms": [
+            {"surface": "GPU", "kind": "product", "aliases": ["显卡"], "source": "seed"},
+            {"surface": "OldTerm", "kind": "other", "aliases": []},
+        ],
+        "keywords": [{"surface": "OldKeyword", "score": 0.9}],
+        "rare_words": [{"surface": "OldRare"}],
+    }
     extract = {
-        "keywords": [{"surface": "GPU", "score": 0.2}],
-        "rare_words": [],
-        "new_terms": [{"surface": "GPU", "kind": "other", "aliases": []}],
+        "keywords": [{"surface": "GPU", "score": 0.2}, {"surface": "NewKeyword", "score": 1.0}],
+        "rare_words": [{"surface": "NewRare"}],
+        "new_terms": [
+            {"surface": "GPU", "kind": "other", "aliases": ["graphics"]},
+            {"surface": "Windows产品", "kind": "product", "aliases": []},
+        ],
     }
     merged = merge_glossary(seed, extract)
-    gpu = next(t for t in merged["terms"] if t["surface"] == "GPU")
-    assert gpu.get("source") == "seed"
-    assert gpu.get("kind") == "product"
+    by_surface = {t["surface"]: t for t in merged["terms"]}
+    assert set(by_surface) == {"GPU", "OldTerm", "Windows产品"}
+    assert by_surface["GPU"].get("kind") == "other"
+    assert by_surface["GPU"].get("aliases") == ["graphics"]
+    assert by_surface["GPU"].get("source") == "extract"
+    assert by_surface["OldTerm"].get("kind") == "other"
+    kw = {k["surface"]: k for k in merged["keywords"]}
+    assert set(kw) == {"OldKeyword", "GPU", "NewKeyword"}
+    assert kw["GPU"]["score"] == 0.2
+    rare = {r["surface"] for r in merged["rare_words"]}
+    assert rare == {"OldRare", "NewRare"}
+
+
+def test_merge_glossary_none_extract_keeps_seed_lists():
+    from stage2_asr.publish import merge_glossary
+
+    seed = {
+        "terms": [{"surface": "KeepMe", "kind": "product"}],
+        "keywords": [{"surface": "K"}],
+        "rare_words": [{"surface": "R"}],
+    }
+    merged = merge_glossary(seed, None)
+    assert [t["surface"] for t in merged["terms"]] == ["KeepMe"]
+    assert [k["surface"] for k in merged["keywords"]] == ["K"]
+    assert [r["surface"] for r in merged["rare_words"]] == ["R"]
+
+
+def test_union_glossary_cli_covers_same_surface():
+    from stage2_asr.publish import union_glossary
+
+    prior = {
+        "terms": [
+            {"surface": "Old", "kind": "other"},
+            {"surface": "Shared", "kind": "other", "aliases": ["a"]},
+        ],
+        "keywords": [{"surface": "K1"}],
+        "rare_words": [],
+    }
+    cli = {
+        "terms": [{"surface": "Shared", "kind": "product", "aliases": ["b"]}],
+        "keywords": [{"surface": "K2"}],
+        "rare_words": [],
+    }
+    merged = union_glossary(prior, cli)
+    by = {t["surface"]: t for t in merged["terms"]}
+    assert set(by) == {"Old", "Shared"}
+    assert by["Shared"]["kind"] == "product"
+    assert by["Shared"]["aliases"] == ["b"]
+    kw = {k["surface"] for k in merged["keywords"]}
+    assert kw == {"K1", "K2"}
 
 
 def test_load_glossary_invalid_json_returns_empty(tmp_path: Path):
@@ -368,6 +471,147 @@ def test_pipeline_publish_stage_writes_artifacts_without_clobber(tmp_path: Path)
     assert (out / "glossary.json").exists()
     assert (out / "mode_c_polished.json").read_text(encoding="utf-8") == polished
     assert (out / "mode_c_asr_final.json").read_text(encoding="utf-8") == final
+
+
+def test_publish_stage_reuses_work_dir_glossary(tmp_path: Path):
+    from stage2_asr.pipeline import run_pipeline
+    from stage2_asr.runners.mock_asr import MockAsrRunner
+    from stage2_asr.runners.mock_llm import MockLlmJudge
+    from stage2_asr.types import PipelineConfig
+
+    fixtures = Path(__file__).parent / "fixtures"
+    out = tmp_path / "work"
+    run_pipeline(
+        input_json=fixtures / "mode_c.json",
+        audio_path=tmp_path / "missing.wav",
+        work_dir=out,
+        asr_runner=MockAsrRunner(),
+        llm_judge=MockLlmJudge(),
+        config=PipelineConfig(),
+        stage="all",
+    )
+    (out / "glossary.json").write_text(
+        json.dumps(
+            {
+                "terms": [
+                    {
+                        "surface": "AlphaProductXYZ",
+                        "aliases": [],
+                        "kind": "product",
+                        "source": "seed",
+                    }
+                ],
+                "keywords": [{"surface": "OldKeyword", "score": 0.8}],
+                "rare_words": [{"surface": "OldRare"}],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    class ExtractUnionJudge(MockLlmJudge):
+        def extract_terms(self, *, meeting: str, glossary: dict | None = None, **kwargs):
+            raw = super().extract_terms(meeting=meeting, glossary=glossary, **kwargs)
+            raw.setdefault("new_terms", []).append(
+                {
+                    "surface": "NewTermThisRound",
+                    "aliases": ["nt"],
+                    "kind": "other",
+                    "latex": None,
+                }
+            )
+            raw["keywords"] = [{"surface": "NewKeyword", "score": 1.0}]
+            raw["rare_words"] = [{"surface": "NewRare"}]
+            return raw
+
+    run_pipeline(
+        input_json=fixtures / "mode_c.json",
+        audio_path=tmp_path / "missing.wav",
+        work_dir=out,
+        asr_runner=MockAsrRunner(),
+        llm_judge=ExtractUnionJudge(),
+        config=PipelineConfig(glossary=None),
+        stage="publish",
+    )
+    loaded = json.loads((out / "glossary.json").read_text(encoding="utf-8"))
+    surfaces = {t.get("surface") for t in loaded.get("terms") or [] if isinstance(t, dict)}
+    assert "AlphaProductXYZ" in surfaces
+    assert "NewTermThisRound" in surfaces
+    kw = {k.get("surface") for k in loaded.get("keywords") or [] if isinstance(k, dict)}
+    assert "OldKeyword" in kw
+    assert "NewKeyword" in kw
+    rare = {r.get("surface") for r in loaded.get("rare_words") or [] if isinstance(r, dict)}
+    assert "OldRare" in rare
+    assert "NewRare" in rare
+
+
+def test_publish_cli_glossary_unions_with_work_dir(tmp_path: Path):
+    from stage2_asr.pipeline import run_pipeline
+    from stage2_asr.runners.mock_asr import MockAsrRunner
+    from stage2_asr.runners.mock_llm import MockLlmJudge
+    from stage2_asr.types import PipelineConfig
+
+    fixtures = Path(__file__).parent / "fixtures"
+    out = tmp_path / "work"
+    run_pipeline(
+        input_json=fixtures / "mode_c.json",
+        audio_path=tmp_path / "missing.wav",
+        work_dir=out,
+        asr_runner=MockAsrRunner(),
+        llm_judge=MockLlmJudge(),
+        config=PipelineConfig(),
+        stage="all",
+    )
+    (out / "glossary.json").write_text(
+        json.dumps(
+            {
+                "terms": [
+                    {"surface": "FromWorkDir", "aliases": [], "kind": "other"},
+                    {
+                        "surface": "SharedTerm",
+                        "aliases": ["old"],
+                        "kind": "other",
+                        "source": "extract",
+                    },
+                ],
+                "keywords": [{"surface": "OldKeyword", "score": 0.1}],
+                "rare_words": [],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    run_pipeline(
+        input_json=fixtures / "mode_c.json",
+        audio_path=tmp_path / "missing.wav",
+        work_dir=out,
+        asr_runner=MockAsrRunner(),
+        llm_judge=MockLlmJudge(),
+        config=PipelineConfig(
+            glossary={
+                "terms": [
+                    {"surface": "FromCli", "aliases": [], "kind": "other"},
+                    {
+                        "surface": "SharedTerm",
+                        "aliases": ["cli"],
+                        "kind": "product",
+                    },
+                ],
+                "keywords": [{"surface": "CliKeyword", "score": 1.0}],
+                "rare_words": [],
+            }
+        ),
+        stage="publish",
+    )
+    loaded = json.loads((out / "glossary.json").read_text(encoding="utf-8"))
+    by_surface = {t.get("surface"): t for t in loaded.get("terms") or [] if isinstance(t, dict)}
+    assert "FromCli" in by_surface
+    assert "FromWorkDir" in by_surface
+    assert by_surface["SharedTerm"].get("kind") == "product"
+    assert by_surface["SharedTerm"].get("aliases") == ["cli"]
+    kw = {k.get("surface") for k in loaded.get("keywords") or [] if isinstance(k, dict)}
+    assert "OldKeyword" in kw
+    assert "CliKeyword" in kw
 
 
 def test_pipeline_all_includes_publish(tmp_path: Path):

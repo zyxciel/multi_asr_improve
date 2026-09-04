@@ -136,6 +136,7 @@ class PipelineConfig:
     neighbor_max_turns: int = 20
     neighbor_window_seconds: float = 600.0
     llm_max_retries: int = 2
+    llm_retry_backoff_s: float = 0.0
     llm_temperature: float = 0.1
     sample_rate: int = 16000
     energy_window_ms: float = 25.0
@@ -153,6 +154,7 @@ class PipelineConfig:
     publish_eval: bool = True
     publish_eval_thinking: bool = True
     glossary: dict | None = None
+    force_refresh: bool = False
 
 
 @dataclass

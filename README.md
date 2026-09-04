@@ -1,6 +1,6 @@
 # Stage-2 Multi-ASR + LLM Fusion
 
-Mock-first Stage-2 package on **diarizen_moss_fusion** Mode-C outputs, with optional real adapters for Qwen3-ASR, FireRedASR2S (VAD off / LID+Punc on), Qwen3.8-27B (primary judge), and DeepSeek (judge fallback).
+Mock-first Stage-2 package on **diarizen_moss_fusion** Mode-C outputs, with optional real adapters for Qwen3-ASR, FireRedASR2S (VAD off / LID+Punc on), and Qwen3.8-27B (LLM judge).
 
 ## Docs
 
@@ -40,7 +40,6 @@ stage2-asr run \
   --audio prepared.wav \
   --work-dir out \
   --backend real --enable-real
-# optional: --no-deepseek-fallback
 ```
 
 ## Staged mode (low-resource / step-by-step)
@@ -67,6 +66,12 @@ stage2-asr run --input mode_c.json --audio prepared.wav --work-dir out --backend
 
 Available stages: `all` (default; includes polish **and** publish), `asr`, `pass_a`, `pass_b`, `llm` (Pass A+B only, no polish/publish), `polish`, `publish`  
 ASR model subsets: `moss`, `qwen`, `firered` (comma-separated via `--asr-models`)
+
+`asr_units.json` stores a source fingerprint (Mode-C bytes + audio size/mtime + unit-split config). `--stage asr` rebuilds units on mismatch. `--stage pass_a` / `pass_b` / `llm` **refuse** a mismatch (re-run `--stage asr` after changing input). `--force-refresh` rebuilds ASR units and skips `asr_cache/`; on LLM stages it allows reusing stale units.
+
+`--glossary` is unioned with existing `work_dir/glossary.json` (CLI covers the same `surface`; then this-round extract covers).
+
+HTTP vLLM auth: `--llm-api-key`, or env `STAGE2_LLM_API_KEY`, then `OPENAI_API_KEY` (never logged).
 
 FireRed system config used by the adapter:
 
@@ -147,8 +152,7 @@ python -m stage2_asr.cli run-batch \
   --pass-b-batch-size 16 \
   --polish-batch-size 16 \
   --vllm-tp-size 1 \
-  --vllm-gpu-memory-utilization 0.90 \
-  --no-deepseek-fallback
+  --vllm-gpu-memory-utilization 0.90
 ```
 
 - First call loads the model into NPU; later units reuse the same engine.
@@ -157,7 +161,6 @@ python -m stage2_asr.cli run-batch \
 - `--polish-batch-size N` (default **1** = sequential). Independent of Pass A/B. `N>1` snapshots neighbors and batches polish with `polish_many`.
 - Thinking/CoT is **off by default** (`enable_thinking=False` in chat template / `chat_template_kwargs`). Required for Qwen3.8 (thinks by default). Use `--llm-enable-thinking` only if you need it; leaked `<think>` blocks are stripped and logged to `llm_infer.jsonl`, JSON only drives Pass A/B **and** polish. Keep thinking **off** for polish as well (JSON span edits; CoT adds latency without helping conservative substitutions).
 - Qwen3.8-27B uses hybrid attention (Gated DeltaNet). The **vLLM-Ascend / vLLM build must support that architecture**; an older 3.6-only engine will fail at load. Pass `--llm-model-id` if weights live at a local path.
-- DeepSeek fallback is **disabled automatically** for `vllm_engine` (avoids loading a second engine / OOM). Prefer `--no-deepseek-fallback`.
 - Traces: `work-dir/llm_infer.jsonl` (includes `user` prompt + `response`, each capped at 16k chars)
 
 **If you see `Invalid thread pool` / `Engine core initialization failed` (vLLM 0.18 V1):** this is a PyTorch OpenMP + V1 multiprocess bug, not Stage-2 logic. Pull latest (defaults `VLLM_USE_V1=0`, `enforce_eager`, `spawn`) or set before running:
@@ -174,7 +177,7 @@ Also confirm `from vllm import LLM` is **vLLM-Ascend** (NPU), not a CUDA-only bu
 
 ### Alternative: HTTP server (`--llm-backend vllm`)
 
-Start vLLM-Ascend yourself, then `--llm-base-url http://127.0.0.1:8000`.
+Start vLLM-Ascend yourself, then `--llm-base-url http://127.0.0.1:8000`. Optional Bearer token: `--llm-api-key`, else `STAGE2_LLM_API_KEY`, else `OPENAI_API_KEY`.
 
 ## Eval B0 (MOSS-from-fusion baseline)
 

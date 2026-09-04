@@ -106,13 +106,10 @@ def build_runners(
     mock_hyps: Path | None,
     qwen_model_id: str,
     llm_model_id: str,
-    deepseek_model_id: str,
-    no_deepseek_fallback: bool,
     llm_backend: str = "transformers",
     llm_base_url: str | None = None,
     llm_api_key: str | None = None,
     llm_timeout_s: float = 300.0,
-    deepseek_base_url: str | None = None,
     vllm_tp_size: int = 1,
     vllm_gpu_memory_utilization: float = 0.90,
     vllm_max_model_len: int | None = None,
@@ -124,7 +121,6 @@ def build_runners(
     """Construct ASR/LLM runners once for a batch (reuse across samples)."""
     from stage2_asr.runners.ensemble import EnsembleAsrRunner
     from stage2_asr.runners.firered_asr2s import FireRedAsr2sConfig, FireRedAsr2sRunner
-    from stage2_asr.runners.llm_deepseek import DeepSeekLlmJudge
     from stage2_asr.runners.llm_qwen36 import Qwen36LlmJudge
     from stage2_asr.runners.mock_asr import MockAsrRunner
     from stage2_asr.runners.mock_llm import MockLlmJudge
@@ -171,32 +167,6 @@ def build_runners(
             use_v1=vllm_use_v1,
             enable_thinking=llm_enable_thinking,
         )
-        if not no_deepseek_fallback:
-            # Prefer a dedicated DeepSeek URL; else reuse primary vLLM HTTP URL if set.
-            # Avoid loading a second in-process vllm_engine (NPU OOM) unless explicitly HTTP.
-            if llm_backend == "vllm_engine":
-                fallback_judge = None  # use --no-deepseek-fallback implicitly
-            else:
-                fb_url = deepseek_base_url or (
-                    llm_base_url if llm_backend == "vllm" else None
-                )
-                fb_backend = "vllm" if fb_url else llm_backend
-                fallback_judge = DeepSeekLlmJudge(
-                    enabled=True,
-                    model_id=deepseek_model_id,
-                    temperature=0.1,
-                    backend=fb_backend,
-                    base_url=fb_url,
-                    api_key=llm_api_key,
-                    timeout_s=llm_timeout_s,
-                    tensor_parallel_size=vllm_tp_size,
-                    gpu_memory_utilization=vllm_gpu_memory_utilization,
-                    max_model_len=vllm_max_model_len,
-                    dtype=vllm_dtype,
-                    enforce_eager=vllm_enforce_eager,
-                    use_v1=vllm_use_v1,
-                    enable_thinking=llm_enable_thinking,
-                )
     return asr, llm, fallback_judge
 
 
@@ -217,14 +187,11 @@ def run_batch(
     config: PipelineConfig | None = None,
     qwen_model_id: str = "Qwen/Qwen3-ASR-1.7B",
     llm_model_id: str = "Qwen/Qwen3.6-27B",
-    deepseek_model_id: str = "deepseek-ai/DeepSeek-V2.5",
-    no_deepseek_fallback: bool = False,
     continue_on_error: bool = True,
     llm_backend: str = "transformers",
     llm_base_url: str | None = None,
     llm_api_key: str | None = None,
     llm_timeout_s: float = 300.0,
-    deepseek_base_url: str | None = None,
     vllm_tp_size: int = 1,
     vllm_gpu_memory_utilization: float = 0.90,
     vllm_max_model_len: int | None = None,
@@ -284,13 +251,10 @@ def run_batch(
         mock_hyps=mock_hyps,
         qwen_model_id=qwen_model_id,
         llm_model_id=llm_model_id,
-        deepseek_model_id=deepseek_model_id,
-        no_deepseek_fallback=no_deepseek_fallback,
         llm_backend=llm_backend,
         llm_base_url=llm_base_url,
         llm_api_key=llm_api_key,
         llm_timeout_s=llm_timeout_s,
-        deepseek_base_url=deepseek_base_url,
         vllm_tp_size=vllm_tp_size,
         vllm_gpu_memory_utilization=vllm_gpu_memory_utilization,
         vllm_max_model_len=vllm_max_model_len,

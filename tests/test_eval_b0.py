@@ -18,6 +18,20 @@ def test_evaluate_b0_identical_is_zero():
     assert result["mean_cer"] == 0.0
 
 
+def test_evaluate_b0_list_root_json(tmp_path: Path):
+    turns = [
+        {"start": 0, "end": 1, "speaker_id": "s0", "text": "你好世界"},
+        {"start": 1, "end": 2, "speaker_id": "s1", "text": "单框架"},
+    ]
+    hyp_path = tmp_path / "hyp.json"
+    ref_path = tmp_path / "ref.json"
+    hyp_path.write_text(json.dumps(turns, ensure_ascii=False), encoding="utf-8")
+    ref_path.write_text(json.dumps(turns, ensure_ascii=False), encoding="utf-8")
+    result = evaluate_b0(hyp_path=hyp_path, ref_path=ref_path)
+    assert result["n_turns"] == 2
+    assert result["corpus_cer"] == 0.0
+
+
 def test_evaluate_b0_detects_errors(tmp_path: Path):
     ref = {
         "turns": [

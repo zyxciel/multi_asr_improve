@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 from stage2_asr.runners.base import UnsupportedRunnerError
 
-# Common thinking / reasoning wrappers (Qwen3, DeepSeek-R1 style, etc.)
+# Common thinking / reasoning wrappers (Qwen3, etc.)
 _THINK_PATTERNS = [
     re.compile(r"<think>(.*?)</think>", re.IGNORECASE | re.DOTALL),
     re.compile(r"<thinking>(.*?)</thinking>", re.IGNORECASE | re.DOTALL),

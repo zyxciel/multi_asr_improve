@@ -270,6 +270,80 @@ def test_validate_punc_may_only_change_punctuation():
     assert ok is False
 
 
+def test_validate_hotword_canonical_waives_cjk_slack():
+    """span_out is a hotword; |Δlen|>2 is allowed when pinyin-near (no pre-listed misspelling)."""
+    ok, err = validate_polish_edits(
+        [
+            {
+                "span_asr": "玛",
+                "span_out": "玛曲县",
+                "kind": "entity",
+                "anchor": "hotword",
+                "evidence": "hotword canonical 玛曲县; pinyin-near 玛",
+            }
+        ],
+        text="去玛开会",
+        hotwords=["玛曲县"],
+    )
+    assert ok is True, err
+
+
+def test_validate_hotword_rejects_unrelated_canonical():
+    ok, err = validate_polish_edits(
+        [
+            {
+                "span_asr": "张三风",
+                "span_out": "昇腾",
+                "kind": "entity",
+                "anchor": "hotword",
+                "evidence": "hotword list contains 昇腾",
+            }
+        ],
+        text="找张三风签字",
+        hotwords=["昇腾"],
+    )
+    assert ok is False
+
+
+def test_validate_meeting_hyp_from_other_turn():
+    ok, err = validate_polish_edits(
+        [
+            {
+                "span_asr": "张三风",
+                "span_out": "张三丰",
+                "kind": "entity",
+                "anchor": "meeting_hyp",
+                "evidence": "other-turn qwen hyp contains 张三丰",
+            }
+        ],
+        text="找张三风签字",
+        hypotheses=[Hypothesis("moss", "找张三风签字")],
+        neighbors=[],
+        meeting_hyps=[Hypothesis("qwen", "张三丰已经到了")],
+    )
+    assert ok is True, err
+
+
+def test_validate_still_rejects_entity_with_no_meeting_or_hotword():
+    ok, err = validate_polish_edits(
+        [
+            {
+                "span_asr": "张三风",
+                "span_out": "张三丰",
+                "kind": "entity",
+                "anchor": "meeting_hyp",
+                "evidence": "guess",
+            }
+        ],
+        text="找张三风签字",
+        hypotheses=[Hypothesis("moss", "找张三风签字")],
+        neighbors=[],
+        meeting_hyps=[Hypothesis("qwen", "找张三风签字")],
+    )
+    assert ok is False
+    assert err
+
+
 def test_run_polish_applies_typed_edits_and_keeps_unedited_turns():
     turns = [
         Turn(0, 2, "s0", "明天开会用gpu"),
@@ -354,6 +428,7 @@ def test_polish_prompt_forbids_itn_and_undisciplined_rewrites():
     assert "punc|entity|codeswitch" in lowered
     assert "punc|entity|codeswitch|itn" not in lowered
     assert "hyp|neighbor_draft|meeting_draft|hotword|world" not in lowered
+    assert "meeting_hyp" in lowered or "other-turn" in lowered or "其它" in blob or "其他" in blob
     assert "punctuation" in lowered or "标点" in blob
     assert "entity" in lowered or "实体" in blob
     assert "code" in lowered or "中英" in blob
@@ -363,6 +438,85 @@ def test_polish_prompt_forbids_itn_and_undisciplined_rewrites():
     assert "evidence" in lowered or "证据" in blob
     assert "0.61" in blob and "reject" in lowered
     assert "no number" in lowered or "number normalization" in lowered
+
+
+def test_run_polish_recovers_entity_from_other_turn_hyp():
+    """Phonetic finals both wrong; another unit's Qwen hyp has the canonical name."""
+    turns = [
+        Turn(0, 2, "s0", "找张三风签字"),
+        Turn(2, 4, "s1", "人还没到"),
+    ]
+    texts = {0: turns[0].text, 1: turns[1].text}
+    hyps = {
+        0: [Hypothesis("moss", "找张三风签字"), Hypothesis("qwen", "找张三风签字")],
+        1: [Hypothesis("moss", "人还没到"), Hypothesis("qwen", "张三丰已经到了")],
+    }
+    out, audits = run_polish(
+        turns, texts, llm_judge=MockLlmJudge(), hyp_by_turn=hyps
+    )
+    assert "张三丰" in out[0]
+    assert "张三风" not in out[0]
+    hit = next(a for a in audits if a.get("span_asr") == "张三风")
+    assert hit["span_out"] == "张三丰"
+    assert hit["anchor"] == "meeting_hyp"
+
+
+def test_run_polish_skips_llm_when_hyps_agree_with_draft():
+    class Spy:
+        def __init__(self):
+            self.n = 0
+
+        def polish(self, **kwargs):
+            self.n += 1
+            return {
+                "text": "改成别的",
+                "edits": [
+                    {
+                        "span_asr": "明天开会",
+                        "span_out": "改成别的",
+                        "kind": "entity",
+                        "anchor": "hyp",
+                        "evidence": "should not run",
+                    }
+                ],
+            }
+
+    turns = [Turn(0, 2, "s0", "明天开会")]
+    texts = {0: "明天开会"}
+    hyps = {
+        0: [
+            Hypothesis("moss", "明天开会"),
+            Hypothesis("qwen", "明天开会"),
+            Hypothesis("firered", "明天开会"),
+        ]
+    }
+    spy = Spy()
+    out, audits = run_polish(turns, texts, llm_judge=spy, hyp_by_turn=hyps)
+    assert spy.n == 0
+    assert out[0] == "明天开会"
+    assert any(a.get("path") == "hyps_agree_skip" for a in audits)
+
+
+def test_run_polish_still_calls_llm_when_hyps_disagree():
+    class Spy:
+        def __init__(self):
+            self.n = 0
+
+        def polish(self, **kwargs):
+            self.n += 1
+            return {"text": kwargs["text"], "edits": []}
+
+    turns = [Turn(0, 2, "s0", "以前那个温度的问题")]
+    texts = {0: turns[0].text}
+    hyps = {
+        0: [
+            Hypothesis("moss", "以前那个温度的问题"),
+            Hypothesis("qwen", "以前那个Windows的问题"),
+        ]
+    }
+    spy = Spy()
+    run_polish(turns, texts, llm_judge=spy, hyp_by_turn=hyps)
+    assert spy.n == 1
 
 
 def test_run_polish_recovers_windows_from_asr_hyp():

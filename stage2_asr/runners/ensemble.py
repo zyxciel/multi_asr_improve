@@ -2,6 +2,7 @@ from __future__ import annotations
 
 """Combine MOSS provisional text with Qwen + FireRed runners."""
 
+from stage2_asr.runners.compat import transcribe_unit_compat
 from stage2_asr.text_map import join_turn_texts
 from stage2_asr.types import AsrUnit, Hypothesis, Turn
 
@@ -44,25 +45,25 @@ class EnsembleAsrRunner:
             return hyps
         # Prefer calling with crop_path if runners accept it
         if "qwen" in selected:
-            try:
-                hyps.extend(
-                    self.qwen_runner.transcribe_unit(
-                        unit, turns, audio_path, moss_exclusive=False, crop_path=crop_path
-                    )
+            hyps.extend(
+                transcribe_unit_compat(
+                    self.qwen_runner,
+                    unit,
+                    turns,
+                    audio_path,
+                    moss_exclusive=False,
+                    crop_path=crop_path,
                 )
-            except TypeError:
-                hyps.extend(
-                    self.qwen_runner.transcribe_unit(unit, turns, audio_path, moss_exclusive=False)
-                )
+            )
         if "firered" in selected:
-            try:
-                hyps.extend(
-                    self.firered_runner.transcribe_unit(
-                        unit, turns, audio_path, moss_exclusive=False, crop_path=crop_path
-                    )
+            hyps.extend(
+                transcribe_unit_compat(
+                    self.firered_runner,
+                    unit,
+                    turns,
+                    audio_path,
+                    moss_exclusive=False,
+                    crop_path=crop_path,
                 )
-            except TypeError:
-                hyps.extend(
-                    self.firered_runner.transcribe_unit(unit, turns, audio_path, moss_exclusive=False)
-                )
+            )
         return hyps

@@ -43,7 +43,7 @@ def test_pass_a_repairs_with_tier_c():
     assert audit.get("skipped_llm") is False
 
 
-def test_pass_a_deepseek_fallback_after_qwen_failures():
+def test_pass_a_fallback_judge_after_qwen_failures():
     unit = AsrUnit("u", 0, 1, "s0", [0])
     turns = [Turn(0, 1, "s0", "你好")]
     hyps = [Hypothesis("moss", "你好"), Hypothesis("qwen", "您好")]
@@ -54,8 +54,8 @@ def test_pass_a_deepseek_fallback_after_qwen_failures():
         def judge(self, **kwargs):
             return {"text": "only"}
 
-    class DeepSeekOk:
-        name = "deepseek"
+    class FallbackOk:
+        name = "fallback"
 
         def judge(self, **kwargs):
             return {
@@ -71,12 +71,12 @@ def test_pass_a_deepseek_fallback_after_qwen_failures():
         hyps=hyps,
         draft_texts={0: "你好"},
         llm_judge=AlwaysBad(),
-        fallback_judge=DeepSeekOk(),
+        fallback_judge=FallbackOk(),
         hotwords=[],
         config=PipelineConfig(llm_max_retries=1),
     )
     assert text == "你好"
-    assert audit.get("fallback_judge") == "deepseek"
+    assert audit.get("fallback_judge") == "fallback"
     assert audit.get("fallback_judge_ok") is True
     assert audit.get("fallback") is not True
 
@@ -316,3 +316,42 @@ def test_pass_a_does_not_double_full_moss_text_on_split_slices():
         config=PipelineConfig(),
     )
     assert draft[0] == full
+
+
+def test_pass_a_retry_backoff_sleeps_between_attempts(monkeypatch):
+    sleeps: list[float] = []
+    monkeypatch.setattr("stage2_asr.llm_retry.time.sleep", lambda s: sleeps.append(s))
+
+    unit = AsrUnit("u", 0, 1, "s0", [0])
+    turns = [Turn(0, 1, "s0", "你好")]
+    hyps = [Hypothesis("moss", "你好"), Hypothesis("qwen", "你好吗")]
+
+    class Flaky:
+        name = "qwen36"
+
+        def __init__(self) -> None:
+            self.n = 0
+
+        def judge(self, **kwargs):
+            self.n += 1
+            if self.n == 1:
+                return {"text": "only"}
+            return {
+                "text": "你好",
+                "base_model": "moss",
+                "edits": [],
+                "overlap": False,
+            }
+
+    text, audit = run_pass_a_for_unit(
+        unit=unit,
+        turns=turns,
+        hyps=hyps,
+        draft_texts={0: "你好"},
+        llm_judge=Flaky(),
+        hotwords=[],
+        config=PipelineConfig(llm_max_retries=2, llm_retry_backoff_s=0.25),
+    )
+    assert text == "你好"
+    assert audit.get("retries") == 1
+    assert sleeps == [0.25]

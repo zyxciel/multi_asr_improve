@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from stage2_asr.agreement import all_hyps_agree, normalize_for_cer, pick_best_hyp
+from stage2_asr.llm_retry import sleep_before_retry
 from stage2_asr.text_map import assign_unit_text
 from stage2_asr.types import AsrUnit, Edit, Hypothesis, PipelineConfig, Turn
 from stage2_asr.validators import (
@@ -150,7 +151,9 @@ def run_pass_a_for_unit(
 
     neighbors = _neighbor_draft(turns, unit, draft_texts, config)
     last_err = None
+    backoff = float(getattr(config, "llm_retry_backoff_s", 0.0))
     for attempt in range(config.llm_max_retries + 1):
+        sleep_before_retry(attempt, backoff)
         raw, err = _try_judge(
             llm_judge,
             hyps=hyps,
@@ -160,8 +163,8 @@ def run_pass_a_for_unit(
         )
         if raw is None:
             last_err = err
-            audit["retries"] = attempt + 1
             continue
+        audit["retries"] = attempt
         return _finalize_from_raw(
             raw=raw,
             unit=unit,
@@ -170,6 +173,7 @@ def run_pass_a_for_unit(
             audit=audit,
         )
 
+    audit["retries"] = int(config.llm_max_retries)
     if fallback_judge is not None:
         audit["fallback_judge"] = getattr(fallback_judge, "name", "fallback")
         raw, err = _try_judge(
@@ -315,7 +319,7 @@ def run_pass_a_batch(
         chunk: list[dict],
         raws: list,
         *,
-        attempt: int,
+        attempt: int | None,
     ) -> list[dict]:
         """Finalize valid judgments; return items that still need another try."""
         deferred: list[dict] = []
@@ -323,29 +327,35 @@ def run_pass_a_batch(
             i = p["index"]
             audit = p["audit"]
             if isinstance(raw, BaseException):
-                audit["retries"] = attempt
+                if attempt is not None:
+                    audit["retries"] = attempt
                 audit["last_error"] = str(raw)
                 deferred.append(p)
                 continue
             ok, err = validate_judgment_schema(raw)
             if not ok:
-                audit["retries"] = attempt
+                if attempt is not None:
+                    audit["retries"] = attempt
                 audit["last_error"] = err
                 deferred.append(p)
                 continue
             judgment = judgment_from_payload(raw)
             ok2, err2 = validate_edits_span_local(judgment.edits)
             if not ok2:
-                audit["retries"] = attempt
+                if attempt is not None:
+                    audit["retries"] = attempt
                 audit["last_error"] = err2
                 deferred.append(p)
                 continue
             ok3, err3 = validate_edits_evidence_ladder(judgment.edits)
             if not ok3:
-                audit["retries"] = attempt
+                if attempt is not None:
+                    audit["retries"] = attempt
                 audit["last_error"] = err3
                 deferred.append(p)
                 continue
+            if attempt is not None:
+                audit["retries"] = attempt
             text, audit2 = _finalize_from_raw(
                 raw=raw,
                 unit=p["unit"],
@@ -364,12 +374,13 @@ def run_pass_a_batch(
         still = _accept_or_defer(
             chunk,
             llm_judge.judge_many(_jobs_for(chunk), max_workers=batch_size),
-            attempt=1,
+            attempt=0,
         )
-        # attempt 0 was the first batch; remaining retries are 2..llm_max_retries+1
-        for attempt in range(2, config.llm_max_retries + 2):
+        backoff = float(getattr(config, "llm_retry_backoff_s", 0.0))
+        for attempt in range(1, config.llm_max_retries + 1):
             if not still:
                 break
+            sleep_before_retry(attempt, backoff)
             still = _accept_or_defer(
                 still,
                 llm_judge.judge_many(_jobs_for(still), max_workers=batch_size),
@@ -383,7 +394,7 @@ def run_pass_a_batch(
             still = _accept_or_defer(
                 before,
                 fallback_judge.judge_many(_jobs_for(before), max_workers=batch_size),
-                attempt=max(int(before[0]["audit"].get("retries") or 0), 1),
+                attempt=None,
             )
             recovered = {p["index"] for p in before} - {p["index"] for p in still}
             for idx in recovered:
@@ -427,8 +438,10 @@ def run_pass_a_batch(
     # Apply draft updates in original order.
     out: list[tuple[str, dict]] = []
     for i, item in enumerate(items):
-        assert results[i] is not None
-        text, audit = results[i]  # type: ignore[misc]
+        got = results[i]
+        if got is None:
+            raise RuntimeError(f"Pass A batch missing result for item {i}")
+        text, audit = got
         out.append((text, audit))
         _commit_unit_text(draft_texts, item["unit"], text, turns, written)
     return out

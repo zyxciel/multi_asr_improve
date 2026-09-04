@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from stage2_asr.llm_retry import sleep_before_retry
 from stage2_asr.publish_itn import itn_edit_allowed
 from stage2_asr.types import PipelineConfig, Turn
 
@@ -353,10 +354,16 @@ def filter_publish_edits(
     return kept, None
 
 
-def apply_publish_edits(meeting: str, edits: list[dict]) -> tuple[str, list[dict]]:
+def apply_publish_edits(
+    meeting: str,
+    edits: list[dict],
+    glossary_terms: list | None = None,
+) -> tuple[str, list[dict]]:
     located = [e for e in edits if isinstance(e, dict) and "start_char" in e and "end_char" in e]
     if any("start_char" not in e for e in edits if isinstance(e, dict)):
-        located, _ = filter_publish_edits(edits, meeting=meeting, glossary_terms=[])
+        located, _ = filter_publish_edits(
+            edits, meeting=meeting, glossary_terms=glossary_terms or []
+        )
     out = meeting
     for loc in sorted(located, key=lambda x: (x["start_char"], x["end_char"]), reverse=True):
         out = out[: loc["start_char"]] + loc["span_out"] + out[loc["end_char"] :]
@@ -381,30 +388,91 @@ def load_glossary(path: Path | None) -> dict:
     }
 
 
+def _surface_key(item: Any) -> str:
+    if isinstance(item, dict):
+        return str(item.get("surface") or "").strip()
+    if isinstance(item, str):
+        return item.strip()
+    return ""
+
+
+def _term_from_extract(t: dict) -> dict:
+    return {
+        "surface": str(t.get("surface") or "").strip(),
+        "aliases": list(t.get("aliases") or []),
+        "kind": str(t.get("kind") or "other"),
+        "latex": t.get("latex"),
+        "source": "extract",
+    }
+
+
+def _upsert_by_surface(base: list, incoming: Any, *, as_term: bool = False) -> list:
+    """Union by surface; incoming covers the same key. Missing/empty incoming keeps base."""
+    by: dict[str, Any] = {}
+    order: list[str] = []
+    for item in base or []:
+        key = _surface_key(item)
+        if not key:
+            continue
+        if key not in by:
+            order.append(key)
+        by[key] = item
+    if isinstance(incoming, list):
+        for item in incoming:
+            if as_term:
+                if not isinstance(item, dict):
+                    continue
+                key = _surface_key(item)
+                if not key:
+                    continue
+                item = _term_from_extract(item)
+            else:
+                key = _surface_key(item)
+                if not key:
+                    continue
+            if key not in by:
+                order.append(key)
+            by[key] = item
+    return [by[key] for key in order]
+
+
 def merge_glossary(seed: dict, extract: dict | None) -> dict:
-    seed_terms = [t for t in (seed.get("terms") or []) if isinstance(t, dict)]
-    seen = {str(t.get("surface") or "") for t in seed_terms if t.get("surface")}
-    merged_terms = [{**t, "source": t.get("source") or "seed"} for t in seed_terms]
+    """Union seed ∪ extract. Same surface: this-round extract covers seed."""
+    seed = seed if isinstance(seed, dict) else {}
+    seed_terms: list[dict] = []
+    for t in seed.get("terms") or []:
+        if not isinstance(t, dict) or not _surface_key(t):
+            continue
+        seed_terms.append({**t, "source": t.get("source") or "seed"})
     extract = extract if isinstance(extract, dict) else {}
-    for t in extract.get("new_terms") or []:
-        if not isinstance(t, dict):
+    seed_kw = seed.get("keywords") if isinstance(seed.get("keywords"), list) else []
+    seed_rare = seed.get("rare_words") if isinstance(seed.get("rare_words"), list) else []
+    return {
+        "terms": _upsert_by_surface(seed_terms, extract.get("new_terms"), as_term=True),
+        "keywords": _upsert_by_surface(seed_kw, extract.get("keywords")),
+        "rare_words": _upsert_by_surface(seed_rare, extract.get("rare_words")),
+    }
+
+
+def union_glossary(base: dict | None, incoming: dict | None) -> dict:
+    """Union two glossary dicts. Same surface: incoming covers."""
+    base = base if isinstance(base, dict) else {}
+    incoming = incoming if isinstance(incoming, dict) else {}
+    base_terms = [t for t in (base.get("terms") or []) if isinstance(t, dict)]
+    inc_terms: list[dict] = []
+    for t in incoming.get("terms") or []:
+        if not isinstance(t, dict) or not _surface_key(t):
             continue
-        surface = str(t.get("surface") or "").strip()
-        if not surface or surface in seen:
-            continue
-        seen.add(surface)
-        merged_terms.append(
-            {
-                "surface": surface,
-                "aliases": list(t.get("aliases") or []),
-                "kind": str(t.get("kind") or "other"),
-                "latex": t.get("latex"),
-                "source": "extract",
-            }
-        )
-    keywords = extract.get("keywords") if isinstance(extract.get("keywords"), list) else []
-    rare = extract.get("rare_words") if isinstance(extract.get("rare_words"), list) else []
-    return {"terms": merged_terms, "keywords": keywords, "rare_words": rare}
+        inc_terms.append({**t, "source": t.get("source") or "seed"})
+    base_kw = base.get("keywords") if isinstance(base.get("keywords"), list) else []
+    inc_kw = incoming.get("keywords") if isinstance(incoming.get("keywords"), list) else []
+    base_rare = base.get("rare_words") if isinstance(base.get("rare_words"), list) else []
+    inc_rare = incoming.get("rare_words") if isinstance(incoming.get("rare_words"), list) else []
+    return {
+        "terms": _upsert_by_surface(base_terms, inc_terms),
+        "keywords": _upsert_by_surface(base_kw, inc_kw),
+        "rare_words": _upsert_by_surface(base_rare, inc_rare),
+    }
 
 
 def _latin_ok_after(src: str, dst: str, applied: list[dict]) -> bool:
@@ -442,7 +510,9 @@ def run_publish(
     original_meeting = concat_meeting(out, speakers)
     accepted = None
     last_err = None
+    backoff = float(getattr(cfg, "llm_retry_backoff_s", 0.0))
     for _attempt in range(int(cfg.llm_max_retries) + 1):
+        sleep_before_retry(_attempt, backoff)
         try:
             raw = llm_judge.publish(
                 meeting=original_meeting,
@@ -476,7 +546,9 @@ def run_publish(
             meeting=original_meeting,
             glossary_terms=terms,
         )
-        published_meeting, located = apply_publish_edits(original_meeting, kept)
+        published_meeting, located = apply_publish_edits(
+            original_meeting, kept, glossary_terms=terms
+        )
         if not _latin_ok_after(original_meeting, published_meeting, located):
             published_meeting = original_meeting
             located = []
@@ -494,6 +566,7 @@ def run_publish(
         eval_payload = None
         last_err = None
         for _attempt in range(int(cfg.llm_max_retries) + 1):
+            sleep_before_retry(_attempt, backoff)
             try:
                 eval_payload = llm_judge.eval_publish(
                     original=original_meeting,
@@ -534,6 +607,7 @@ def run_publish(
     extract_raw = None
     if hasattr(llm_judge, "extract_terms"):
         for _attempt in range(int(cfg.llm_max_retries) + 1):
+            sleep_before_retry(_attempt, backoff)
             try:
                 extract_raw = llm_judge.extract_terms(
                     meeting=concat_meeting(out, speakers),

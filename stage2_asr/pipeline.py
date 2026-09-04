@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -12,7 +13,8 @@ from stage2_asr.llm_log import LlmInferLogger
 from stage2_asr.pass_a import run_pass_a_batch
 from stage2_asr.pass_b import run_pass_b
 from stage2_asr.polish import hyps_by_merged_from_records, hyps_by_turn_from_records, run_polish
-from stage2_asr.publish import load_glossary, render_transcript, run_publish
+from stage2_asr.publish import load_glossary, render_transcript, run_publish, union_glossary
+from stage2_asr.runners.compat import transcribe_unit_compat
 from stage2_asr.text_map import (
     assign_unit_text,
     distribute_unit_text,
@@ -72,23 +74,65 @@ def _load_audio_optional(audio_path: Path, sr: int) -> np.ndarray | None:
         return None
 
 
-def _load_units(path: Path) -> list[AsrUnit] | None:
+def _source_fingerprint(input_json: Path, audio_path: Path, cfg: PipelineConfig) -> str:
+    """Hash Mode-C bytes + audio size/mtime + unit-affecting config."""
+    h = hashlib.sha256()
+    if input_json.exists():
+        h.update(input_json.read_bytes())
+    else:
+        h.update(b"missing-input")
+    if audio_path.exists():
+        st = audio_path.stat()
+        h.update(f"{st.st_size}:{st.st_mtime_ns}".encode())
+    else:
+        h.update(b"missing-audio")
+    h.update(
+        f"{cfg.max_asr_seconds}:{cfg.max_gap_seconds}:{cfg.min_asr_seconds}:"
+        f"{cfg.min_valid_seconds}:{cfg.heavy_overlap_threshold}:{cfg.sample_rate}:"
+        f"{cfg.energy_window_ms}:{cfg.energy_hop_ms}:{cfg.edge_zone_ratio}".encode()
+    )
+    return h.hexdigest()
+
+
+def _load_units(
+    path: Path, expected_fingerprint: str | None = None
+) -> list[AsrUnit] | None:
     if not path.exists():
         return None
     payload = json.loads(path.read_text(encoding="utf-8"))
+    if expected_fingerprint is not None:
+        got = payload.get("source_fingerprint") if isinstance(payload, dict) else None
+        if got != expected_fingerprint:
+            return None
     raw = payload.get("units") if isinstance(payload, dict) else payload
     if not isinstance(raw, list) or not raw:
         return None
     return [AsrUnit.from_dict(u) for u in raw]
 
 
-def _save_units(path: Path, units: list[AsrUnit], skipped: list[Any]) -> None:
+def _units_fingerprint_mismatch(path: Path, expected: str) -> bool:
+    """True when asr_units.json exists but its fingerprint is missing or differs."""
+    if not path.exists():
+        return False
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    got = payload.get("source_fingerprint") if isinstance(payload, dict) else None
+    return got != expected
+
+
+def _save_units(
+    path: Path,
+    units: list[AsrUnit],
+    skipped: list[Any],
+    source_fingerprint: str | None = None,
+) -> None:
+    payload: dict[str, Any] = {
+        "units": [u.to_dict() for u in units],
+        "skipped_invalid_ts": skipped,
+    }
+    if source_fingerprint:
+        payload["source_fingerprint"] = source_fingerprint
     path.write_text(
-        json.dumps(
-            {"units": [u.to_dict() for u in units], "skipped_invalid_ts": skipped},
-            ensure_ascii=False,
-            indent=2,
-        ),
+        json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
@@ -200,6 +244,7 @@ def _summarize_polish(audits: list[dict]) -> dict[str, Any]:
         "n_audits": len(audits),
         "llm_edits": sum(1 for a in audits if a.get("path") == "llm" and not a.get("fallback")),
         "empty_edits_reject": sum(1 for a in audits if a.get("path") == "empty_edits_reject"),
+        "hyps_agree_skip": sum(1 for a in audits if a.get("path") == "hyps_agree_skip"),
         "fallback": sum(1 for a in audits if a.get("fallback")),
         "by_kind": kinds,
         "by_anchor": anchors,
@@ -353,7 +398,9 @@ def _persist_publish(
         )
     _log(f"[publish] start: {len(turns)} turns from {source.name} work_dir={work_dir}")
     texts = {i: t.text for i, t in enumerate(turns)}
-    glossary = cfg.glossary if isinstance(getattr(cfg, "glossary", None), dict) else load_glossary(None)
+    prior = load_glossary(work_dir / "glossary.json")
+    cli = cfg.glossary if isinstance(getattr(cfg, "glossary", None), dict) else None
+    glossary = union_glossary(prior, cli) if cli is not None else prior
     published_map, audits, glossary_out, eval_payload = run_publish(
         turns,
         texts,
@@ -507,6 +554,17 @@ def _moss_hypothesis_from_turns(unit: AsrUnit, turns: list[Turn]) -> Hypothesis 
     )
 
 
+def _unit_covers_member_turns(unit: AsrUnit, turns: list[Turn]) -> bool:
+    """False for long-turn slices: Mode-C text is the full turn, not the slice."""
+    for i in unit.turn_indices:
+        if not (0 <= i < len(turns)):
+            return False
+        t = turns[i]
+        if float(t.start) < float(unit.start) - 1e-4 or float(t.end) > float(unit.end) + 1e-4:
+            return False
+    return True
+
+
 def _ensure_moss_hyp(
     hyps: list[Hypothesis],
     unit: AsrUnit,
@@ -514,10 +572,10 @@ def _ensure_moss_hyp(
     *,
     selected: set[str],
 ) -> list[Hypothesis]:
-    """Guarantee a moss hyp from Mode-C text when moss is requested (no GPU)."""
+    """Refresh moss from current Mode-C text when the unit covers those turns."""
     if "moss" not in selected:
         return hyps
-    if any(h.model == "moss" and (h.text or "").strip() for h in hyps):
+    if not _unit_covers_member_turns(unit, turns):
         return hyps
     moss = _moss_hypothesis_from_turns(unit, turns)
     if moss is None:
@@ -707,21 +765,46 @@ def _run_pipeline_body(
     turns, skipped = validate_turns(raw_turns, cfg)
     audio = _load_audio_optional(audio_path, cfg.sample_rate)
     units_path = work_dir / "asr_units.json"
+    source_fp = _source_fingerprint(input_json, audio_path, cfg)
+    force_refresh = bool(getattr(cfg, "force_refresh", False))
 
     # Reload persisted units so staged ASR (qwen/firered, then moss) keeps the same unit_id keys.
     reuse_units = stage in {"pass_a", "pass_b", "llm"} or (
-        stage == "asr" and units_path.exists()
+        stage == "asr" and units_path.exists() and not force_refresh
     )
+    invalidate_asr_cache = force_refresh
     if reuse_units:
-        loaded = _load_units(units_path)
-        if loaded is not None:
+        mismatch = _units_fingerprint_mismatch(units_path, source_fp)
+        if mismatch and stage in {"pass_a", "pass_b", "llm"}:
+            if not force_refresh:
+                raise RuntimeError(
+                    "Input/audio fingerprint does not match asr_units.json. "
+                    "Re-run --stage asr before pass_a/pass_b/llm, "
+                    "or pass --force-refresh to reuse stale units."
+                )
+            _log(
+                f"[{stage}] asr_units.json fingerprint mismatch; "
+                "--force-refresh reusing stale units"
+            )
+            loaded = _load_units(units_path)
+            if loaded is None:
+                raise FileNotFoundError(f"{units_path} missing; run --stage asr first.")
             units = loaded
-        else:
+        elif mismatch:
+            _log("[asr] asr_units.json source fingerprint mismatch; rebuilding units")
             units = build_asr_units(turns, cfg, audio=audio, sample_rate=cfg.sample_rate)
-            _save_units(units_path, units, skipped)
+            _save_units(units_path, units, skipped, source_fingerprint=source_fp)
+            invalidate_asr_cache = True
+        else:
+            loaded = _load_units(units_path)
+            if loaded is not None:
+                units = loaded
+            else:
+                units = build_asr_units(turns, cfg, audio=audio, sample_rate=cfg.sample_rate)
+                _save_units(units_path, units, skipped, source_fingerprint=source_fp)
     else:
         units = build_asr_units(turns, cfg, audio=audio, sample_rate=cfg.sample_rate)
-        _save_units(units_path, units, skipped)
+        _save_units(units_path, units, skipped, source_fingerprint=source_fp)
 
     asr_runner_name = f"{getattr(asr_runner, 'name', 'asr')}__{'-'.join(sorted(normalized_models))}"
     hyp_path = work_dir / "asr_hypotheses.json"
@@ -761,7 +844,8 @@ def _run_pipeline_body(
                 selected_for_call.add("moss")
             cache = _cache_path(work_dir, unit.unit_id, asr_runner_name)
             hyps: list[Hypothesis] | None = None
-            if cache.exists():
+            skip_cache = invalidate_asr_cache
+            if cache.exists() and not skip_cache:
                 cached = json.loads(cache.read_text(encoding="utf-8"))
                 cached_hyps = [
                     Hypothesis(
@@ -805,24 +889,15 @@ def _run_pipeline_body(
                     f"[asr] {asr_i}/{n_asr} {unit.unit_id} transcribe "
                     f"({crop_note}) models={sorted(selected_for_call)}"
                 )
-                try:
-                    hyps = asr_runner.transcribe_unit(
-                        unit,
-                        turns,
-                        str(audio_path),
-                        moss_exclusive=unit.heavy_overlap,
-                        crop_path=crop_path,
-                        selected_models=selected_for_call,
-                    )
-                except TypeError:
-                    hyps = asr_runner.transcribe_unit(
-                        unit,
-                        turns,
-                        str(audio_path),
-                        moss_exclusive=unit.heavy_overlap,
-                        crop_path=crop_path,
-                    )
-                    hyps = [h for h in hyps if h.model in selected_for_call]
+                hyps = transcribe_unit_compat(
+                    asr_runner,
+                    unit,
+                    turns,
+                    str(audio_path),
+                    moss_exclusive=unit.heavy_overlap,
+                    crop_path=crop_path,
+                    selected_models=selected_for_call,
+                )
             hyps = _ensure_moss_hyp(
                 hyps, unit, turns, selected=selected_for_call
             )
@@ -1027,9 +1102,7 @@ def _run_pipeline_body(
     _log(f"[pass_a] wrote {draft_path}")
     if stage == "pass_a":
         edits_path = work_dir / "llm_edits.jsonl"
-        with edits_path.open("w", encoding="utf-8") as f:
-            for a in pass_a_audits:
-                f.write(json.dumps({"pass": "A", **a}, ensure_ascii=False) + "\n")
+        _rewrite_edits_keep_other_passes(edits_path, "A", pass_a_audits)
         stats_path = work_dir / "pass_stats.json"
         pass_stats = _merge_pass_stats(stats_path, {"pass_a": _summarize_pass_a(pass_a_audits)})
         return {
@@ -1091,18 +1164,17 @@ def _run_pipeline_body(
     )
 
     edits_path = work_dir / "llm_edits.jsonl"
-    with edits_path.open("w", encoding="utf-8") as f:
-        for a in pass_a_audits:
-            f.write(json.dumps({"pass": "A", **a}, ensure_ascii=False) + "\n")
-        for a in pass_b_audits:
-            f.write(json.dumps(a, ensure_ascii=False) + "\n")
+    _rewrite_edits_keep_other_passes(edits_path, "A", pass_a_audits)
+    _rewrite_edits_keep_other_passes(edits_path, "B", pass_b_audits)
 
-    pass_stats = {
-        "pass_a": _summarize_pass_a(pass_a_audits),
-        "pass_b": _summarize_pass_b(pass_b_audits),
-    }
     stats_path = work_dir / "pass_stats.json"
-    stats_path.write_text(json.dumps(pass_stats, ensure_ascii=False, indent=2), encoding="utf-8")
+    pass_stats = _merge_pass_stats(
+        stats_path,
+        {
+            "pass_a": _summarize_pass_a(pass_a_audits),
+            "pass_b": _summarize_pass_b(pass_b_audits),
+        },
+    )
     _log(f"[stage={stage}] done: final={final_path} draft={draft_path}")
 
     extra: dict[str, Any] = {}

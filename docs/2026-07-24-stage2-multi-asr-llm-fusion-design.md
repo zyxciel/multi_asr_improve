@@ -31,7 +31,7 @@ Diarization `(start, end, speaker_id)` stays frozen.
 | Short skip | After concat, duration **&lt; 0.35 s** → no ASR; keep turn as timeline placeholder for Pass B |
 | Invalid TS | Discard `end-start &lt; 0.01s`, NaN/Inf; log `skipped_invalid_ts`; no repair |
 | Pass order | Pass A → `mode_c_draft.json` → Pass B → `mode_c_asr_final.json` |
-| Judge | [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) @ **T=0.1**; DeepSeek fallback; invalid JSON retry ≤2 then best hyp (MOSS if overlap) |
+| Judge | [Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) @ **T=0.1**; invalid JSON retry ≤2 then best hyp (MOSS if overlap) |
 | Eval B0 | **MOSS-from-fusion** (primary). Optional side baseline: single Qwen3-ASR |
 | Ablation | B0 → +concat multi-ASR → +dynamic overlap → +Pass A → +Pass B |
 | max_asr_seconds | Default **30**; config knob **60** pending model-card confirmation |
