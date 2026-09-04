@@ -47,7 +47,7 @@ hyps from asr_hypotheses.json (all engines, all units)
        extra allow-list: span in an approved subset may target that subset's chosen surface
        every edit still goes through validate_polish_edits (anchor/evidence)
   → deterministic check per approved entity subset
-       among cluster-channel edits in S: if landed writings are not unique → revert S's cluster-channel edits only
+       among intra-subset unify edits in S: if landed writings are not unique → revert S's intra-subset unify edits only
        leftover unedited mentions in S: do not revert; emit a warning record
   → write mode_c_polished.json (WER files untouched)
 ```
@@ -138,7 +138,7 @@ A false group may contain one or many surfaces. Semantics: **each listed surface
 ### Other rules
 
 - `canonical` is required when `same_entity` is true; it **must** be one of that subset's `surfaces` (a hyp-attested **full-run** writing). Reject the subset if not.
-- Invalid JSON / schema: treat the whole cluster as **no subsets** (no extra edits from this cluster). Retry with existing `llm_max_retries` / backoff, then give up.
+- Invalid JSON / schema (`subsets` missing or not a list): treat the whole cluster as **no subsets** (no extra edits from this cluster). Retry with existing `llm_max_retries` / backoff, then give up. A well-formed `{"subsets": []}` (or a list whose entries are all dropped) is a successful empty partition, not a retry.
 
 **Thinking:** allowed on this call only (`enable_thinking=True` for `pass=polish_cluster`), independent of polish generate.
 
@@ -160,7 +160,7 @@ Additional allow-list, computed from approved subsets (`same_entity` and valid `
 
 - If `span_asr` is a surface in subset S and `span_out == S.canonical`, the edit **may** use `anchor=meeting_hyp` (or `hyp` if this unit's n-best already has `canonical`) provided `validate_polish_edits` agrees.
 - Partition success only grants **eligibility**. If validator rejects (span not in text, missing evidence, CJK slack, etc.), drop that edit.
-- No unify permission for: `same_entity: false` surfaces (including multi-surface false groups), uncovered surfaces, or rejected subsets. Existing neighbor/hyp entity repairs **unrelated** to the cluster remain allowed.
+- **Deterministic deny:** if `span_asr` and `span_out` are both member surfaces of the same phonetic cluster, the edit is accepted only when the allow-list maps `span_asr → span_out`. This covers `same_entity: false` groups, uncovered surfaces, and rejected subsets. Existing neighbor/hyp entity repairs **unrelated** to the cluster (span_out not a member of that cluster) remain allowed.
 
 Polish prompt may include a short block listing **approved** mappings only (`张三风|涨三丰 → 涨三丰`), not raw unpartitioned clusters. Unapproved bags stay out of context.
 
@@ -172,9 +172,24 @@ After applying polish edits, for **each approved subset S** two different things
 
 ### Hard check (edits that ran)
 
-Collect landed text of spans that (a) belonged to S and (b) received a **cluster-channel** edit in this polish run.
+Collect landed text of spans that (a) belonged to S and (b) received an **intra-subset unify** in this polish run: `span_asr ∈ S.surfaces` and `span_out ∈ S.surfaces`.
 
-If those landed strings are not all equal to `S.canonical` (the applied edits disagree with each other or with the chosen surface), **revert only S's cluster-channel edits** from this run. Other subsets and non-cluster polish edits stay.
+> **Implementation note:** The spec's earlier phrase "cluster-channel edit" meant `span_asr` on the allow-list and `span_out == S.canonical`. Filtering the hard check on that predicate makes uniqueness vacuously true (every tagged edit already landed canonical) and would miss in-subset landings of a *different* S surface. Foreign-channel repairs (e.g. hotword `张三风 → 张三丰` when S's canonical is `涨三丰`) are excluded because `span_out ∉ S`. Do not "correct" this back to the cluster-channel tag.
+
+If those landed strings are not all equal to `S.canonical` (the applied edits disagree with each other or with the chosen surface), **revert only S's intra-subset unify edits** from this run. Other subsets and non-cluster polish edits stay.
+
+> **Layering note — deny is primary, hard check is the safety net:** with the §3
+> deterministic deny active, an edit whose `span_asr`/`span_out` are both member
+> surfaces of the same cluster is accepted only when the allow-list maps
+> `span_asr → span_out`; since the allow-list maps every conflict-free surface of
+> an approved subset to `S.canonical`, every landed intra-subset unify edit
+> already equals the canonical. The hard check therefore **cannot fire through
+> `run_polish`** while the deny is active. It is retained as defense-in-depth: if
+> the deny is ever relaxed (e.g. keyed only on partition-refused mappings) or a
+> future edit channel bypasses `validate_polish_edits`, this check is the
+> backstop that still enforces per-subset landed uniqueness. Do not delete it as
+> unreachable dead code, and do not relax the deny in order to exercise it
+> end-to-end.
 
 ### Leftover report (mentions polish left alone)
 
@@ -207,7 +222,7 @@ Subsets that never produced edits are not hard-checked for uniqueness (nothing t
 - Allow-list: approved mapping still fails validator if `canonical` is absent from meeting hyps (should not happen if construction is correct; guard anyway).
 - Two subsets in one cluster: A unified, B left mixed → check reverts nothing in B and does not revert A.
 - Approved subset: some mentions edited to canonical, some left unedited → **no** revert of the successful edits; leftover warning lists the unedited mentions.
-- Approved subset lands two **different** writings **among cluster-channel edits** → revert **that subset's cluster-channel edits only**.
+- Hard-check revert behavior (a subset's intra-subset unify edits land two different writings → revert only that subset) is covered at **unit level** with synthetic applied-edit audits, directly against the sweep/`revert_subsets_edits`. An end-to-end trigger through `run_polish` is impossible **by design** while the §3 deny is active; e2e tests instead assert that **no** `subset_revert` audit rows appear.
 - `llm_edits.jsonl` contains `polish_cluster` rows plus `polish` span rows.
 - `mode_c_asr_final.json` unchanged.
 
@@ -215,7 +230,7 @@ Subsets that never produced edits are not hard-checked for uniqueness (nothing t
 
 1. Chosen `canonical` ∈ hyp **full-run** surfaces of that entity subset.
 2. Cluster recall ≠ rewrite permission.
-3. Rollback grain = consistency grain = entity subset (hard check applies to cluster-channel **edits**, not to unedited leftovers).
+3. Rollback grain = consistency grain = entity subset (hard check applies to intra-subset unify **edits**, not to unedited leftovers).
 4. Partition call count = number of kept clusters, not mentions.
 5. Phonetic WER artifact is never written by this pass.
 6. Sliding-window substrings of a longer CJK run are never cluster members.

@@ -72,16 +72,18 @@ def test_full_run_phrase_residual_may_cluster():
 
 
 def test_transitive_closure_keeps_distant_pair():
-    # Construct A-B and B-C legal, A-C dist > 2 if possible; if hard with real names,
-    # use three surfaces where union-find still yields one cluster of size 3.
+    a, b, c = "张三丰来了", "张三丰走了", "张四海走了"
+    assert pair_surfaces(a, b) is True
+    assert pair_surfaces(b, c) is True
+    assert pair_surfaces(a, c) is False  # toneless dist 3 > 2
     recs = [
-        {"unit_id": "u0", "turn_indices": [0], "hyps": [{"model": "qwen", "text": "张三风"}]},
-        {"unit_id": "u1", "turn_indices": [1], "hyps": [{"model": "moss", "text": "涨三丰"}]},
-        {"unit_id": "u2", "turn_indices": [2], "hyps": [{"model": "firered", "text": "章三丰"}]},
+        {"unit_id": "u0", "turn_indices": [0], "hyps": [{"model": "qwen", "text": a}]},
+        {"unit_id": "u1", "turn_indices": [1], "hyps": [{"model": "moss", "text": b}]},
+        {"unit_id": "u2", "turn_indices": [2], "hyps": [{"model": "firered", "text": c}]},
     ]
     clusters = build_homophone_clusters(recs)
     assert len(clusters) == 1
-    assert set(clusters[0].surfaces) == {"张三风", "涨三丰", "章三丰"}
+    assert set(clusters[0].surfaces) == {a, b, c}
 
 
 def test_pair_surfaces_cache_does_not_change_rules():
@@ -99,6 +101,7 @@ def test_pair_surfaces_cache_does_not_change_rules():
 
 from stage2_asr.polish_cluster import (
     HomophoneCluster,
+    cluster_allow_conflicts,
     cluster_allow_list,
     parse_partition_payload,
 )
@@ -130,6 +133,29 @@ def test_false_multi_surface_empty_allow_list():
     raw = {"subsets": [{"surfaces": ["找张三丰", "签张三丰"], "canonical": None, "same_entity": False, "reason": "verbs"}]}
     subs = parse_partition_payload(raw, _cluster("找张三丰", "签张三丰"))
     assert cluster_allow_list(subs) == {}
+
+
+def test_cluster_allow_list_drops_within_cluster_conflict():
+    raw = {
+        "subsets": [
+            {
+                "surfaces": ["张三风", "涨三丰"],
+                "canonical": "涨三丰",
+                "same_entity": True,
+                "reason": "a",
+            },
+            {
+                "surfaces": ["张三风", "张三峰"],
+                "canonical": "张三峰",
+                "same_entity": True,
+                "reason": "b",
+            },
+        ]
+    }
+    subs = parse_partition_payload(raw, _cluster("张三风", "涨三丰", "张三峰"))
+    allow = cluster_allow_list(subs)
+    assert "张三风" not in allow
+    assert cluster_allow_conflicts(subs) == ["张三风"]
 
 
 # --- Task 3: subset hard check + leftover warning ---
@@ -264,6 +290,61 @@ def test_leftover_unedited_does_not_fail_unique():
     ]
 
 
+def test_leftover_mask_uses_post_apply_spans_when_prior_edit_changes_length():
+    """Canonical 找张三丰 contains 张三丰. A 2-char punc shrink before the
+    cluster edit must not leave a leftover_mix on already-unified text.
+    """
+    subset_s = _subset({"张三丰", "找张三丰"}, "找张三丰")
+    applied = [
+        {
+            "turn_index": 0,
+            "span_asr": "嗯嗯",
+            "span_out": "",
+            "kind": "punc",
+            "start_char": 0,
+            "end_char": 2,
+        },
+        {
+            "turn_index": 0,
+            "span_asr": "张三丰",
+            "span_out": "找张三丰",
+            "kind": "entity",
+            "start_char": 2,
+            "end_char": 5,
+        },
+    ]
+    texts = {0: "找张三丰来了"}
+    # Subset-only audits omit the punc length delta, so the pre-edit
+    # entity offset masks the wrong post-edit slice and 张三丰 inside
+    # 找张三丰 looks uncovered. Production must pass every landed polish
+    # audit of the turn (see `_cluster_subset_sweep`).
+    assert leftover_mentions(texts, subset_s, [applied[1]])
+    assert leftover_mentions(texts, subset_s, applied) == []
+
+
+def test_leftover_after_full_revert_does_not_warn_when_unmixed():
+    """Stale applied_for_s after a full subset revert must not emit leftover_mix."""
+    subset_s = _subset({"张三风", "涨三丰"}, "涨三丰")
+    texts = {0: "张三风先到。", 1: "张三风最后走。"}
+    applied_for_s = [
+        {
+            "turn_index": 0,
+            "span_asr": "张三风",
+            "span_out": "涨三丰",
+            "start_char": 0,
+            "end_char": 3,
+        },
+        {
+            "turn_index": 1,
+            "span_asr": "涨三丰",
+            "span_out": "张三风",
+            "start_char": 0,
+            "end_char": 3,
+        },
+    ]
+    assert leftover_mentions(texts, subset_s, applied_for_s) == []
+
+
 # --- Task 4: partition prompt + judge methods ---
 
 from stage2_asr.polish_cluster_prompt import (
@@ -307,6 +388,27 @@ def test_partition_prompt_tone_is_weak():
     assert "weak" in blob
     assert "do not weight" in blob
     assert "more willing to split" not in blob
+
+
+def test_partition_snippets_are_truncated():
+    long_hyp = "张三风" + ("啊" * 5000)
+    cluster = HomophoneCluster(
+        cluster_id="c0",
+        surfaces=("张三风", "涨三丰"),
+        hits=[
+            {
+                "surface": "张三风",
+                "model": "qwen",
+                "unit_id": "u0",
+                "turn_indices": [0],
+                "hyp_text": long_hyp,
+            }
+        ],
+        tone_mismatch_pairs=[],
+    )
+    blob = render_partition_user_prompt(cluster=cluster)
+    assert len(blob) < len(long_hyp)
+    assert "..." in blob or len(blob) < 8000
 
 
 def test_mock_partition_default_empty_allow_list():

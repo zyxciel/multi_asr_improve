@@ -913,12 +913,60 @@ def test_pipeline_polish_stage_requires_asr_final(tmp_path: Path):
 # --- Task 5: wire run_polish with homophone-cluster partition ---
 
 
+def test_validate_rejects_intra_cluster_unify_not_on_allow_list():
+    """Spec residual: both spans are cluster members, mapping not allowed."""
+    edit = {
+        "span_asr": "找张三丰",
+        "span_out": "签张三丰",
+        "kind": "entity",
+        "anchor": "meeting_hyp",
+        "evidence": "other-turn moss hyp contains 签张三丰",
+    }
+    meeting = [Hypothesis("moss", "签张三丰")]
+    # Old evidence check would accept this (span_out is in meeting_hyp).
+    ok, _ = validate_polish_edits(
+        [edit],
+        text="找张三丰签字",
+        meeting_hyps=meeting,
+    )
+    assert ok is True
+    ok, err = validate_polish_edits(
+        [edit],
+        text="找张三丰签字",
+        meeting_hyps=meeting,
+        cluster_allow={},
+        cluster_members=[frozenset({"找张三丰", "签张三丰"})],
+    )
+    assert ok is False
+    assert "allow-list" in (err or "").lower() or "cluster" in (err or "").lower()
+
+
+def test_validate_approved_mapping_still_needs_hyp_evidence():
+    """Spec §6: allow-list eligibility does not skip the evidence check."""
+    ok, err = validate_polish_edits(
+        [
+            {
+                "span_asr": "张三风",
+                "span_out": "涨三丰",
+                "kind": "entity",
+                "anchor": "meeting_hyp",
+                "evidence": "claimed other-turn hyp",
+            }
+        ],
+        text="找张三风签字",
+        meeting_hyps=[],
+        cluster_allow={"张三风": "涨三丰", "涨三丰": "涨三丰"},
+        cluster_members=[frozenset({"张三风", "涨三丰"})],
+    )
+    assert ok is False
+    assert "meeting_hyp" in (err or "") or "not found" in (err or "")
+
+
 def test_run_polish_allow_list_empty_when_mock_partition_false():
     """Full-run hyps 找张三丰/签张三丰 cluster; mock partition says same_entity: false.
 
-    The polish LLM may still try 找张三丰 → 签张三丰, but with an empty cluster
-    allow-list and no validator evidence the texts must stay unchanged and no
-    cluster-channel edit may be applied.
+    Meeting-hyp evidence would pass the old validator. The deterministic
+    cluster deny must still keep the texts unchanged.
     """
     hyp_records = [
         {
@@ -932,6 +980,10 @@ def test_run_polish_allow_list_empty_when_mock_partition_false():
             "hyps": [{"model": "moss", "text": "签张三丰"}],
         },
     ]
+    hyps = {
+        0: [Hypothesis("qwen", "找张三丰")],
+        1: [Hypothesis("moss", "签张三丰")],
+    }
 
     class SpanTryJudge:
         def partition_cluster(self, **kwargs):
@@ -957,7 +1009,7 @@ def test_run_polish_allow_list_empty_when_mock_partition_false():
                             "span_out": "签张三丰",
                             "kind": "entity",
                             "anchor": "meeting_hyp",
-                            "evidence": "claimed other-turn hyp",
+                            "evidence": "other-turn moss hyp contains 签张三丰",
                         }
                     ],
                 }
@@ -966,7 +1018,11 @@ def test_run_polish_allow_list_empty_when_mock_partition_false():
     turns = [Turn(0, 2, "s0", "找张三丰签字"), Turn(2, 4, "s1", "人还没到齐")]
     texts = {0: turns[0].text, 1: turns[1].text}
     out, audits = run_polish(
-        turns, texts, llm_judge=SpanTryJudge(), hyp_records=hyp_records
+        turns,
+        texts,
+        llm_judge=SpanTryJudge(),
+        hyp_by_turn=hyps,
+        hyp_records=hyp_records,
     )
     assert out[0] == "找张三丰签字"
     assert out[1] == "人还没到齐"
@@ -1143,18 +1199,249 @@ def test_run_polish_leftover_warns_without_revert():
     assert leftover[0]["turn_index"] == 1
     assert leftover[0]["surfaces"] == ["张三风"]
     assert leftover[0]["canonical"] == "涨三丰"
+    assert any(
+        a.get("pass") == "polish" and a.get("path") == "llm" for a in audits
+    )
+    assert any(a.get("pass") == "polish_cluster" for a in audits)
 
 
-def test_run_polish_revert_shifts_coords_after_length_change():
-    """A length-changing punc edit BEFORE a subset entity edit in the same
-    turn must not make the subset revert a no-op.
+def test_run_polish_leftover_mask_follows_prior_punc_length_change():
+    """Canonical 找张三丰 contains 张三丰. A same-turn 2-char punc delete
+    must not emit leftover_mix on the already-unified text.
+    """
+    hyp_records = [
+        {
+            "unit_id": "u0",
+            "turn_indices": [0],
+            "hyps": [{"model": "qwen", "text": "张三丰"}],
+        },
+        {
+            "unit_id": "u1",
+            "turn_indices": [0],
+            "hyps": [{"model": "moss", "text": "找张三丰"}],
+        },
+    ]
 
-    Turn 0 lands a punc edit (`，。` -> `。`, 2 chars -> 1) before the
-    cluster-channel edit 张三风->涨三丰; turn 1 lands 涨三丰->张三风 (an
-    in-subset, non-canonical writing). The hard check fails for the subset;
-    the revert must restore BOTH entity spans (audits record PRE-edit
-    offsets, so the revert converts them to post-apply coordinates) while
-    keeping the punc edit — no partial/wrong undo.
+    class PuncThenClusterJudge:
+        def partition_cluster(self, **kwargs):
+            return {
+                "subsets": [
+                    {
+                        "surfaces": ["张三丰", "找张三丰"],
+                        "canonical": "找张三丰",
+                        "same_entity": True,
+                        "reason": "same person",
+                    }
+                ]
+            }
+
+        def polish(self, **kwargs):
+            return {
+                "text": kwargs["text"],
+                "edits": [
+                    {"span_asr": "，。", "span_out": "", "kind": "punc"},
+                    {
+                        "span_asr": "张三丰",
+                        "span_out": "找张三丰",
+                        "kind": "entity",
+                        "anchor": "meeting_hyp",
+                        "evidence": "u1 moss hyp contains 找张三丰",
+                    },
+                ],
+            }
+
+    turns = [Turn(0, 2, "s0", "，。张三丰来了")]
+    hyps = {
+        0: [Hypothesis("qwen", "张三丰"), Hypothesis("moss", "找张三丰")],
+    }
+    out, audits = run_polish(
+        turns,
+        {0: turns[0].text},
+        llm_judge=PuncThenClusterJudge(),
+        hyp_by_turn=hyps,
+        hyp_records=hyp_records,
+    )
+    assert out[0] == "找张三丰来了"
+    assert not any(a.get("path") == "leftover_mix" for a in audits)
+
+
+def test_llm_edits_jsonl_keeps_polish_and_cluster_rows(tmp_path: Path):
+    """Spec §6: llm_edits.jsonl holds polish_cluster partition rows and polish span rows."""
+    from stage2_asr.pipeline import _rewrite_edits_keep_other_passes
+
+    hyp_records = [
+        {
+            "unit_id": "u0",
+            "turn_indices": [0],
+            "hyps": [
+                {"model": "qwen", "text": "张三风"},
+                {"model": "moss", "text": "张三风"},
+            ],
+        },
+        {
+            "unit_id": "u1",
+            "turn_indices": [1],
+            "hyps": [
+                {"model": "qwen", "text": "涨三丰"},
+                {"model": "moss", "text": "张三风"},
+            ],
+        },
+    ]
+
+    class ClusterPolishJudge:
+        def partition_cluster(self, **kwargs):
+            return {
+                "subsets": [
+                    {
+                        "surfaces": ["张三风", "涨三丰"],
+                        "canonical": "涨三丰",
+                        "same_entity": True,
+                        "reason": "same person",
+                    }
+                ]
+            }
+
+        def polish(self, **kwargs):
+            text = kwargs["text"]
+            if kwargs.get("turn_index") == 0 and "张三风" in text:
+                return {
+                    "text": text.replace("张三风", "涨三丰"),
+                    "edits": [
+                        {
+                            "span_asr": "张三风",
+                            "span_out": "涨三丰",
+                            "kind": "entity",
+                            "anchor": "meeting_hyp",
+                            "evidence": "u1 qwen hyp contains 涨三丰",
+                        }
+                    ],
+                }
+            return {"text": text, "edits": []}
+
+    turns = [Turn(0, 2, "s0", "请张三风发言"), Turn(2, 4, "s1", "张三风还没到")]
+    hyps = {
+        0: [Hypothesis("qwen", "张三风"), Hypothesis("moss", "张三风")],
+        1: [Hypothesis("qwen", "涨三丰"), Hypothesis("moss", "张三风")],
+    }
+    _, audits = run_polish(
+        turns,
+        {0: turns[0].text, 1: turns[1].text},
+        llm_judge=ClusterPolishJudge(),
+        hyp_by_turn=hyps,
+        hyp_records=hyp_records,
+    )
+    path = tmp_path / "llm_edits.jsonl"
+    polish_rows = [a for a in audits if a.get("pass") != "polish_cluster"]
+    cluster_rows = [a for a in audits if a.get("pass") == "polish_cluster"]
+    _rewrite_edits_keep_other_passes(path, "polish", polish_rows)
+    _rewrite_edits_keep_other_passes(path, "polish_cluster", cluster_rows)
+    rows = [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert any(r.get("pass") == "polish" and r.get("path") == "llm" for r in rows)
+    assert any(r.get("pass") == "polish_cluster" for r in rows)
+
+
+def test_partition_invalid_schema_retries_then_fallback():
+    """Dict payloads with a non-list `subsets` are schema-illegal: retry, then fallback."""
+
+    class GarbageThenEmpty:
+        def __init__(self):
+            self.n = 0
+
+        def partition_cluster(self, **kwargs):
+            self.n += 1
+            return {"subsets": "garbage"}
+
+        def polish(self, **kwargs):
+            return {"text": kwargs["text"], "edits": []}
+
+    hyp_records = [
+        {
+            "unit_id": "u0",
+            "turn_indices": [0],
+            "hyps": [{"model": "qwen", "text": "张三风"}],
+        },
+        {
+            "unit_id": "u1",
+            "turn_indices": [1],
+            "hyps": [{"model": "moss", "text": "涨三丰"}],
+        },
+    ]
+    turns = [Turn(0, 2, "s0", "请张三风发言")]
+    judge = GarbageThenEmpty()
+    _, audits = run_polish(
+        turns,
+        {0: turns[0].text},
+        llm_judge=judge,
+        hyp_records=hyp_records,
+        config=PipelineConfig(llm_max_retries=2),
+    )
+    assert judge.n == 3
+    row = next(a for a in audits if a.get("path") == "partition")
+    assert row["ok"] is False
+    assert row.get("fallback") is True
+
+
+def test_partition_audit_lists_allow_list_conflicts():
+    hyp_records = [
+        {
+            "unit_id": "u0",
+            "turn_indices": [0],
+            "hyps": [{"model": "qwen", "text": "张三风"}],
+        },
+        {
+            "unit_id": "u1",
+            "turn_indices": [1],
+            "hyps": [{"model": "moss", "text": "涨三丰"}],
+        },
+        {
+            "unit_id": "u2",
+            "turn_indices": [2],
+            "hyps": [{"model": "firered", "text": "张三峰"}],
+        },
+    ]
+
+    class ConflictJudge:
+        def partition_cluster(self, **kwargs):
+            return {
+                "subsets": [
+                    {
+                        "surfaces": ["张三风", "涨三丰"],
+                        "canonical": "涨三丰",
+                        "same_entity": True,
+                        "reason": "a",
+                    },
+                    {
+                        "surfaces": ["张三风", "张三峰"],
+                        "canonical": "张三峰",
+                        "same_entity": True,
+                        "reason": "b",
+                    },
+                ]
+            }
+
+        def polish(self, **kwargs):
+            return {"text": kwargs["text"], "edits": []}
+
+    _, audits = run_polish(
+        [Turn(0, 2, "s0", "请张三风发言")],
+        {0: "请张三风发言"},
+        llm_judge=ConflictJudge(),
+        hyp_records=hyp_records,
+    )
+    row = next(a for a in audits if a.get("path") == "partition")
+    assert "张三风" in (row.get("conflicts") or [])
+
+
+def test_run_polish_deny_blocks_non_canonical_intra_cluster_unify():
+    """A length-changing punc edit plus an approved canonical unify both land.
+
+    The reverse intra-cluster unify (涨三丰 → 张三风) is not on the allow-list
+    and must be rejected by the validator, so the hard-check revert path is
+    not needed. Punc is kept.
     """
     hyp_records = [
         {
@@ -1224,11 +1511,9 @@ def test_run_polish_revert_shifts_coords_after_length_change():
         hyp_by_turn=hyps,
         hyp_records=hyp_records,
     )
-    # Both intra-subset edits reverted; the punc edit is kept.
-    assert out[0] == "。请张三风发言"
+    assert out[0] == "。请涨三丰发言"
     assert out[1] == "涨三丰点头"
-    assert any(a.get("path") == "subset_revert" for a in audits)
-    assert not any(a.get("path") == "subset_revert_skip" for a in audits)
+    assert not any(a.get("path") == "subset_revert" for a in audits)
 
 
 def test_run_polish_hotword_repair_does_not_trigger_subset_revert():

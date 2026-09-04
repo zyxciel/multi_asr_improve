@@ -10,11 +10,13 @@ from stage2_asr.pinyin_util import pinyin_edit_distance
 from stage2_asr.polish_cluster import (
     EntitySubset,
     build_homophone_clusters,
+    cluster_allow_conflicts,
     cluster_allow_list,
     cluster_channel_edit,
     intra_subset_unify_edit,
     leftover_mentions,
     parse_partition_payload,
+    partition_payload_is_schema_ok,
     revert_subsets_edits,
     subset_edit_texts_unique,
 )
@@ -269,6 +271,8 @@ def validate_polish_edits(
     hotwords: list[str] | None = None,
     meeting_hyps: list | dict | None = None,
     meeting_drafts: list | None = None,
+    cluster_allow: dict[str, str] | None = None,
+    cluster_members: list[frozenset[str]] | None = None,
 ) -> tuple[bool, str | None]:
     """Reject undisciplined polish edits. Empty edits are schema-ok (applied later)."""
     if not isinstance(edits, list):
@@ -293,6 +297,10 @@ def validate_polish_edits(
         span_out = str(e.get("span_out", ""))
         if span_asr == span_out:
             continue
+        if _cluster_unify_not_allowed(
+            span_asr, span_out, cluster_allow, cluster_members
+        ):
+            return False, "cluster mapping not on allow-list"
         if span_asr == "":
             return False, "insertions forbidden"
         if span_asr not in text:
@@ -344,6 +352,25 @@ def validate_polish_edits(
         ):
             return False, f"span_out not found in {anchor} evidence"
     return True, None
+
+
+def _cluster_unify_not_allowed(
+    span_asr: str,
+    span_out: str,
+    cluster_allow: dict[str, str] | None,
+    cluster_members: list[frozenset[str]] | None,
+) -> bool:
+    """True when both spans are members of one cluster but the mapping is not allowed.
+
+    Unrelated entity repairs (span_out outside that cluster) are not gated here.
+    """
+    if not cluster_members:
+        return False
+    allow = cluster_allow or {}
+    for members in cluster_members:
+        if span_asr in members and span_out in members:
+            return allow.get(span_asr) != span_out
+    return False
 
 
 def apply_polish_edits(text: str, edits: list[dict]) -> tuple[str, list[dict]]:
@@ -508,20 +535,20 @@ def _cluster_partition(
     hyp_records: list[dict] | None,
     cfg: PipelineConfig,
     audits: list[dict],
-) -> tuple[dict[str, str], list[EntitySubset], str]:
+) -> tuple[dict[str, str], list[EntitySubset], str, list[frozenset[str]]]:
     """Run cluster construction + one partition call per kept cluster.
 
-    Returns (allow_list, approved_subsets, cluster_mappings_pretty).
+    Returns (allow_list, approved_subsets, cluster_mappings_pretty, member_sets).
     Skips (current behavior) when the config disables it, the judge lacks
-    `partition_cluster`, or there are no hyp records. Invalid JSON / errors
-    retry with the polish backoff, then yield no subsets for that cluster.
+    `partition_cluster`, or there are no hyp records. Invalid JSON / schema /
+    errors retry with the polish backoff, then yield no subsets for that cluster.
     """
     if not getattr(cfg, "polish_cluster", True):
-        return {}, [], "(none)"
+        return {}, [], "(none)", []
     if not hasattr(llm_judge, "partition_cluster"):
-        return {}, [], "(none)"
+        return {}, [], "(none)", []
     if not hyp_records:
-        return {}, [], "(none)"
+        return {}, [], "(none)", []
 
     clusters = build_homophone_clusters(hyp_records)
     allow: dict[str, str] = {}
@@ -542,10 +569,14 @@ def _cluster_partition(
                 raw = None
                 last_err = str(exc)
                 continue
-            if isinstance(raw, dict):
+            if partition_payload_is_schema_ok(raw):
                 ok = True
                 break
-            last_err = f"expected dict partition payload, got {type(raw).__name__}"
+            last_err = (
+                "invalid partition schema"
+                if isinstance(raw, dict)
+                else f"expected dict partition payload, got {type(raw).__name__}"
+            )
             raw = None
         subsets = parse_partition_payload(raw, cluster) if ok else []
         covered: set[str] = set()
@@ -572,22 +603,28 @@ def _cluster_partition(
         if not ok:
             row["fallback"] = True
             row["last_error"] = last_err
-        audits.append(row)
 
         approved.extend(
             sub for sub in subsets if sub.same_entity and sub.canonical is not None
         )
         # Merge this cluster's allow-list; a surface mapped to two different
         # canonicals (across subsets/clusters) is dropped as a conflict.
-        for surface, canonical in cluster_allow_list(subsets).items():
+        this_allow = cluster_allow_list(subsets)
+        dropped = set(cluster_allow_conflicts(subsets))
+        for surface, canonical in this_allow.items():
             if surface in conflicts:
+                dropped.add(surface)
                 continue
             if surface in allow and allow[surface] != canonical:
                 del allow[surface]
                 conflicts.add(surface)
+                dropped.add(surface)
             else:
                 allow[surface] = canonical
-    return allow, approved, _pretty_cluster_mappings(approved, allow)
+        row["conflicts"] = sorted(dropped)
+        audits.append(row)
+    member_sets = [frozenset(c.surfaces) for c in clusters]
+    return allow, approved, _pretty_cluster_mappings(approved, allow), member_sets
 
 
 def _cluster_subset_sweep(
@@ -606,6 +643,15 @@ def _cluster_subset_sweep(
     coordinates converted from pre-edit offsets stay exact (any same-turn
     length-changing edit shifts later spans) and one subset's revert cannot
     drift another's.
+
+    Defense-in-depth note: with the deterministic deny in
+    ``validate_polish_edits`` active (same-cluster co-membership +
+    allow-list), every landed intra-subset unify edit already equals the
+    subset canonical, so ``failing`` stays empty and no revert fires
+    through ``run_polish``. This sweep is the spec §4 safety net for deny
+    relaxation or future edit channels that bypass validation — do not
+    remove it as unreachable, and do not relax the deny just to exercise
+    it. Its behavior is pinned by unit tests with synthetic audits.
     """
     applied = [
         a
@@ -639,8 +685,8 @@ def _cluster_subset_sweep(
                     "reason": "intra-subset unify edits landed non-unique writings",
                 }
             )
-    for sub, applied_for_s in applied_per_subset:
-        audits.extend(leftover_mentions(out, sub, applied_for_s))
+    for sub, _applied_for_s in applied_per_subset:
+        audits.extend(leftover_mentions(out, sub, applied))
     return out
 
 
@@ -653,6 +699,8 @@ def _validate_polish_raw(
     hotwords: list[str] | None = None,
     meeting_hyps: list | dict | None = None,
     meeting_drafts: list | None = None,
+    cluster_allow: dict[str, str] | None = None,
+    cluster_members: list[frozenset[str]] | None = None,
 ) -> tuple[dict | None, str | None]:
     if isinstance(raw, BaseException):
         return None, str(raw)
@@ -679,6 +727,8 @@ def _validate_polish_raw(
         hotwords=hotwords,
         meeting_hyps=meeting_hyps,
         meeting_drafts=meeting_drafts,
+        cluster_allow=cluster_allow,
+        cluster_members=cluster_members,
     )
     if not ok:
         return None, err
@@ -698,6 +748,8 @@ def _try_polish(
     meeting_drafts: list | None = None,
     meeting_hyps_prompt: str = "(none)",
     cluster_mappings: str = "(none)",
+    cluster_allow: dict[str, str] | None = None,
+    cluster_members: list[frozenset[str]] | None = None,
 ) -> tuple[dict | None, str | None]:
     try:
         raw = llm_judge.polish(
@@ -720,6 +772,8 @@ def _try_polish(
         hotwords=hotwords,
         meeting_hyps=meeting_hyps,
         meeting_drafts=meeting_drafts,
+        cluster_allow=cluster_allow,
+        cluster_members=cluster_members,
     )
 
 
@@ -807,6 +861,7 @@ def _run_polish_batched(
     hyp_by_turn: dict[int, list[Hypothesis]] | None = None,
     allow: dict[str, str] | None = None,
     cluster_mappings: str = "(none)",
+    cluster_members: list[frozenset[str]] | None = None,
 ) -> tuple[dict[int, str], list[dict]]:
     meeting = meeting_draft(turns, out)
     batch_size = max(1, int(getattr(cfg, "polish_batch_size", 1) or 1))
@@ -856,6 +911,8 @@ def _run_polish_batched(
                 hotwords=hotwords,
                 meeting_hyps=hyp_by_turn,
                 meeting_drafts=meeting,
+                cluster_allow=allow,
+                cluster_members=cluster_members,
             )
             if accepted is None:
                 p["last_err"] = err
@@ -942,7 +999,7 @@ def run_polish(
     if llm_judge is None or not hasattr(llm_judge, "polish"):
         return out, audits
 
-    allow, approved_subsets, cluster_mappings = _cluster_partition(
+    allow, approved_subsets, cluster_mappings, cluster_members = _cluster_partition(
         llm_judge, hyp_records, cfg, audits
     )
 
@@ -958,6 +1015,7 @@ def run_polish(
             hyp_by_turn=hyp_by_turn,
             allow=allow,
             cluster_mappings=cluster_mappings,
+            cluster_members=cluster_members,
         )
         out = _cluster_subset_sweep(out, audits, approved_subsets)
         return out, audits
@@ -1002,6 +1060,8 @@ def run_polish(
                 meeting_drafts=meeting,
                 meeting_hyps_prompt=hyp_prompt,
                 cluster_mappings=cluster_mappings,
+                cluster_allow=allow,
+                cluster_members=cluster_members,
             )
             if raw is None:
                 last_err = err

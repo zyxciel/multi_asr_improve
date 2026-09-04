@@ -93,7 +93,16 @@ def _render_tone_mismatch(cluster: HomophoneCluster) -> str:
     return "\n".join(f"- {a} / {b}" for a, b in cluster.tone_mismatch_pairs)
 
 
-def _render_snippets(cluster: HomophoneCluster) -> str:
+_SNIPPET_CHAR_CAP = 4096
+_SNIPPET_EACH = 240
+
+
+def _render_snippets(
+    cluster: HomophoneCluster,
+    *,
+    char_cap: int = _SNIPPET_CHAR_CAP,
+    each: int = _SNIPPET_EACH,
+) -> str:
     seen: set[tuple[str, str]] = set()
     lines: list[str] = []
     for h in cluster.hits:
@@ -103,8 +112,15 @@ def _render_snippets(cluster: HomophoneCluster) -> str:
         if key in seen or not hyp_text:
             continue
         seen.add(key)
+        if len(hyp_text) > each:
+            hyp_text = hyp_text[:each] + "..."
         lines.append(f"- {surface}: {hyp_text}")
-    return "\n".join(lines) if lines else "(none)"
+    if not lines:
+        return "(none)"
+    blob = "\n".join(lines)
+    if len(blob) > char_cap:
+        return blob[:char_cap] + "\n..."
+    return blob
 
 
 def render_partition_user_prompt(*, cluster: HomophoneCluster) -> str:

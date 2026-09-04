@@ -113,6 +113,16 @@ class EntitySubset:
     reason: str
 
 
+def partition_payload_is_schema_ok(raw: object) -> bool:
+    """Closed schema: a dict whose `subsets` value is a list.
+
+    Individual subset entries may still be dropped by ``parse_partition_payload``.
+    A dict with a non-list ``subsets`` (or no ``subsets``) is schema-illegal
+    and must be retried like a JSON parse failure.
+    """
+    return isinstance(raw, dict) and isinstance(raw.get("subsets"), list)
+
+
 def parse_partition_payload(
     raw: dict | None, cluster: HomophoneCluster
 ) -> list[EntitySubset]:
@@ -128,15 +138,13 @@ def parse_partition_payload(
     - `same_entity` accepts JSON true/false. Empty `reason` is ok. Unknown
       keys are ignored.
     """
-    if not isinstance(raw, dict):
+    if not partition_payload_is_schema_ok(raw):
         return []
-    subsets_raw = raw.get("subsets")
-    if not isinstance(subsets_raw, list):
-        return []
+    assert isinstance(raw, dict)
 
     cluster_surfaces = set(cluster.surfaces)
     out: list[EntitySubset] = []
-    for entry in subsets_raw:
+    for entry in raw["subsets"]:
         if not isinstance(entry, dict):
             continue
         surfaces_raw = entry.get("surfaces")
@@ -183,15 +191,34 @@ def cluster_allow_list(subsets: list[EntitySubset]) -> dict[str, str]:
 
     For each `same_entity` subset, map every surface in the subset (including
     the canonical itself, ``canonical -> canonical``) to the canonical.
-    `same_entity: false` surfaces are not included.
+    `same_entity: false` surfaces are not included. If one surface is mapped
+    to two different canonicals, that key is dropped.
     """
     allow: dict[str, str] = {}
+    conflicts: set[str] = set()
     for sub in subsets:
         if not sub.same_entity or sub.canonical is None:
             continue
         for s in sub.surfaces:
-            allow[s] = sub.canonical
+            if s in conflicts:
+                continue
+            prev = allow.get(s)
+            if prev is not None and prev != sub.canonical:
+                del allow[s]
+                conflicts.add(s)
+            else:
+                allow[s] = sub.canonical
     return allow
+
+
+def cluster_allow_conflicts(subsets: list[EntitySubset]) -> list[str]:
+    """Surfaces dropped because two same_entity subsets named different canonicals."""
+    allow = cluster_allow_list(subsets)
+    named: set[str] = set()
+    for sub in subsets:
+        if sub.same_entity and sub.canonical is not None:
+            named.update(sub.surfaces)
+    return sorted(s for s in named if s not in allow)
 
 
 def _tone_mismatch(
@@ -370,22 +397,29 @@ def leftover_mentions(
 
     Rows are emitted only when the final texts are actually MIXED for this
     subset: more than one distinct subset surface is still present in the
-    meeting texts, or at least one intra-subset unify edit landed AND a
-    non-canonical surface remains. A consistent meeting (only the old
-    writing, or only the canonical) yields no rows.
+    meeting texts. A consistent meeting (only the old writing, or only the
+    canonical) — including after a full subset revert — yields no rows.
+    ``applied_for_s`` should be the turn's landed polish audits (including
+    non-cluster edits). Mask spans are converted with ``_post_apply_spans``
+    so a prior length-changing punc edit cannot uncover a canonical that
+    contains another subset surface as a substring.
     """
     canonical = subset.canonical
-    # Spans per turn that were fully replaced by edits landing canonical.
-    replaced: dict[int, list[tuple[int, int]]] = {}
+    by_turn: dict[int, list[dict]] = {}
     for a in applied_for_s:
-        span_out = str(a.get("span_out"))
-        if canonical is None or span_out != canonical:
-            continue
         turn = a.get("turn_index")
         start = a.get("start_char")
-        if not isinstance(turn, int) or not isinstance(start, int):
-            continue
-        replaced.setdefault(turn, []).append((start, start + len(span_out)))
+        if isinstance(turn, int) and isinstance(start, int):
+            by_turn.setdefault(turn, []).append(a)
+
+    replaced: dict[int, list[tuple[int, int]]] = {}
+    for turn, edits in by_turn.items():
+        for post_start, post_end, a in _post_apply_spans(edits):
+            if canonical is None or str(a.get("span_out")) != canonical:
+                continue
+            if not intra_subset_unify_edit(a, subset):
+                continue
+            replaced.setdefault(turn, []).append((post_start, post_end))
 
     candidates = sorted(s for s in subset.surfaces if s != canonical)
     per_turn_found: list[tuple[int, list[str]]] = []
@@ -412,9 +446,7 @@ def leftover_mentions(
         canonical in text for text in texts.values()
     )
     distinct_present = len(found_surfaces) + (1 if canonical_present else 0)
-    landed_unify_edit = bool(applied_for_s)
-    mixed = distinct_present >= 2 or (landed_unify_edit and bool(found_surfaces))
-    if not mixed:
+    if distinct_present < 2:
         return []
 
     return [
