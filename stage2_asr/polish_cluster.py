@@ -13,7 +13,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from stage2_asr.pinyin_util import pinyin_edit_distance, to_pinyin
+from stage2_asr.pinyin_util import _levenshtein, to_pinyin
 
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]+")
 
@@ -37,20 +37,41 @@ def extract_full_cjk_runs(text: str) -> list[str]:
     return [r for r in _CJK_RE.findall(text) if len(r) >= _MIN_RUN_LEN]
 
 
-def pair_surfaces(a: str, b: str) -> bool:
-    """Spec §1 pairing (1)-(4). Both surfaces must independently be eligible."""
+def _cached_pinyin(
+    text: str, tone: bool, cache: dict[tuple[str, bool], str] | None
+) -> str:
+    """`to_pinyin(text, tone)` memoized on ``(text, tone)`` when a cache dict
+    is given. ``build_homophone_clusters`` passes one cache per build so the
+    O(n^2) pair loop converts each surface once per tone style."""
+    if cache is None:
+        return to_pinyin(text, tone=tone)
+    key = (text, tone)
+    if key not in cache:
+        cache[key] = to_pinyin(text, tone=tone)
+    return cache[key]
+
+
+def pair_surfaces(
+    a: str, b: str, cache: dict[tuple[str, bool], str] | None = None
+) -> bool:
+    """Spec §1 pairing (1)-(4). Both surfaces must independently be eligible.
+
+    ``cache`` optionally memoizes pinyin conversions for the duration of one
+    ``build_homophone_clusters`` call; it does not change the pairing rules.
+    """
     # (1) CJK length >= 3 on both.
     if len(a) < _MIN_RUN_LEN or len(b) < _MIN_RUN_LEN:
         return False
 
+    sa = _cached_pinyin(a, False, cache).split()
+    sb = _cached_pinyin(b, False, cache).split()
+
     # (2) Toneless pinyin edit distance <= 2.
-    dist = pinyin_edit_distance(a, b)
+    dist = _levenshtein(sa, sb)
     if dist > _MAX_PINYIN_DIST:
         return False
 
     # (3) First or last toneless syllable equal.
-    sa = to_pinyin(a, tone=False).split()
-    sb = to_pinyin(b, tone=False).split()
     if not sa or not sb:
         return False
     first_eq = sa[0] == sb[0]
@@ -173,14 +194,20 @@ def cluster_allow_list(subsets: list[EntitySubset]) -> dict[str, str]:
     return allow
 
 
-def _tone_mismatch(a: str, b: str) -> bool:
-    return to_pinyin(a, tone=True) != to_pinyin(b, tone=True)
+def _tone_mismatch(
+    a: str, b: str, cache: dict[tuple[str, bool], str] | None = None
+) -> bool:
+    return _cached_pinyin(a, True, cache) != _cached_pinyin(b, True, cache)
 
 
 # --- Task 3: entity-subset hard check + leftover warning (spec §4) ---
 #
 # Applied-edit audits carry: turn_index, span_asr, span_out, start_char,
-# end_char (coordinates are AFTER the edit was applied to the turn text).
+# end_char. `start_char`/`end_char` are offsets in the turn's PRE-edit text:
+# `apply_polish_edits` locates spans in its input and applies the located
+# edits right-to-left. A landed span therefore sits in the post-edit text at
+# `start_char` shifted by the summed length deltas of all same-turn edits
+# with a SMALLER `start_char` (edits to its right do not move it).
 
 
 def cluster_channel_edit(edit: dict, allow: dict[str, str]) -> bool:
@@ -197,33 +224,82 @@ def cluster_channel_edit(edit: dict, allow: dict[str, str]) -> bool:
     return str(edit.get("span_out")) == allow[span_asr]
 
 
+def intra_subset_unify_edit(edit: dict, subset: EntitySubset) -> bool:
+    """True iff the edit is an intra-subset unify attempt for ``subset``:
+    it rewrites one of the subset's surfaces TO one of the subset's surfaces
+    (canonical or another listed writing).
+
+    This — not ``cluster_channel_edit`` — is the hard-check / revert grain:
+    filtering on ``cluster_channel`` would require ``span_out == canonical``
+    and make the uniqueness check vacuous, while filtering on ``span_asr``
+    alone would sweep in foreign-channel edits (e.g. a hotword repair
+    `张三风→张三丰` when the subset is `{张三风, 涨三丰}`), which must be
+    left alone.
+    """
+    return (
+        str(edit.get("span_asr")) in subset.surfaces
+        and str(edit.get("span_out")) in subset.surfaces
+    )
+
+
 def subset_edit_texts_unique(applied_for_s: list[dict], canonical: str) -> bool:
-    """Hard check: every landed cluster-channel edit for subset S is canonical."""
+    """Hard check: every landed intra-subset unify edit for S is canonical."""
     return all(str(a.get("span_out")) == canonical for a in applied_for_s)
 
 
-def revert_subset_edits(
-    texts: dict[int, str], applied: list[dict], subset: EntitySubset
-) -> dict[int, str]:
-    """Undo the cluster-channel edits of one subset, leave everything else.
+def _post_apply_spans(turn_edits: list[dict]) -> list[tuple[int, int, dict]]:
+    """Convert pre-edit offsets to post-apply spans for one turn.
 
-    For each audit whose ``span_asr`` is in ``subset.surfaces``, put
-    ``span_asr`` back at ``start_char``, replacing the ``len(span_out)``
-    characters that the edit landed. Audits are reverted per turn in
-    DESCENDING ``start_char`` order so that reverting a later span (whose
-    length may differ from the original) never shifts the coordinates of an
-    earlier span that is still pending revert. Audits from other subsets and
-    non-cluster edits are untouched. If the current text at the recorded
-    coordinates no longer equals ``span_out``, that audit is skipped (a blind
-    splice would corrupt drifted text).
+    ``turn_edits`` must be ALL landed edits of the turn (any length-changing
+    edit — e.g. a punctuation fix — shifts the post-apply offset of every
+    span to its right, so a subset-only list is not enough). Audits record
+    ``start_char`` in the turn's pre-edit text; edits were applied
+    right-to-left, so each edit's landed span is shifted right by the summed
+    ``len(span_out) - len(span_asr)`` deltas of the edits before it.
+
+    Returns ``(post_start, post_end, edit)`` triples in pre-edit order.
+    """
+    spans: list[tuple[int, int, dict]] = []
+    delta = 0
+    for a in sorted(turn_edits, key=lambda x: x["start_char"]):
+        span_asr = str(a.get("span_asr") or "")
+        span_out = str(a.get("span_out") or "")
+        post_start = a["start_char"] + delta
+        spans.append((post_start, post_start + len(span_out), a))
+        delta += len(span_out) - len(span_asr)
+    return spans
+
+
+def revert_subsets_edits(
+    texts: dict[int, str],
+    applied: list[dict],
+    subsets: list[EntitySubset],
+    *,
+    audit_sink: list[dict] | None = None,
+) -> dict[int, str]:
+    """Undo the intra-subset unify edits of ``subsets``, leave everything else.
+
+    ``applied`` must be ALL landed polish-edit audits (see
+    ``_post_apply_spans``). For each subset, the edits reverted are exactly
+    the intra-subset unify attempts (``intra_subset_unify_edit``); foreign
+    hotword/neighbor repairs that landed a spelling outside the subset are
+    NOT reverted.
+
+    All target edits of a turn are reverted in a single pass, in DESCENDING
+    post-apply order, so reverting a later span (whose length may differ
+    from the original) never shifts the coordinates of an earlier span still
+    pending revert, and one subset's revert cannot drift another subset's
+    coordinates.
+
+    If the current text at the converted coordinates no longer equals
+    ``span_out`` (the text drifted), the edit is NOT blindly spliced: a
+    ``path=subset_revert_skip`` row is appended to ``audit_sink`` instead.
 
     Returns a new dict; ``texts`` is not mutated.
     """
     out = dict(texts)
     per_turn: dict[int, list[dict]] = {}
     for a in applied:
-        if str(a.get("span_asr")) not in subset.surfaces:
-            continue
         turn = a.get("turn_index")
         start = a.get("start_char")
         if not isinstance(turn, int) or not isinstance(start, int):
@@ -232,18 +308,53 @@ def revert_subset_edits(
             continue
         per_turn.setdefault(turn, []).append(a)
 
-    for turn, audits in per_turn.items():
+    for turn, turn_edits in per_turn.items():
+        targets = {
+            id(a)
+            for a in turn_edits
+            if any(intra_subset_unify_edit(a, sub) for sub in subsets)
+        }
+        if not targets:
+            continue
         text = out[turn]
-        for a in sorted(audits, key=lambda x: x["start_char"], reverse=True):
-            start = a["start_char"]
-            span_asr = str(a.get("span_asr"))
-            span_out = str(a.get("span_out"))
-            end = start + len(span_out)
-            if text[start:end] != span_out:
+        for post_start, post_end, a in sorted(
+            _post_apply_spans(turn_edits), key=lambda t: t[0], reverse=True
+        ):
+            if id(a) not in targets:
                 continue
-            text = text[:start] + span_asr + text[end:]
+            span_asr = str(a.get("span_asr") or "")
+            span_out = str(a.get("span_out") or "")
+            if text[post_start:post_end] != span_out:
+                if audit_sink is not None:
+                    audit_sink.append(
+                        {
+                            "pass": "polish_cluster",
+                            "path": "subset_revert_skip",
+                            "turn_index": turn,
+                            "span_asr": span_asr,
+                            "span_out": span_out,
+                            "start_char": a.get("start_char"),
+                            "reason": (
+                                "text drifted: post-apply slice no longer "
+                                "matches span_out; edit left in place"
+                            ),
+                        }
+                    )
+                continue
+            text = text[:post_start] + span_asr + text[post_end:]
         out[turn] = text
     return out
+
+
+def revert_subset_edits(
+    texts: dict[int, str],
+    applied: list[dict],
+    subset: EntitySubset,
+    *,
+    audit_sink: list[dict] | None = None,
+) -> dict[int, str]:
+    """Undo one subset's intra-subset unify edits; see ``revert_subsets_edits``."""
+    return revert_subsets_edits(texts, applied, [subset], audit_sink=audit_sink)
 
 
 def leftover_mentions(
@@ -256,6 +367,12 @@ def leftover_mentions(
     to canonical (those spans are fully replaced by definition). Unedited
     mentions are mention autonomy, not a hard failure: they are reported, not
     reverted. Occurrences of the canonical itself never flag a turn.
+
+    Rows are emitted only when the final texts are actually MIXED for this
+    subset: more than one distinct subset surface is still present in the
+    meeting texts, or at least one intra-subset unify edit landed AND a
+    non-canonical surface remains. A consistent meeting (only the old
+    writing, or only the canonical) yields no rows.
     """
     canonical = subset.canonical
     # Spans per turn that were fully replaced by edits landing canonical.
@@ -271,7 +388,8 @@ def leftover_mentions(
         replaced.setdefault(turn, []).append((start, start + len(span_out)))
 
     candidates = sorted(s for s in subset.surfaces if s != canonical)
-    rows: list[dict] = []
+    per_turn_found: list[tuple[int, list[str]]] = []
+    found_surfaces: set[str] = set()
     for i in sorted(texts):
         text = texts[i]
         spans = replaced.get(i, [])
@@ -285,16 +403,30 @@ def leftover_mentions(
                     break
                 idx = text.find(s, idx + 1)
         if found:
-            rows.append(
-                {
-                    "pass": "polish_cluster",
-                    "path": "leftover_mix",
-                    "surfaces": found,
-                    "turn_index": i,
-                    "canonical": canonical,
-                }
-            )
-    return rows
+            per_turn_found.append((i, found))
+            found_surfaces.update(found)
+
+    # Gate on an actual mix. Without it, a meeting that consistently uses
+    # only the old writing (nothing edited) would still emit warnings.
+    canonical_present = canonical is not None and any(
+        canonical in text for text in texts.values()
+    )
+    distinct_present = len(found_surfaces) + (1 if canonical_present else 0)
+    landed_unify_edit = bool(applied_for_s)
+    mixed = distinct_present >= 2 or (landed_unify_edit and bool(found_surfaces))
+    if not mixed:
+        return []
+
+    return [
+        {
+            "pass": "polish_cluster",
+            "path": "leftover_mix",
+            "surfaces": found,
+            "turn_index": i,
+            "canonical": canonical,
+        }
+        for i, found in per_turn_found
+    ]
 
 
 class _UnionFind:
@@ -348,6 +480,9 @@ def build_homophone_clusters(hyp_records: list[dict]) -> list[HomophoneCluster]:
         return []
 
     # Step 2: union-find over eligible surfaces via pair_surfaces.
+    # One pinyin cache for the whole build: the O(n^2) pair loop would
+    # otherwise re-convert every surface for every pair it touches.
+    pinyin_cache: dict[tuple[str, bool], str] = {}
     uf = _UnionFind()
     for s in surfaces_set:
         uf.find(s)  # ensure each surface is its own root initially
@@ -355,7 +490,7 @@ def build_homophone_clusters(hyp_records: list[dict]) -> list[HomophoneCluster]:
     for i in range(len(surfaces_list)):
         for j in range(i + 1, len(surfaces_list)):
             a, b = surfaces_list[i], surfaces_list[j]
-            if pair_surfaces(a, b):
+            if pair_surfaces(a, b, cache=pinyin_cache):
                 uf.union(a, b)
 
     # Step 3: group surfaces by root, attach hits.
@@ -386,7 +521,7 @@ def build_homophone_clusters(hyp_records: list[dict]) -> list[HomophoneCluster]:
         for i in range(len(members_sorted)):
             for j in range(i + 1, len(members_sorted)):
                 a, b = members_sorted[i], members_sorted[j]
-                if _tone_mismatch(a, b):
+                if _tone_mismatch(a, b, cache=pinyin_cache):
                     tone_mismatch_pairs.append((a, b))
 
         cluster_id = f"polish_cluster_{idx:04d}"

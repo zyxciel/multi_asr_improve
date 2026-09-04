@@ -1057,7 +1057,9 @@ def test_run_polish_cluster_does_not_clobber_asr_final(tmp_path: Path):
     ]
     cluster_rows = [e for e in edits if e.get("pass") == "polish_cluster"]
     assert cluster_rows
-    assert any(e.get("path") == "leftover_mix" for e in cluster_rows)
+    # The mock meeting is unmixed (only 张三风 appears in the polished texts;
+    # 涨三丰 never lands), so no leftover_mix warning may be emitted.
+    assert not any(e.get("path") == "leftover_mix" for e in cluster_rows)
 
 
 def test_run_polish_leftover_warns_without_revert():
@@ -1141,3 +1143,172 @@ def test_run_polish_leftover_warns_without_revert():
     assert leftover[0]["turn_index"] == 1
     assert leftover[0]["surfaces"] == ["张三风"]
     assert leftover[0]["canonical"] == "涨三丰"
+
+
+def test_run_polish_revert_shifts_coords_after_length_change():
+    """A length-changing punc edit BEFORE a subset entity edit in the same
+    turn must not make the subset revert a no-op.
+
+    Turn 0 lands a punc edit (`，。` -> `。`, 2 chars -> 1) before the
+    cluster-channel edit 张三风->涨三丰; turn 1 lands 涨三丰->张三风 (an
+    in-subset, non-canonical writing). The hard check fails for the subset;
+    the revert must restore BOTH entity spans (audits record PRE-edit
+    offsets, so the revert converts them to post-apply coordinates) while
+    keeping the punc edit — no partial/wrong undo.
+    """
+    hyp_records = [
+        {
+            "unit_id": "u0",
+            "turn_indices": [0],
+            "hyps": [{"model": "qwen", "text": "张三风"}],
+        },
+        {
+            "unit_id": "u1",
+            "turn_indices": [1],
+            "hyps": [{"model": "moss", "text": "涨三丰"}],
+        },
+    ]
+
+    class PuncThenEntityJudge:
+        def partition_cluster(self, **kwargs):
+            return {
+                "subsets": [
+                    {
+                        "surfaces": ["张三风", "涨三丰"],
+                        "canonical": "涨三丰",
+                        "same_entity": True,
+                        "reason": "same person",
+                    }
+                ]
+            }
+
+        def polish(self, **kwargs):
+            text = kwargs["text"]
+            if kwargs.get("turn_index") == 0:
+                return {
+                    "text": text,
+                    "edits": [
+                        {"span_asr": "，。", "span_out": "。", "kind": "punc"},
+                        {
+                            "span_asr": "张三风",
+                            "span_out": "涨三丰",
+                            "kind": "entity",
+                            "anchor": "meeting_hyp",
+                            "evidence": "u1 moss hyp contains 涨三丰",
+                        },
+                    ],
+                }
+            return {
+                "text": text,
+                "edits": [
+                    {
+                        "span_asr": "涨三丰",
+                        "span_out": "张三风",
+                        "kind": "entity",
+                        "anchor": "meeting_hyp",
+                        "evidence": "u0 qwen hyp contains 张三风",
+                    }
+                ],
+            }
+
+    turns = [Turn(0, 2, "s0", "，。请张三风发言"), Turn(2, 4, "s1", "涨三丰点头")]
+    texts = {0: turns[0].text, 1: turns[1].text}
+    hyps = {
+        0: [Hypothesis("qwen", "张三风")],
+        1: [Hypothesis("moss", "涨三丰")],
+    }
+    out, audits = run_polish(
+        turns,
+        texts,
+        llm_judge=PuncThenEntityJudge(),
+        hyp_by_turn=hyps,
+        hyp_records=hyp_records,
+    )
+    # Both intra-subset edits reverted; the punc edit is kept.
+    assert out[0] == "。请张三风发言"
+    assert out[1] == "涨三丰点头"
+    assert any(a.get("path") == "subset_revert" for a in audits)
+    assert not any(a.get("path") == "subset_revert_skip" for a in audits)
+
+
+def test_run_polish_hotword_repair_does_not_trigger_subset_revert():
+    """Subset {张三风, 涨三丰} canonical 涨三丰. Turn 0 lands the
+    cluster-channel edit 张三风->涨三丰; turn 1 lands a hotword repair
+    张三风->张三丰 whose span_out is OUTSIDE the subset. The hotword edit is
+    not an intra-subset unify attempt: it must not fail the hard check, and
+    the successful cluster-channel edit must NOT be reverted.
+    """
+    hyp_records = [
+        {
+            "unit_id": "u0",
+            "turn_indices": [0],
+            "hyps": [{"model": "qwen", "text": "张三风"}],
+        },
+        {
+            "unit_id": "u1",
+            "turn_indices": [1],
+            "hyps": [{"model": "moss", "text": "涨三丰"}],
+        },
+    ]
+
+    class HotwordRepairJudge:
+        def partition_cluster(self, **kwargs):
+            return {
+                "subsets": [
+                    {
+                        "surfaces": ["张三风", "涨三丰"],
+                        "canonical": "涨三丰",
+                        "same_entity": True,
+                        "reason": "same person",
+                    }
+                ]
+            }
+
+        def polish(self, **kwargs):
+            text = kwargs["text"]
+            if kwargs.get("turn_index") == 0 and "张三风" in text:
+                return {
+                    "text": text,
+                    "edits": [
+                        {
+                            "span_asr": "张三风",
+                            "span_out": "涨三丰",
+                            "kind": "entity",
+                            "anchor": "meeting_hyp",
+                            "evidence": "u1 moss hyp contains 涨三丰",
+                        }
+                    ],
+                }
+            if kwargs.get("turn_index") == 1 and "张三风" in text:
+                return {
+                    "text": text,
+                    "edits": [
+                        {
+                            "span_asr": "张三风",
+                            "span_out": "张三丰",
+                            "kind": "entity",
+                            "anchor": "hotword",
+                            "evidence": "hotword canonical 张三丰",
+                        }
+                    ],
+                }
+            return {"text": text, "edits": []}
+
+    turns = [Turn(0, 2, "s0", "张三风先发言"), Turn(2, 4, "s1", "后来张三风到了")]
+    texts = {0: turns[0].text, 1: turns[1].text}
+    hyps = {
+        0: [Hypothesis("qwen", "张三风")],
+        1: [Hypothesis("moss", "涨三丰")],
+    }
+    out, audits = run_polish(
+        turns,
+        texts,
+        llm_judge=HotwordRepairJudge(),
+        hotwords=["张三丰"],
+        hyp_by_turn=hyps,
+        hyp_records=hyp_records,
+    )
+    assert out[0] == "涨三丰先发言"  # cluster-channel edit kept
+    assert out[1] == "后来张三丰到了"  # foreign-channel hotword repair kept
+    assert not any(a.get("path") == "subset_revert" for a in audits)
+    assert not any(a.get("path") == "subset_revert_skip" for a in audits)

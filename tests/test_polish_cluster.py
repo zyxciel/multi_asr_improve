@@ -84,6 +84,17 @@ def test_transitive_closure_keeps_distant_pair():
     assert set(clusters[0].surfaces) == {"张三风", "涨三丰", "章三丰"}
 
 
+def test_pair_surfaces_cache_does_not_change_rules():
+    """The optional pinyin cache memoizes conversions; pairing rules are unchanged."""
+    cache: dict = {}
+    assert pair_surfaces("张三风", "涨三丰", cache=cache) is True
+    assert ("张三风", False) in cache
+    assert ("涨三丰", False) in cache
+    # Cached and uncached calls agree, including the length gate.
+    assert pair_surfaces("意图", "音图", cache=cache) is False
+    assert pair_surfaces("张三丰", "章三丰", cache=cache) == pair_surfaces("张三丰", "章三丰")
+
+
 # --- Task 2: parse partition payload -> allow-list ---
 
 from stage2_asr.polish_cluster import (
@@ -126,6 +137,7 @@ def test_false_multi_surface_empty_allow_list():
 from stage2_asr.polish_cluster import (
     EntitySubset,
     cluster_channel_edit,
+    intra_subset_unify_edit,
     leftover_mentions,
     revert_subset_edits,
     subset_edit_texts_unique,
@@ -142,42 +154,83 @@ def _subset(surfaces, canonical):
 
 
 def test_hard_check_reverts_only_that_subset():
-    subset_s = _subset({"欧阳娜", "欧阳娜娜"}, "欧阳娜娜")
+    subset_s = _subset({"张三风", "涨三丰"}, "涨三丰")
     subset_t = _subset({"赵六兆", "赵六照"}, "赵六照")
     allow = cluster_allow_list([subset_s, subset_t])
 
-    # S edits: turn 0 landed canonical; turn 1 had two mentions, one landed
-    # canonical (length-changing) and one landed a wrong writing -> hard-check
-    # failure for S. T edit on turn 2 is a different subset and must stay.
+    # Audits as the pipeline really emits them: start_char/end_char are
+    # offsets in the turn's PRE-edit text (apply_polish_edits locates spans
+    # in its input and applies edits right-to-left).
+    #
+    # Turn 0: a length-changing punc edit (2 chars -> 1) BEFORE the subset
+    # entity edit 张三风->涨三丰. The landed 涨三丰 therefore sits at
+    # post-apply offset 2, not 3; the revert must convert coordinates.
+    # Turn 1: an intra-subset unify edit landing the OTHER in-subset writing
+    # (涨三丰->张三风) -> hard check fails for S.
+    # Turn 2: subset T's edit is a different subset and must stay.
     applied = [
-        {"turn_index": 0, "span_asr": "欧阳娜", "span_out": "欧阳娜娜",
-         "start_char": 1, "end_char": 5},
-        {"turn_index": 1, "span_asr": "欧阳娜", "span_out": "欧阳娜娜",
-         "start_char": 0, "end_char": 4},
-        {"turn_index": 1, "span_asr": "欧阳娜", "span_out": "欧阳哪",
-         "start_char": 5, "end_char": 8},
+        {"turn_index": 0, "span_asr": "，。", "span_out": "。", "kind": "punc",
+         "start_char": 0, "end_char": 2},
+        {"turn_index": 0, "span_asr": "张三风", "span_out": "涨三丰",
+         "kind": "entity", "start_char": 3, "end_char": 6},
+        {"turn_index": 1, "span_asr": "涨三丰", "span_out": "张三风",
+         "kind": "entity", "start_char": 0, "end_char": 3},
         {"turn_index": 2, "span_asr": "赵六兆", "span_out": "赵六照",
-         "start_char": 0, "end_char": 3},
+         "kind": "entity", "start_char": 0, "end_char": 3},
     ]
     texts_after = {
-        0: "请欧阳娜娜发言。",
-        1: "欧阳娜娜和欧阳哪都来了。",
+        0: "。请涨三丰发言。",
+        1: "张三风点头。",
         2: "赵六照也在场。",
     }
 
-    applied_for_s = [a for a in applied if a["span_asr"] in subset_s.surfaces]
-    assert subset_edit_texts_unique(applied_for_s, "欧阳娜娜") is False
-    assert cluster_channel_edit(applied[0], allow) is True
-    assert cluster_channel_edit(applied[2], allow) is False  # wrong landed writing
+    applied_for_s = [a for a in applied if intra_subset_unify_edit(a, subset_s)]
+    # The punc edit is not intra-subset; only the two entity edits count.
+    assert applied_for_s == [applied[1], applied[2]]
+    assert subset_edit_texts_unique(applied_for_s, "涨三丰") is False
+    assert cluster_channel_edit(applied[1], allow) is True
+    assert cluster_channel_edit(applied[2], allow) is False  # non-canonical landing
+
+    sink: list[dict] = []
+    reverted = revert_subset_edits(texts_after, applied, subset_s, audit_sink=sink)
+    assert reverted == {
+        0: "。请张三风发言。",  # entity reverted despite the punc length change
+        1: "涨三丰点头。",
+        2: "赵六照也在场。",  # other subset's landed edit stays
+    }
+    assert not [r for r in sink if r.get("path") == "subset_revert_skip"]
+    # The caller's mapping is not mutated.
+    assert texts_after[1] == "张三风点头。"
+
+
+def test_revert_leaves_foreign_channel_edits_in_place():
+    """A repair landing a spelling OUTSIDE the subset is not an intra-subset
+    unify attempt: it neither counts for the hard check nor gets reverted."""
+    subset_s = _subset({"张三风", "涨三丰"}, "涨三丰")
+
+    # Turn 2: hotword repair 张三风->张三丰 (span_out not in S).
+    applied = [
+        {"turn_index": 0, "span_asr": "张三风", "span_out": "涨三丰",
+         "kind": "entity", "start_char": 0, "end_char": 3},
+        {"turn_index": 1, "span_asr": "涨三丰", "span_out": "张三风",
+         "kind": "entity", "start_char": 0, "end_char": 3},
+        {"turn_index": 2, "span_asr": "张三风", "span_out": "张三丰",
+         "kind": "entity", "start_char": 0, "end_char": 3, "anchor": "hotword"},
+    ]
+    texts_after = {0: "涨三丰发言。", 1: "张三风点头。", 2: "张三丰到场。"}
+
+    foreign = applied[2]
+    assert intra_subset_unify_edit(foreign, subset_s) is False
+    applied_for_s = [a for a in applied if intra_subset_unify_edit(a, subset_s)]
+    assert applied_for_s == [applied[0], applied[1]]
+    assert subset_edit_texts_unique(applied_for_s, "涨三丰") is False
 
     reverted = revert_subset_edits(texts_after, applied, subset_s)
     assert reverted == {
-        0: "请欧阳娜发言。",
-        1: "欧阳娜和欧阳娜都来了。",
-        2: "赵六照也在场。",  # other subset's landed edit stays
+        0: "张三风发言。",
+        1: "涨三丰点头。",
+        2: "张三丰到场。",  # foreign-channel repair left alone
     }
-    # The caller's mapping is not mutated.
-    assert texts_after[1] == "欧阳娜娜和欧阳哪都来了。"
 
 
 def test_leftover_unedited_does_not_fail_unique():

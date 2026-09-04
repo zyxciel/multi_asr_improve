@@ -12,9 +12,10 @@ from stage2_asr.polish_cluster import (
     build_homophone_clusters,
     cluster_allow_list,
     cluster_channel_edit,
+    intra_subset_unify_edit,
     leftover_mentions,
     parse_partition_payload,
-    revert_subset_edits,
+    revert_subsets_edits,
     subset_edit_texts_unique,
 )
 from stage2_asr.text_map import distribute_unit_text
@@ -593,7 +594,19 @@ def _cluster_subset_sweep(
     out: dict[int, str], audits: list[dict], subsets: list[EntitySubset]
 ) -> dict[int, str]:
     """Per approved subset: hard-check landed edits, revert that subset only
-    if its cluster-channel edits disagree, then report leftover mentions."""
+    if its intra-subset unify edits disagree, then report leftover mentions.
+
+    The hard check and the revert operate on intra-subset unify attempts
+    (``span_asr`` in S AND ``span_out`` in S; see ``intra_subset_unify_edit``).
+    Filtering on ``cluster_channel`` alone would make the uniqueness check
+    vacuous (cluster-channel edits land canonical by definition); filtering
+    on ``span_asr`` alone would roll back unrelated foreign-channel repairs
+    (e.g. a hotword fix landing a spelling outside S). All failing subsets
+    are reverted in ONE pass over the full applied-edit list so that
+    coordinates converted from pre-edit offsets stay exact (any same-turn
+    length-changing edit shifts later spans) and one subset's revert cannot
+    drift another's.
+    """
     applied = [
         a
         for a in audits
@@ -603,23 +616,30 @@ def _cluster_subset_sweep(
         and isinstance(a.get("turn_index"), int)
         and isinstance(a.get("start_char"), int)
     ]
-    for sub in subsets:
-        if not sub.same_entity or sub.canonical is None:
-            continue
-        applied_for_s = [
-            a for a in applied if str(a.get("span_asr")) in sub.surfaces
-        ]
-        if applied_for_s and not subset_edit_texts_unique(applied_for_s, sub.canonical):
-            out = revert_subset_edits(out, applied_for_s, sub)
+    approved = [s for s in subsets if s.same_entity and s.canonical is not None]
+    applied_per_subset = [
+        (sub, [a for a in applied if intra_subset_unify_edit(a, sub)])
+        for sub in approved
+    ]
+    failing = [
+        sub
+        for sub, applied_for_s in applied_per_subset
+        if applied_for_s
+        and not subset_edit_texts_unique(applied_for_s, sub.canonical)
+    ]
+    if failing:
+        out = revert_subsets_edits(out, applied, failing, audit_sink=audits)
+        for sub in failing:
             audits.append(
                 {
                     "pass": "polish_cluster",
                     "path": "subset_revert",
                     "surfaces": sorted(sub.surfaces),
                     "canonical": sub.canonical,
-                    "reason": "cluster-channel edits landed non-unique writings",
+                    "reason": "intra-subset unify edits landed non-unique writings",
                 }
             )
+    for sub, applied_for_s in applied_per_subset:
         audits.extend(leftover_mentions(out, sub, applied_for_s))
     return out
 
