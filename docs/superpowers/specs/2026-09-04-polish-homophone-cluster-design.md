@@ -1,7 +1,7 @@
 # Polish: Homophone Clusters and Entity-Subset Consistency (Design)
 
 **Date:** 2026-09-04  
-**Status:** Revised for spec review (do not implement until this file is approved)  
+**Status:** Approved for implementation  
 **Repo:** Stage-2 Multi-ASR + LLM Fusion  
 **Related:** [Architecture](../../2026-07-24-stage2-multi-asr-llm-fusion-design.md), [README polish policy](../../../README.md)
 
