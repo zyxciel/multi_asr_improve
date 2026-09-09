@@ -4,6 +4,7 @@ import re
 from typing import Any
 
 from stage2_asr.agreement import normalize_for_cer
+from stage2_asr.hotwords import prompt_hotwords
 from stage2_asr.llm_retry import sleep_before_retry
 from stage2_asr.neighbors import cap_neighbors, meeting_draft
 from stage2_asr.pinyin_util import pinyin_edit_distance
@@ -750,12 +751,13 @@ def _try_polish(
     cluster_mappings: str = "(none)",
     cluster_allow: dict[str, str] | None = None,
     cluster_members: list[frozenset[str]] | None = None,
+    llm_hotwords: list[str] | None = None,
 ) -> tuple[dict | None, str | None]:
     try:
         raw = llm_judge.polish(
             text=text,
             neighbor_draft=neighbors,
-            hotwords=hotwords,
+            hotwords=llm_hotwords if llm_hotwords is not None else hotwords,
             turn_index=turn_index,
             unit_id=unit_id,
             hypotheses=hypotheses or [],
@@ -865,6 +867,7 @@ def _run_polish_batched(
 ) -> tuple[dict[int, str], list[dict]]:
     meeting = meeting_draft(turns, out)
     batch_size = max(1, int(getattr(cfg, "polish_batch_size", 1) or 1))
+    hw_llm = prompt_hotwords(hotwords, cfg)
     hyp_by_turn = hyp_by_turn or {}
     prepared: list[dict] = []
     for i, turn in enumerate(turns):
@@ -938,7 +941,7 @@ def _run_polish_batched(
         still = _accept_or_defer(
             chunk,
             llm_judge.polish_many(
-                _jobs_for(chunk, hotwords, cluster_mappings), max_workers=batch_size
+                _jobs_for(chunk, hw_llm, cluster_mappings), max_workers=batch_size
             ),
             attempt=1,
         )
@@ -950,7 +953,7 @@ def _run_polish_batched(
             still = _accept_or_defer(
                 still,
                 llm_judge.polish_many(
-                    _jobs_for(still, hotwords, cluster_mappings),
+                    _jobs_for(still, hw_llm, cluster_mappings),
                     max_workers=batch_size,
                 ),
                 attempt=attempt,
@@ -1021,6 +1024,7 @@ def run_polish(
         return out, audits
 
     meeting = meeting_draft(turns, out)
+    hw_llm = prompt_hotwords(hotwords, cfg)
     for i, turn in enumerate(turns):
         text = out.get(i, turn.text)
         if not text:
@@ -1062,6 +1066,7 @@ def run_polish(
                 cluster_mappings=cluster_mappings,
                 cluster_allow=allow,
                 cluster_members=cluster_members,
+                llm_hotwords=hw_llm,
             )
             if raw is None:
                 last_err = err

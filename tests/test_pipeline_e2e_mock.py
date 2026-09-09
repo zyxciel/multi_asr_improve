@@ -186,6 +186,8 @@ def test_stage_asr_then_llm_uses_cached_hypotheses(tmp_path: Path):
     assert llm_result["stage"] == "llm"
     assert (out / "mode_c_draft.json").exists()
     assert (out / "mode_c_asr_final.json").exists()
+    assert (out / "mode_c_polished.json").exists()
+    assert (out / "mode_c_published.json").exists()
 
 
 def test_stage_asr_can_accumulate_different_models(tmp_path: Path):
@@ -447,7 +449,7 @@ def test_pass_b_stage_preserves_pass_a_artifacts(tmp_path: Path):
     assert "pass_a" in stats and "pass_b" in stats
 
 
-def test_stage_llm_keeps_polish_audits_and_stats(tmp_path: Path):
+def test_stage_llm_runs_polish_publish_and_keeps_pass_a(tmp_path: Path):
     out = tmp_path / "work"
     common = dict(
         input_json=FIXTURES / "mode_c.json",
@@ -458,31 +460,20 @@ def test_stage_llm_keeps_polish_audits_and_stats(tmp_path: Path):
         config=PipelineConfig(),
         hotwords=["单框架|单方接"],
     )
-    run_pipeline(**common, stage="all")
-    edits_path = out / "llm_edits.jsonl"
-    with edits_path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps({"pass": "polish", "path": "seed", "turn_index": 0}, ensure_ascii=False) + "\n")
-    stats_path = out / "pass_stats.json"
-    stats_before = json.loads(stats_path.read_text(encoding="utf-8"))
-    stats_before.setdefault("polish", {"n_audits": 1})
-    stats_path.write_text(json.dumps(stats_before, ensure_ascii=False, indent=2), encoding="utf-8")
-    before = [
-        json.loads(line)
-        for line in edits_path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    assert any(e.get("pass") == "polish" for e in before)
-
+    run_pipeline(**common, stage="asr", asr_models=["moss", "qwen"])
     run_pipeline(**common, stage="llm")
     after = [
         json.loads(line)
         for line in (out / "llm_edits.jsonl").read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
-    assert any(e.get("pass") == "polish" for e in after)
     assert any(e.get("pass") == "A" for e in after)
+    assert (out / "mode_c_asr_final.json").exists()
+    assert (out / "mode_c_polished.json").exists()
+    assert (out / "mode_c_published.json").exists()
     stats = json.loads((out / "pass_stats.json").read_text(encoding="utf-8"))
     assert "polish" in stats
+    assert "publish" in stats
     assert "pass_a" in stats and "pass_b" in stats
 
 

@@ -31,7 +31,7 @@ def _add_common_run_args(p: argparse.ArgumentParser) -> None:
         "--stage",
         default="all",
         choices=["all", "asr", "pass_a", "pass_b", "llm", "polish", "publish"],
-        help="Execution stage: all | asr | pass_a | pass_b | llm | polish | publish",
+        help="Execution stage: all | asr | pass_a | pass_b | llm (pass_a+pass_b+polish+publish) | polish | publish",
     )
     p.add_argument(
         "--asr-models",
@@ -181,6 +181,26 @@ def _add_common_run_args(p: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Allow Qwen3-style thinking/CoT (default: off — JSON-only for ASR judge speed/validity)",
     )
+    p.add_argument(
+        "--llm-log-mode",
+        choices=["full", "meta", "off"],
+        default="meta",
+        help="llm_infer.jsonl: meta (default, no prompt/response bodies), full, or off",
+    )
+    p.add_argument("--neighbor-max-turns", type=int, default=20)
+    p.add_argument("--neighbor-window-seconds", type=float, default=600.0)
+    p.add_argument(
+        "--neighbor-char-budget",
+        type=int,
+        default=8192,
+        help="Max neighbor-draft characters in LLM prompts (approx 0.5 token/char)",
+    )
+    p.add_argument(
+        "--hotword-prompt-chars",
+        type=int,
+        default=4000,
+        help="Max JSON characters of hotwords sent to the LLM (aliases still use the full list)",
+    )
 
 
 def _resolve_backend(args: argparse.Namespace) -> str | None:
@@ -238,6 +258,11 @@ def _pipeline_config(args: argparse.Namespace) -> PipelineConfig:
     raw_glossary = getattr(args, "glossary", None)
     if raw_glossary:
         glossary = load_glossary(Path(raw_glossary))
+    neighbor_char_budget = int(getattr(args, "neighbor_char_budget", 8192))
+    max_len = getattr(args, "vllm_max_model_len", None)
+    if max_len:
+        derived = max(512, (int(max_len) - 1024) * 2)
+        neighbor_char_budget = min(neighbor_char_budget, derived)
     return PipelineConfig(
         max_asr_seconds=float(args.max_asr_seconds),
         pass_a_batch_size=max(1, int(args.pass_a_batch_size)),
@@ -250,6 +275,11 @@ def _pipeline_config(args: argparse.Namespace) -> PipelineConfig:
         glossary=glossary,
         llm_retry_backoff_s=float(getattr(args, "llm_retry_backoff_s", 0.0)),
         force_refresh=bool(getattr(args, "force_refresh", False)),
+        neighbor_max_turns=max(0, int(getattr(args, "neighbor_max_turns", 20))),
+        neighbor_window_seconds=float(getattr(args, "neighbor_window_seconds", 600.0)),
+        neighbor_char_budget=max(0, neighbor_char_budget),
+        hotword_prompt_chars=max(0, int(getattr(args, "hotword_prompt_chars", 4000))),
+        llm_log_mode=str(getattr(args, "llm_log_mode", "meta") or "meta"),
     )
 
 
@@ -361,6 +391,8 @@ def _cmd_run_batch(args: argparse.Namespace) -> int:
         llm_base_url=args.llm_base_url,
         llm_api_key=resolve_llm_api_key(args.llm_api_key),
         llm_timeout_s=float(args.llm_timeout_s),
+        skip_existing=bool(getattr(args, "skip_existing", True)),
+        sample_workers=max(1, int(getattr(args, "sample_workers", 1))),
         **_vllm_flags(args),
     )
     print(
@@ -372,6 +404,7 @@ def _cmd_run_batch(args: argparse.Namespace) -> int:
                 "llm_backend": summary.get("llm_backend"),
                 "n_paired": summary["n_paired"],
                 "n_ok": summary["n_ok"],
+                "n_cached": summary.get("n_cached", 0),
                 "n_skip": summary["n_skip"],
                 "n_error": summary["n_error"],
                 "summary": str(Path(args.work_root) / "batch_summary.json"),
@@ -394,27 +427,27 @@ def main(argv: list[str] | None = None) -> int:
 
     batch_p = sub.add_parser(
         "run-batch",
-        help="Run Stage-2 over benchmark/*/Audio wavs paired with Mode-C JSONs",
+        help="Run Stage-2 over audio files recursively paired with Mode-C JSONs",
     )
     batch_p.add_argument(
         "--wav-benchmark",
         required=True,
-        help="Root .../benchmark containing {dataset}/Audio/*.wav",
+        help="Wav file or directory; directories are scanned recursively for *.wav",
     )
     batch_p.add_argument(
         "--mode-c-benchmark",
         required=True,
-        help="Root .../benchmark containing {dataset}/Audio/{stem}/mode_c.json",
+        help="mode_c.json file or directory; directories are scanned recursively for mode_c.json",
     )
     batch_p.add_argument(
         "--work-root",
         required=True,
-        help="Output root; writes work-root/{dataset}/{stem}/ plus batch_summary.json",
+        help="Output root; writes work-root/<relative-audio-path>/ plus batch_summary.json",
     )
     batch_p.add_argument(
         "--datasets",
         default=None,
-        help="Optional comma-separated dataset names under benchmark (default: all)",
+        help="Optional comma-separated top-level directory names under the audio root (default: all)",
     )
     batch_p.add_argument("--limit", type=int, default=None, help="Optional max number of paired samples")
     batch_p.add_argument(
@@ -426,6 +459,18 @@ def main(argv: list[str] | None = None) -> int:
         "--fail-fast",
         action="store_true",
         help="Stop on first sample error (default: continue and record errors)",
+    )
+    batch_p.add_argument(
+        "--skip-existing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Skip samples whose stage artifacts already exist (default: on; --no-skip-existing to rerun)",
+    )
+    batch_p.add_argument(
+        "--sample-workers",
+        type=int,
+        default=1,
+        help="Process this many samples in parallel (I/O overlap; vllm_engine generate is serialized)",
     )
     _add_common_run_args(batch_p)
 

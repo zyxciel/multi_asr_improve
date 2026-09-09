@@ -35,3 +35,15 @@ def test_load_docs_hotwords_txt():
 
 def test_load_hotwords_none():
     assert load_hotwords(None) == []
+
+
+def test_cap_hotword_list_keeps_whole_terms_under_budget():
+    from stage2_asr.hotwords import cap_hotword_list
+
+    words = ["昇腾", "鸿蒙操作系统", "单框架"]
+    capped = cap_hotword_list(words, max_chars=10)
+    joined = "".join(capped)
+    assert len(joined) <= 10
+    assert capped == ["昇腾"]
+    assert cap_hotword_list(words, max_chars=0) == []
+    assert cap_hotword_list(words, max_chars=10_000) == words

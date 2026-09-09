@@ -662,8 +662,8 @@ def test_pipeline_all_includes_publish(tmp_path: Path):
         stage="llm",
     )
     assert (llm_out / "mode_c_asr_final.json").exists()
-    assert not (llm_out / "mode_c_published.json").exists()
-    assert not (llm_out / "mode_c_polished.json").exists()
+    assert (llm_out / "mode_c_published.json").exists()
+    assert (llm_out / "mode_c_polished.json").exists()
 
 
 def test_pipeline_publish_requires_input(tmp_path: Path):

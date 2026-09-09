@@ -51,7 +51,7 @@ You can run ASR and LLM in separate stages and reuse artifacts in `--work-dir`.
 stage2-asr run --input mode_c.json --audio prepared.wav --work-dir out --backend real --enable-real --stage asr --asr-models qwen
 stage2-asr run --input mode_c.json --audio prepared.wav --work-dir out --backend real --enable-real --stage asr --asr-models firered
 
-# 2) LLM only (reads out/asr_hypotheses.json; no ASR inference)
+# 2) LLM stack (Pass A + Pass B + polish + publish; reads out/asr_hypotheses.json; no ASR inference)
 stage2-asr run --input mode_c.json --audio prepared.wav --work-dir out --backend real --enable-real --stage llm
 
 # 3) Merge same-speaker units from mode_c_asr_final.json, then polish.
@@ -64,7 +64,7 @@ stage2-asr run --input mode_c.json --audio prepared.wav --work-dir out --backend
 stage2-asr run --input mode_c.json --audio prepared.wav --work-dir out --backend real --enable-real --stage publish
 ```
 
-Available stages: `all` (default; includes polish **and** publish), `asr`, `pass_a`, `pass_b`, `llm` (Pass A+B only, no polish/publish), `polish`, `publish`  
+Available stages: `all` (default; ASR + Pass A/B + polish + publish), `asr`, `pass_a`, `pass_b`, `llm` (Pass A+B + polish + publish, no ASR), `polish`, `publish`  
 ASR model subsets: `moss`, `qwen`, `firered` (comma-separated via `--asr-models`)
 
 `asr_units.json` stores a source fingerprint (Mode-C bytes + audio size/mtime + unit-split config). `--stage asr` rebuilds units on mismatch. `--stage pass_a` / `pass_b` / `llm` **refuse** a mismatch (re-run `--stage asr` after changing input). `--force-refresh` rebuilds ASR units and skips `asr_cache/`; on LLM stages it allows reusing stale units.
@@ -79,15 +79,17 @@ FireRed system config used by the adapter:
 
 ## Dataset batch mode
 
-Pairs wavs and Mode-C JSONs under parallel `benchmark/` trees:
+Give an audio path and a Mode-C path (file or directory). Directories are scanned recursively, including nested subfolders. A wav at `{audio-root}/{rel}.wav` pairs with `{mode-c-root}/{rel}/mode_c.json`. `Audio/` in the relative path is optional on either side (`ds/Audio/utt.wav` still matches `ds/utt/mode_c.json`). Outputs mirror the audio relative path:
 
 ```text
-{wav-benchmark}/{dataset}/Audio/{stem}.wav
-{mode-c-benchmark}/{dataset}/Audio/{stem}/mode_c.json
-→ work-root/{dataset}/{stem}/
+{wav-benchmark}/{rel}.wav
+{mode-c-benchmark}/{rel}/mode_c.json
+→ work-root/{rel}/
 ```
 
-Example (your layout):
+Classic `benchmark/{dataset}/Audio/{stem}.wav` trees still work; work dirs become `work-root/{dataset}/Audio/{stem}/`.
+
+Example:
 
 ```bash
 # dry-run: list pairs / missing mode_c without loading models
@@ -120,7 +122,17 @@ stage2-asr run-batch \
   --backend real --enable-real --stage llm
 ```
 
-Useful flags: `--limit N`, `--fail-fast`, `--hotwords docs/hotwords.txt`.
+`--stage llm` here runs Pass A, Pass B, polish, and publish on cached ASR hypotheses.
+
+Useful flags: `--limit N`, `--fail-fast`, `--hotwords docs/hotwords.txt`, `--skip-existing` (default on), `--no-skip-existing`, `--sample-workers N`.
+
+`--skip-existing` (default) skips a sample when the stage's outputs are already in its work dir. `--stage llm` looks for `mode_c_asr_final.json` + polished + published; `--stage asr` also checks that `asr_hypotheses.json` already has every `--asr-models` name. `--force-refresh` and `--no-skip-existing` both rerun.
+
+`--sample-workers N` overlaps CPU/I/O across meetings. In-process `vllm_engine.generate` is serialized with a lock; HTTP `--llm-backend vllm` can actually run concurrent requests. `--fail-fast` forces workers=1.
+
+`--llm-log-mode meta` (default) writes `llm_infer.jsonl` without prompt/response bodies. Use `full` to debug, `off` to skip the file.
+
+Prompt size: `--neighbor-max-turns`, `--neighbor-window-seconds`, `--neighbor-char-budget` (default 8192; auto-tightened if `--vllm-max-model-len` is small), `--hotword-prompt-chars` (LLM prompt only; Pass B aliases still see the full list).
 
 **Hotwords file formats** (any of these work with `--hotwords`):
 - Plaintext one term per line (repo default: `docs/hotwords.txt`)
@@ -162,7 +174,7 @@ python -m stage2_asr.cli run-batch \
 - Homophone-cluster partition is **default on** for `--stage polish` / `all`: one LLM call per multi-surface cluster builds an entity-subset allow-list before span-edit polish. Use `--no-polish-cluster` to freeze pre-cluster (2026-09-04) polish for A/B; that changes display output (`mode_c_polished.json`) only, not `mode_c_asr_final.json`. Partition thinking is internal; keep thinking **off** for polish span-edit generate (`--llm-enable-thinking` stays off by default).
 - Thinking/CoT is **off by default** (`enable_thinking=False` in chat template / `chat_template_kwargs`). Required for Qwen3.8 (thinks by default). Use `--llm-enable-thinking` only if you need it; leaked `<think>` blocks are stripped and logged to `llm_infer.jsonl`, JSON only drives Pass A/B **and** polish. Keep thinking **off** for polish as well (JSON span edits; CoT adds latency without helping conservative substitutions).
 - Qwen3.8-27B uses hybrid attention (Gated DeltaNet). The **vLLM-Ascend / vLLM build must support that architecture**; an older 3.6-only engine will fail at load. Pass `--llm-model-id` if weights live at a local path.
-- Traces: `work-dir/llm_infer.jsonl` (includes `user` prompt + `response`, each capped at 16k chars)
+- Traces: `work-dir/llm_infer.jsonl` — `--llm-log-mode meta` (default) keeps counts/errors only; `full` stores user/response (capped at 16k chars); `off` skips the file.
 
 **If you see `Invalid thread pool` / `Engine core initialization failed` (vLLM 0.18 V1):** this is a PyTorch OpenMP + V1 multiprocess bug, not Stage-2 logic. Pull latest (defaults `VLLM_USE_V1=0`, `enforce_eager`, `spawn`) or set before running:
 

@@ -158,6 +158,11 @@ class PipelineConfig:
     publish_eval_thinking: bool = True
     glossary: dict | None = None
     force_refresh: bool = False
+    # Neighbor / prompt size (char ≈ 0.5 token). Caps LLM context on long meetings.
+    neighbor_char_budget: int = 8192
+    hotword_prompt_chars: int = 4000
+    # llm_infer.jsonl: full = user/response bodies; meta = counts only; off = no file.
+    llm_log_mode: str = "meta"
 
 
 @dataclass

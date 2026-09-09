@@ -129,3 +129,70 @@ def test_pipeline_writes_llm_infer_log(tmp_path: Path):
     lines = [json.loads(x) for x in log_path.read_text(encoding="utf-8").splitlines() if x.strip()]
     assert lines
     assert any(r.get("unit_id") for r in lines)
+
+
+def test_pipeline_llm_log_meta_strips_bodies(tmp_path: Path):
+    from stage2_asr.pipeline import run_pipeline
+    from stage2_asr.runners.mock_asr import MockAsrRunner
+    from stage2_asr.runners.mock_llm import MockLlmJudge
+    from stage2_asr.types import PipelineConfig
+
+    class LoggingMock(MockLlmJudge):
+        def __init__(self):
+            super().__init__()
+            self.log_fn = None
+
+        def judge(self, **kwargs):
+            if self.log_fn:
+                self.log_fn(
+                    {
+                        "judge": "mock",
+                        "pass": "judge",
+                        "unit_id": kwargs.get("unit_id"),
+                        "user": "PROMPT" * 100,
+                        "response": "BODY" * 100,
+                        "reasoning": "THINK",
+                    }
+                )
+            return super().judge(**kwargs)
+
+    fixtures = Path(__file__).parent / "fixtures"
+    out = tmp_path / "work"
+    run_pipeline(
+        input_json=fixtures / "mode_c.json",
+        audio_path=tmp_path / "missing.wav",
+        work_dir=out,
+        asr_runner=MockAsrRunner(),
+        llm_judge=LoggingMock(),
+        config=PipelineConfig(llm_log_mode="meta"),
+        stage="all",
+    )
+    lines = [
+        json.loads(x)
+        for x in (out / "llm_infer.jsonl").read_text(encoding="utf-8").splitlines()
+        if x.strip()
+    ]
+    assert lines
+    assert all("user" not in r and "response" not in r and "reasoning" not in r for r in lines)
+    assert any(r.get("unit_id") for r in lines)
+
+
+def test_pipeline_llm_log_off_writes_nothing(tmp_path: Path):
+    from stage2_asr.pipeline import run_pipeline
+    from stage2_asr.runners.mock_asr import MockAsrRunner
+    from stage2_asr.runners.mock_llm import MockLlmJudge
+    from stage2_asr.types import PipelineConfig
+
+    fixtures = Path(__file__).parent / "fixtures"
+    out = tmp_path / "work"
+    result = run_pipeline(
+        input_json=fixtures / "mode_c.json",
+        audio_path=tmp_path / "missing.wav",
+        work_dir=out,
+        asr_runner=MockAsrRunner(),
+        llm_judge=MockLlmJudge(),
+        config=PipelineConfig(llm_log_mode="off"),
+        stage="all",
+    )
+    assert result.get("llm_log_path") is None
+    assert not (out / "llm_infer.jsonl").exists()

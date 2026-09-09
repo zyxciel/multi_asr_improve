@@ -21,7 +21,7 @@ def cap_neighbors(
     turn_index: int,
     cfg: PipelineConfig,
 ) -> list[dict]:
-    """Nearest other turns within ±window, capped by neighbor_max_turns and ~8k chars."""
+    """Nearest other turns within ±window, capped by neighbor_max_turns and neighbor_char_budget."""
     current = next((row for row in meeting if int(row["turn_index"]) == int(turn_index)), None)
     if current is None:
         return []
@@ -39,7 +39,7 @@ def cap_neighbors(
         cands.append((dist, idx, row))
     cands.sort(key=lambda item: (item[0], item[1]))
 
-    char_budget = 4096 * 2
+    char_budget = int(getattr(cfg, "neighbor_char_budget", 8192) or 8192)
     used = 0
     capped: list[dict] = []
     for _, _, row in cands[: cfg.neighbor_max_turns]:
