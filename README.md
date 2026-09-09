@@ -18,6 +18,8 @@ pip install -e ".[dev]"
 pytest -q
 ```
 
+Cluster one-shot (install → mock/pytest → dry-run → ASR → LLM, including 8-NPU split): see [`scripts/run_stage2_pipeline.sh`](scripts/run_stage2_pipeline.sh). Override `WAV_BENCHMARK`, `MODE_C_BENCHMARK`, `WORK_ROOT`, `LLM_MODEL_ID`, `DEVICES`. Real `qwen_asr` / `fireredasr2s` / vLLM-Ascend must already be in that Python env.
+
 ## Mock end-to-end (no weights)
 
 ```bash
