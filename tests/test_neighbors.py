@@ -43,3 +43,16 @@ def test_cap_neighbors_respects_time_window():
     cfg = PipelineConfig(neighbor_max_turns=20, neighbor_window_seconds=60.0)
     neighbors = cap_neighbors(meeting, 2, cfg)
     assert [row["text"] for row in neighbors] == ["近"]
+
+
+def test_cap_neighbors_uses_neighbor_char_budget():
+    turns = [
+        Turn(0.0, 1.0, "s0", "甲" * 50),
+        Turn(2.0, 3.0, "s0", "乙" * 50),
+        Turn(4.0, 5.0, "s0", "当前"),
+    ]
+    meeting = meeting_draft(turns, {i: t.text for i, t in enumerate(turns)})
+    cfg = PipelineConfig(neighbor_max_turns=20, neighbor_window_seconds=600.0, neighbor_char_budget=80)
+    neighbors = cap_neighbors(meeting, 2, cfg)
+    assert len(neighbors) == 1
+    assert neighbors[0]["text"].startswith("乙")

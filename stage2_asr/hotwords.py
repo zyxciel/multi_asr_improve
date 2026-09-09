@@ -49,3 +49,21 @@ def load_hotwords(path: str | Path | None) -> list[str]:
         seen.add(item)
         out.append(item)
     return out
+
+
+def cap_hotword_list(hotwords: list[str] | None, max_chars: int) -> list[str]:
+    """Keep whole terms whose JSON list stays within ``max_chars`` (prompt budget)."""
+    if not hotwords or int(max_chars) <= 0:
+        return []
+    out: list[str] = []
+    for item in hotwords:
+        candidate = out + [str(item)]
+        if len(json.dumps(candidate, ensure_ascii=False)) > int(max_chars):
+            break
+        out = candidate
+    return out
+
+
+def prompt_hotwords(hotwords: list[str] | None, cfg) -> list[str]:
+    n = int(getattr(cfg, "hotword_prompt_chars", 4000) or 0)
+    return cap_hotword_list(hotwords, n)

@@ -653,7 +653,7 @@ def test_pipeline_all_writes_polished_without_clobbering_asr_final(tmp_path: Pat
     assert stats["polish"]["n_audits"] >= 0
 
 
-def test_pipeline_llm_stage_skips_polish(tmp_path: Path):
+def test_pipeline_llm_stage_runs_polish_and_publish(tmp_path: Path):
     out = tmp_path / "work"
     run_pipeline(
         input_json=FIXTURES / "mode_c.json",
@@ -677,7 +677,8 @@ def test_pipeline_llm_stage_skips_polish(tmp_path: Path):
         stage="llm",
     )
     assert (out / "mode_c_asr_final.json").exists()
-    assert not (out / "mode_c_polished.json").exists()
+    assert (out / "mode_c_polished.json").exists()
+    assert (out / "mode_c_published.json").exists()
 
 
 def test_pipeline_polish_stage_reads_asr_final(tmp_path: Path):
