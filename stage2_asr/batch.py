@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import sys
 import traceback
 from concurrent.futures import ThreadPoolExecutor
@@ -262,6 +264,145 @@ def stage_complete(
     return True
 
 
+def split_even(items: list, n_parts: int) -> list[list]:
+    """Split ``items`` into ``n_parts`` contiguous slices covering every element once."""
+    n_parts = int(n_parts)
+    if n_parts < 1:
+        raise ValueError("n_parts must be >= 1")
+    seq = list(items)
+    q, r = divmod(len(seq), n_parts)
+    parts: list[list] = []
+    start = 0
+    for _k in range(n_parts):
+        size = q + (1 if _k < r else 0)
+        parts.append(seq[start : start + size])
+        start += size
+    return parts
+
+
+def parse_shard(spec: str | None) -> tuple[int, int] | None:
+    if spec is None or str(spec).strip() == "":
+        return None
+    raw = str(spec).strip()
+    if "/" not in raw:
+        raise ValueError(f"invalid shard {spec!r}; expected i/n (e.g. 0/4)")
+    left, right = raw.split("/", 1)
+    index, n_shards = int(left), int(right)
+    if n_shards < 1 or index < 0 or index >= n_shards:
+        raise ValueError(f"invalid shard {spec!r}; expected 0 <= i < n")
+    return index, n_shards
+
+
+def plan_npu_jobs(devices: list[int], npu_per_job: int) -> list[dict[str, Any]]:
+    npu_per_job = int(npu_per_job)
+    if npu_per_job < 1:
+        raise ValueError("npu_per_job must be >= 1")
+    ids = [int(d) for d in devices]
+    n_jobs = len(ids) // npu_per_job
+    if n_jobs < 1:
+        raise ValueError(f"need at least {npu_per_job} devices for one job, got {ids}")
+    return [
+        {
+            "shard_index": i,
+            "n_shards": n_jobs,
+            "devices": ids[i * npu_per_job : (i + 1) * npu_per_job],
+        }
+        for i in range(n_jobs)
+    ]
+
+
+def shard_summary_name(index: int) -> str:
+    return f"batch_summary.shard{index}.json"
+
+
+def merge_shard_summaries(work_root: Path, n_shards: int) -> dict[str, Any]:
+    work_root = Path(work_root)
+    shards: list[dict[str, Any]] = []
+    missing: list[str] = []
+    for i in range(n_shards):
+        path = work_root / shard_summary_name(i)
+        if not path.is_file():
+            missing.append(str(path))
+            continue
+        shards.append(json.loads(path.read_text(encoding="utf-8")))
+    if missing:
+        raise FileNotFoundError(f"shard summaries missing: {missing}")
+    merged = dict(shards[0])
+    merged["n_paired"] = sum(int(s.get("n_paired") or 0) for s in shards)
+    merged["n_ok"] = sum(int(s.get("n_ok") or 0) for s in shards)
+    merged["n_cached"] = sum(int(s.get("n_cached") or 0) for s in shards)
+    merged["n_error"] = sum(int(s.get("n_error") or 0) for s in shards)
+    merged["n_skip"] = int(shards[0].get("n_skip") or 0)
+    merged["skips"] = shards[0].get("skips") or []
+    merged["results"] = [row for s in shards for row in (s.get("results") or [])]
+    merged["n_shards"] = n_shards
+    merged["shards"] = [str(s.get("shard") or f"{i}/{n_shards}") for i, s in enumerate(shards)]
+    return merged
+
+
+def launch_npu_shards(
+    *,
+    devices: list[int],
+    npu_per_job: int,
+    work_root: Path,
+    child_argv: list[str],
+    executable: str | None = None,
+) -> dict[str, Any]:
+    """Spawn one process per NPU group, wait for all, merge shard summaries."""
+    jobs = plan_npu_jobs(devices, npu_per_job)
+    work_root = Path(work_root)
+    work_root.mkdir(parents=True, exist_ok=True)
+    exe = executable or sys.executable
+    repo_root = str(Path(__file__).resolve().parent.parent)
+    procs: list[subprocess.Popen] = []
+    for job in jobs:
+        env = os.environ.copy()
+        visible = ",".join(str(d) for d in job["devices"])
+        env["ASCEND_RT_VISIBLE_DEVICES"] = visible
+        existing = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = repo_root if not existing else f"{repo_root}{os.pathsep}{existing}"
+        cmd = [
+            exe,
+            "-m",
+            "stage2_asr.cli",
+            *child_argv,
+            "--shard",
+            f"{job['shard_index']}/{job['n_shards']}",
+        ]
+        _log(
+            f"[batch] launch shard {job['shard_index']}/{job['n_shards']} "
+            f"devices={visible}"
+        )
+        procs.append(
+            subprocess.Popen(
+                cmd,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=None,
+            )
+        )
+    rc = 0
+    for job, proc in zip(jobs, procs):
+        out, _err = proc.communicate()
+        code = int(proc.returncode or 0)
+        if out:
+            text = out.decode("utf-8", errors="replace").strip()
+            if text:
+                _log(f"[batch] shard {job['shard_index']}/{job['n_shards']} stdout: {text}")
+        if code:
+            rc = code
+            _log(f"[batch] shard {job['shard_index']}/{job['n_shards']} exit={code}")
+    merged = merge_shard_summaries(work_root, n_shards=len(jobs))
+    merged["launcher_exit"] = rc
+    _write_summary(work_root, merged)
+    _log(
+        f"[batch] all shards done n_paired={merged['n_paired']} "
+        f"ok={merged['n_ok']} error={merged['n_error']} "
+        f"summary={work_root / 'batch_summary.json'}"
+    )
+    return merged
+
+
 def build_runners(
     *,
     backend: str,
@@ -366,6 +507,7 @@ def run_batch(
     llm_enable_thinking: bool = False,
     skip_existing: bool = True,
     sample_workers: int = 1,
+    shard: str | None = None,
 ) -> dict[str, Any]:
     """Discover pairs and run Stage-2 per sample under work_root/{audio-relative-path}/."""
     cfg = config or PipelineConfig()
@@ -377,6 +519,10 @@ def run_batch(
     workers = max(1, int(sample_workers or 1))
     if not continue_on_error:
         workers = 1
+    parsed_shard = parse_shard(shard)
+    summary_name = (
+        shard_summary_name(parsed_shard[0]) if parsed_shard is not None else "batch_summary.json"
+    )
 
     pairs, skips = discover_benchmark_pairs(
         wav_benchmark,
@@ -385,6 +531,10 @@ def run_batch(
     )
     if limit is not None:
         pairs = pairs[: max(0, int(limit))]
+    n_paired_all = len(pairs)
+    if parsed_shard is not None:
+        index, n_shards = parsed_shard
+        pairs = split_even(pairs, n_shards)[index]
 
     summary: dict[str, Any] = {
         "backend": backend,
@@ -396,6 +546,7 @@ def run_batch(
         "mode_c_benchmark": str(mode_c_benchmark),
         "work_root": str(work_root),
         "n_paired": len(pairs),
+        "n_paired_all": n_paired_all,
         "n_skip": len(skips),
         "n_ok": 0,
         "n_cached": 0,
@@ -406,13 +557,15 @@ def run_batch(
         "skips": skips,
         "results": [],
     }
+    if parsed_shard is not None:
+        summary["shard"] = f"{parsed_shard[0]}/{parsed_shard[1]}"
 
     if dry_run:
         summary["results"] = [
             {**p.to_dict(), "work_dir": str(p.work_dir(work_root)), "status": "dry_run"}
             for p in pairs
         ]
-        _write_summary(work_root, summary)
+        _write_summary(work_root, summary, filename=summary_name)
         _log(f"[batch] dry-run: paired={len(pairs)} skipped={len(skips)}")
         return summary
 
@@ -515,7 +668,7 @@ def run_batch(
                 rows.append(row)
                 summary["results"] = rows
                 _tally_batch(summary, rows)
-                _write_summary(work_root, summary)
+                _write_summary(work_root, summary, filename=summary_name)
                 raise
             _log(f"[batch] {bi}/{n_pairs} {pair.sample_id} {row.get('status')}")
             rows.append(row)
@@ -529,11 +682,11 @@ def run_batch(
 
     summary["results"] = rows
     _tally_batch(summary, rows)
-    _write_summary(work_root, summary)
+    _write_summary(work_root, summary, filename=summary_name)
     _log(
         f"[batch] done ok={summary['n_ok']} cached={summary['n_cached']} "
         f"error={summary['n_error']} skip={summary['n_skip']} "
-        f"summary={work_root / 'batch_summary.json'}"
+        f"summary={work_root / summary_name}"
     )
     return summary
 
@@ -544,6 +697,11 @@ def _tally_batch(summary: dict[str, Any], rows: list[dict[str, Any]]) -> None:
     summary["n_error"] = sum(1 for r in rows if r.get("status") == "error")
 
 
-def _write_summary(work_root: Path, summary: dict[str, Any]) -> None:
-    path = work_root / "batch_summary.json"
+def _write_summary(
+    work_root: Path,
+    summary: dict[str, Any],
+    *,
+    filename: str = "batch_summary.json",
+) -> None:
+    path = work_root / filename
     path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")

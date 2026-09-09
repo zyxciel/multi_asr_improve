@@ -124,7 +124,23 @@ stage2-asr run-batch \
 
 `--stage llm` here runs Pass A, Pass B, polish, and publish on cached ASR hypotheses.
 
-Useful flags: `--limit N`, `--fail-fast`, `--hotwords docs/hotwords.txt`, `--skip-existing` (default on), `--no-skip-existing`, `--sample-workers N`.
+Useful flags: `--limit N`, `--fail-fast`, `--hotwords docs/hotwords.txt`, `--skip-existing` (default on), `--no-skip-existing`, `--sample-workers N`, `--devices`, `--npu-per-job`.
+
+**Multi-NPU (split audio across card pairs):** with 8 NPUs and ~6000 wavs, launch four concurrent jobs (2 cards each). The parent waits until every shard finishes, then writes a merged `batch_summary.json`. Omit `--devices` to keep the original single-process behavior.
+
+```bash
+stage2-asr run-batch \
+  --wav-benchmark /path/to/audio_root \
+  --mode-c-benchmark /path/to/mode_c_root \
+  --work-root /path/to/out \
+  --devices 0,1,2,3,4,5,6,7 \
+  --npu-per-job 2 \
+  --backend real --enable-real --stage llm \
+  --llm-backend vllm_engine --vllm-tp-size 2
+```
+
+Each child sees `ASCEND_RT_VISIBLE_DEVICES` for its pair and processes a disjoint slice (`--shard i/4`). Sample outputs still land in `work-root/{audio-rel}/`. Per-shard logs: `batch_summary.shard0.json` … `shard3.json`.
+
 
 `--skip-existing` (default) skips a sample when the stage's outputs are already in its work dir. `--stage llm` looks for `mode_c_asr_final.json` + polished + published; `--stage asr` also checks that `asr_hypotheses.json` already has every `--asr-models` name. `--force-refresh` and `--no-skip-existing` both rerun.
 

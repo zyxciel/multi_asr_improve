@@ -266,3 +266,86 @@ def test_run_batch_sample_workers_completes_all(tmp_path: Path):
     assert summary["n_ok"] == 2
     assert (work_root / "ds1" / "Audio" / "m1" / "mode_c_published.json").exists()
     assert (work_root / "ds1" / "Audio" / "m2" / "mode_c_published.json").exists()
+
+
+def test_split_even_covers_all_items_without_overlap():
+    from stage2_asr.batch import split_even
+
+    parts = split_even(list(range(6000)), 4)
+    assert [len(p) for p in parts] == [1500, 1500, 1500, 1500]
+    assert [x for part in parts for x in part] == list(range(6000))
+
+    uneven = split_even(list(range(7)), 4)
+    assert [len(p) for p in uneven] == [2, 2, 2, 1]
+    assert [x for part in uneven for x in part] == list(range(7))
+
+
+def test_plan_npu_jobs_groups_devices_by_two():
+    from stage2_asr.batch import plan_npu_jobs
+
+    jobs = plan_npu_jobs([0, 1, 2, 3, 4, 5, 6, 7], npu_per_job=2)
+    assert [(j["shard_index"], j["devices"]) for j in jobs] == [
+        (0, [0, 1]),
+        (1, [2, 3]),
+        (2, [4, 5]),
+        (3, [6, 7]),
+    ]
+    assert jobs[0]["n_shards"] == 4
+
+
+def test_run_batch_shard_is_disjoint(tmp_path: Path):
+    wav_bench, mc_bench, work_root = _one_sample_trees(tmp_path, n=4)
+    a = run_batch(
+        wav_benchmark=wav_bench,
+        mode_c_benchmark=mc_bench,
+        work_root=work_root,
+        backend="mock",
+        stage="all",
+        shard="0/2",
+        skip_existing=False,
+    )
+    b = run_batch(
+        wav_benchmark=wav_bench,
+        mode_c_benchmark=mc_bench,
+        work_root=work_root,
+        backend="mock",
+        stage="all",
+        shard="1/2",
+        skip_existing=False,
+    )
+    assert a["n_paired"] == 2 and b["n_paired"] == 2
+    ids_a = {r["sample_id"] for r in a["results"]}
+    ids_b = {r["sample_id"] for r in b["results"]}
+    assert ids_a.isdisjoint(ids_b)
+    assert ids_a | ids_b == {"ds1/Audio/m1", "ds1/Audio/m2", "ds1/Audio/m3", "ds1/Audio/m4"}
+    assert (work_root / "batch_summary.shard0.json").exists()
+    assert (work_root / "batch_summary.shard1.json").exists()
+
+
+def test_cli_npu_parallel_dry_run_waits_and_merges(tmp_path: Path, capsys):
+    wav_bench, mc_bench, work_root = _one_sample_trees(tmp_path, n=4)
+    code = cli_main(
+        [
+            "run-batch",
+            "--wav-benchmark",
+            str(wav_bench),
+            "--mode-c-benchmark",
+            str(mc_bench),
+            "--work-root",
+            str(work_root),
+            "--dry-run",
+            "--mock",
+            "--devices",
+            "0,1,2,3",
+            "--npu-per-job",
+            "2",
+        ]
+    )
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["n_paired"] == 4
+    assert payload["n_shards"] == 2
+    merged = json.loads((work_root / "batch_summary.json").read_text(encoding="utf-8"))
+    assert merged["n_paired"] == 4
+    assert len(merged["results"]) == 4
+    assert {r["status"] for r in merged["results"]} == {"dry_run"}

@@ -6,7 +6,7 @@ import os
 import sys
 from pathlib import Path
 
-from stage2_asr.batch import build_runners, run_batch
+from stage2_asr.batch import build_runners, launch_npu_shards, run_batch
 from stage2_asr.hotwords import load_hotwords
 from stage2_asr.pipeline import run_pipeline
 from stage2_asr.publish import load_glossary
@@ -349,10 +349,88 @@ def _cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_run_batch(args: argparse.Namespace) -> int:
+_LAUNCHER_VALUE_FLAGS = {"--devices", "--npu-per-job", "--shard"}
+
+
+def _parse_devices(raw: str | None) -> list[int]:
+    if raw is None or str(raw).strip() == "":
+        return []
+    return [int(part.strip()) for part in str(raw).split(",") if part.strip()]
+
+
+def _child_batch_argv(argv: list[str], *, npu_per_job: int) -> list[str]:
+    """Drop launcher-only flags so children do not re-spawn; default TP to npu_per_job."""
+    out: list[str] = []
+    i = 0
+    saw_tp = False
+    while i < len(argv):
+        tok = argv[i]
+        key = tok.split("=", 1)[0]
+        if key in _LAUNCHER_VALUE_FLAGS:
+            i += 1 if "=" in tok else 2
+            continue
+        if key == "--vllm-tp-size":
+            saw_tp = True
+        out.append(tok)
+        i += 1
+    if not saw_tp:
+        out.extend(["--vllm-tp-size", str(npu_per_job)])
+    return out
+
+
+def _emit_batch_stdout(summary: dict, work_root: Path) -> int:
+    payload = {
+        "ok": int(summary.get("n_error") or 0) == 0 and int(summary.get("launcher_exit") or 0) == 0,
+        "backend": summary.get("backend"),
+        "stage": summary.get("stage"),
+        "llm_backend": summary.get("llm_backend"),
+        "n_paired": summary.get("n_paired"),
+        "n_ok": summary.get("n_ok"),
+        "n_cached": summary.get("n_cached", 0),
+        "n_skip": summary.get("n_skip"),
+        "n_error": summary.get("n_error"),
+        "summary": str(work_root / "batch_summary.json"),
+    }
+    if "n_shards" in summary:
+        payload["n_shards"] = summary["n_shards"]
+    print(json.dumps(payload, ensure_ascii=False))
+    if int(summary.get("launcher_exit") or 0) or int(summary.get("n_error") or 0):
+        return 1
+    return 0
+
+
+def _cmd_run_batch(args: argparse.Namespace, argv: list[str] | None = None) -> int:
     backend = _resolve_backend(args)
     if backend is None:
         return 2
+
+    devices = _parse_devices(getattr(args, "devices", None))
+    npu_per_job = max(1, int(getattr(args, "npu_per_job", 2) or 2))
+    shard = getattr(args, "shard", None)
+    work_root = Path(args.work_root)
+
+    if devices and not shard:
+        n_jobs = len(devices) // npu_per_job
+        if n_jobs < 1:
+            print(
+                f"need at least {npu_per_job} devices for --npu-per-job {npu_per_job}, got {devices}",
+                file=sys.stderr,
+            )
+            return 2
+        if n_jobs >= 2:
+            leftover = devices[n_jobs * npu_per_job :]
+            if leftover:
+                print(f"[batch] ignoring leftover devices {leftover}", file=sys.stderr)
+            merged = launch_npu_shards(
+                devices=devices,
+                npu_per_job=npu_per_job,
+                work_root=work_root,
+                child_argv=_child_batch_argv(list(argv or []), npu_per_job=npu_per_job),
+            )
+            return _emit_batch_stdout(merged, work_root)
+        os.environ["ASCEND_RT_VISIBLE_DEVICES"] = ",".join(
+            str(d) for d in devices[:npu_per_job]
+        )
 
     datasets = None
     if args.datasets:
@@ -364,7 +442,7 @@ def _cmd_run_batch(args: argparse.Namespace) -> int:
     summary = run_batch(
         wav_benchmark=Path(args.wav_benchmark),
         mode_c_benchmark=Path(args.mode_c_benchmark),
-        work_root=Path(args.work_root),
+        work_root=work_root,
         backend=backend,
         stage=str(args.stage).lower(),
         asr_models=asr_models,
@@ -384,26 +462,10 @@ def _cmd_run_batch(args: argparse.Namespace) -> int:
         llm_timeout_s=float(args.llm_timeout_s),
         skip_existing=bool(getattr(args, "skip_existing", True)),
         sample_workers=max(1, int(getattr(args, "sample_workers", 1))),
+        shard=shard,
         **_vllm_flags(args),
     )
-    print(
-        json.dumps(
-            {
-                "ok": summary["n_error"] == 0,
-                "backend": summary["backend"],
-                "stage": summary["stage"],
-                "llm_backend": summary.get("llm_backend"),
-                "n_paired": summary["n_paired"],
-                "n_ok": summary["n_ok"],
-                "n_cached": summary.get("n_cached", 0),
-                "n_skip": summary["n_skip"],
-                "n_error": summary["n_error"],
-                "summary": str(Path(args.work_root) / "batch_summary.json"),
-            },
-            ensure_ascii=False,
-        )
-    )
-    return 1 if summary["n_error"] else 0
+    return _emit_batch_stdout(summary, work_root)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -463,13 +525,30 @@ def main(argv: list[str] | None = None) -> int:
         default=1,
         help="Process this many samples in parallel (I/O overlap; vllm_engine generate is serialized)",
     )
+    batch_p.add_argument(
+        "--devices",
+        default=None,
+        help="Comma-separated NPU ids (e.g. 0,1,2,3,4,5,6,7). Split into concurrent jobs of --npu-per-job cards",
+    )
+    batch_p.add_argument(
+        "--npu-per-job",
+        type=int,
+        default=2,
+        help="NPUs per concurrent shard (default 2). 8 cards → 4 jobs that all run until every wav finishes",
+    )
+    batch_p.add_argument(
+        "--shard",
+        default=None,
+        help="Process slice i/n of paired samples (set automatically by --devices)",
+    )
     _add_common_run_args(batch_p)
 
+    argv = list(sys.argv[1:] if argv is None else argv)
     args = parser.parse_args(argv)
     if args.cmd == "run":
         return _cmd_run(args)
     if args.cmd == "run-batch":
-        return _cmd_run_batch(args)
+        return _cmd_run_batch(args, argv)
     parser.error(f"unknown command {args.cmd}")
 
 
