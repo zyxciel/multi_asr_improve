@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 
 from stage2_asr.audio_io import crop_unit_wav, load_wav_mono16k
-from stage2_asr.llm_log import LlmInferLogger
+from stage2_asr.llm_log import LlmInferLogger, activate_llm_log, reset_llm_log
 from stage2_asr.pass_a import run_pass_a_batch
 from stage2_asr.pass_b import run_pass_b
 from stage2_asr.polish import hyps_by_merged_from_records, hyps_by_turn_from_records, run_polish
@@ -649,7 +649,7 @@ def run_pipeline(
     - asr: build units + run selected ASR models, persist asr_hypotheses/asr_cache only.
     - pass_a: run Pass A only from saved ASR hypotheses/cache.
     - pass_b: run Pass B only from mode_c_draft.json.
-    - llm: run Pass A then Pass B from saved ASR hypotheses/cache (no ASR inference).
+    - llm: run Pass A, Pass B, polish, and publish from saved ASR hypotheses/cache (no ASR inference).
     - polish: merge same-speaker ASR units from mode_c_asr_final.json, then polish; writes mode_c_polished.json on the unit grid.
     - publish: display fluency/ITN/latex/glossary on polished (else merged final); does not overwrite WER or polish files.
     - all: full pipeline in one run (ASR + Pass A/B + polish + publish).
@@ -672,12 +672,17 @@ def run_pipeline(
 
     llm_logger: LlmInferLogger | None = None
     llm_log_path: Path | None = None
-    if stage in {"all", "pass_a", "pass_b", "llm", "polish", "publish"}:
+    log_token = None
+    log_mode = str(getattr(cfg, "llm_log_mode", "meta") or "meta").lower()
+    if log_mode not in {"full", "meta", "off"}:
+        log_mode = "meta"
+    if stage in {"all", "pass_a", "pass_b", "llm", "polish", "publish"} and log_mode != "off":
         llm_log_path = work_dir / "llm_infer.jsonl"
-        llm_logger = LlmInferLogger(llm_log_path)
+        llm_logger = LlmInferLogger(llm_log_path, mode=log_mode)
+        log_token = activate_llm_log(llm_logger.log)
         _attach_llm_logger(llm_judge, llm_logger)
         _attach_llm_logger(fallback_judge, llm_logger)
-        _log(f"[llm] infer log -> {llm_log_path}")
+        _log(f"[llm] infer log ({log_mode}) -> {llm_log_path}")
 
     try:
         return _run_pipeline_body(
@@ -694,6 +699,8 @@ def run_pipeline(
             llm_log_path=llm_log_path,
         )
     finally:
+        if log_token is not None:
+            reset_llm_log(log_token)
         if llm_logger is not None:
             llm_logger.close()
 
@@ -1178,7 +1185,7 @@ def _run_pipeline_body(
     _log(f"[stage={stage}] done: final={final_path} draft={draft_path}")
 
     extra: dict[str, Any] = {}
-    if stage == "all":
+    if stage in {"all", "llm"}:
         extra = _persist_polish(
             turns=merged_final,
             texts={i: t.text for i, t in enumerate(merged_final)},

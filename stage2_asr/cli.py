@@ -6,7 +6,7 @@ import os
 import sys
 from pathlib import Path
 
-from stage2_asr.batch import build_runners, run_batch
+from stage2_asr.batch import build_runners, launch_npu_shards, run_batch
 from stage2_asr.hotwords import load_hotwords
 from stage2_asr.pipeline import run_pipeline
 from stage2_asr.publish import load_glossary
@@ -31,7 +31,7 @@ def _add_common_run_args(p: argparse.ArgumentParser) -> None:
         "--stage",
         default="all",
         choices=["all", "asr", "pass_a", "pass_b", "llm", "polish", "publish"],
-        help="Execution stage: all | asr | pass_a | pass_b | llm | polish | publish",
+        help="Execution stage: all | asr | pass_a | pass_b | llm (pass_a+pass_b+polish+publish) | polish | publish",
     )
     p.add_argument(
         "--asr-models",
@@ -173,6 +173,26 @@ def _add_common_run_args(p: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Allow Qwen3-style thinking/CoT (default: off — JSON-only for ASR judge speed/validity)",
     )
+    p.add_argument(
+        "--llm-log-mode",
+        choices=["full", "meta", "off"],
+        default="meta",
+        help="llm_infer.jsonl: meta (default, no prompt/response bodies), full, or off",
+    )
+    p.add_argument("--neighbor-max-turns", type=int, default=20)
+    p.add_argument("--neighbor-window-seconds", type=float, default=600.0)
+    p.add_argument(
+        "--neighbor-char-budget",
+        type=int,
+        default=8192,
+        help="Max neighbor-draft characters in LLM prompts (approx 0.5 token/char)",
+    )
+    p.add_argument(
+        "--hotword-prompt-chars",
+        type=int,
+        default=4000,
+        help="Max JSON characters of hotwords sent to the LLM (aliases still use the full list)",
+    )
 
 
 def _resolve_backend(args: argparse.Namespace) -> str | None:
@@ -230,6 +250,11 @@ def _pipeline_config(args: argparse.Namespace) -> PipelineConfig:
     raw_glossary = getattr(args, "glossary", None)
     if raw_glossary:
         glossary = load_glossary(Path(raw_glossary))
+    neighbor_char_budget = int(getattr(args, "neighbor_char_budget", 8192))
+    max_len = getattr(args, "vllm_max_model_len", None)
+    if max_len:
+        derived = max(512, (int(max_len) - 1024) * 2)
+        neighbor_char_budget = min(neighbor_char_budget, derived)
     return PipelineConfig(
         max_asr_seconds=float(args.max_asr_seconds),
         pass_a_batch_size=max(1, int(args.pass_a_batch_size)),
@@ -241,6 +266,11 @@ def _pipeline_config(args: argparse.Namespace) -> PipelineConfig:
         glossary=glossary,
         llm_retry_backoff_s=float(getattr(args, "llm_retry_backoff_s", 0.0)),
         force_refresh=bool(getattr(args, "force_refresh", False)),
+        neighbor_max_turns=max(0, int(getattr(args, "neighbor_max_turns", 20))),
+        neighbor_window_seconds=float(getattr(args, "neighbor_window_seconds", 600.0)),
+        neighbor_char_budget=max(0, neighbor_char_budget),
+        hotword_prompt_chars=max(0, int(getattr(args, "hotword_prompt_chars", 4000))),
+        llm_log_mode=str(getattr(args, "llm_log_mode", "meta") or "meta"),
     )
 
 
@@ -319,10 +349,88 @@ def _cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_run_batch(args: argparse.Namespace) -> int:
+_LAUNCHER_VALUE_FLAGS = {"--devices", "--npu-per-job", "--shard"}
+
+
+def _parse_devices(raw: str | None) -> list[int]:
+    if raw is None or str(raw).strip() == "":
+        return []
+    return [int(part.strip()) for part in str(raw).split(",") if part.strip()]
+
+
+def _child_batch_argv(argv: list[str], *, npu_per_job: int) -> list[str]:
+    """Drop launcher-only flags so children do not re-spawn; default TP to npu_per_job."""
+    out: list[str] = []
+    i = 0
+    saw_tp = False
+    while i < len(argv):
+        tok = argv[i]
+        key = tok.split("=", 1)[0]
+        if key in _LAUNCHER_VALUE_FLAGS:
+            i += 1 if "=" in tok else 2
+            continue
+        if key == "--vllm-tp-size":
+            saw_tp = True
+        out.append(tok)
+        i += 1
+    if not saw_tp:
+        out.extend(["--vllm-tp-size", str(npu_per_job)])
+    return out
+
+
+def _emit_batch_stdout(summary: dict, work_root: Path) -> int:
+    payload = {
+        "ok": int(summary.get("n_error") or 0) == 0 and int(summary.get("launcher_exit") or 0) == 0,
+        "backend": summary.get("backend"),
+        "stage": summary.get("stage"),
+        "llm_backend": summary.get("llm_backend"),
+        "n_paired": summary.get("n_paired"),
+        "n_ok": summary.get("n_ok"),
+        "n_cached": summary.get("n_cached", 0),
+        "n_skip": summary.get("n_skip"),
+        "n_error": summary.get("n_error"),
+        "summary": str(work_root / "batch_summary.json"),
+    }
+    if "n_shards" in summary:
+        payload["n_shards"] = summary["n_shards"]
+    print(json.dumps(payload, ensure_ascii=False))
+    if int(summary.get("launcher_exit") or 0) or int(summary.get("n_error") or 0):
+        return 1
+    return 0
+
+
+def _cmd_run_batch(args: argparse.Namespace, argv: list[str] | None = None) -> int:
     backend = _resolve_backend(args)
     if backend is None:
         return 2
+
+    devices = _parse_devices(getattr(args, "devices", None))
+    npu_per_job = max(1, int(getattr(args, "npu_per_job", 2) or 2))
+    shard = getattr(args, "shard", None)
+    work_root = Path(args.work_root)
+
+    if devices and not shard:
+        n_jobs = len(devices) // npu_per_job
+        if n_jobs < 1:
+            print(
+                f"need at least {npu_per_job} devices for --npu-per-job {npu_per_job}, got {devices}",
+                file=sys.stderr,
+            )
+            return 2
+        if n_jobs >= 2:
+            leftover = devices[n_jobs * npu_per_job :]
+            if leftover:
+                print(f"[batch] ignoring leftover devices {leftover}", file=sys.stderr)
+            merged = launch_npu_shards(
+                devices=devices,
+                npu_per_job=npu_per_job,
+                work_root=work_root,
+                child_argv=_child_batch_argv(list(argv or []), npu_per_job=npu_per_job),
+            )
+            return _emit_batch_stdout(merged, work_root)
+        os.environ["ASCEND_RT_VISIBLE_DEVICES"] = ",".join(
+            str(d) for d in devices[:npu_per_job]
+        )
 
     datasets = None
     if args.datasets:
@@ -334,7 +442,7 @@ def _cmd_run_batch(args: argparse.Namespace) -> int:
     summary = run_batch(
         wav_benchmark=Path(args.wav_benchmark),
         mode_c_benchmark=Path(args.mode_c_benchmark),
-        work_root=Path(args.work_root),
+        work_root=work_root,
         backend=backend,
         stage=str(args.stage).lower(),
         asr_models=asr_models,
@@ -352,25 +460,12 @@ def _cmd_run_batch(args: argparse.Namespace) -> int:
         llm_base_url=args.llm_base_url,
         llm_api_key=resolve_llm_api_key(args.llm_api_key),
         llm_timeout_s=float(args.llm_timeout_s),
+        skip_existing=bool(getattr(args, "skip_existing", True)),
+        sample_workers=max(1, int(getattr(args, "sample_workers", 1))),
+        shard=shard,
         **_vllm_flags(args),
     )
-    print(
-        json.dumps(
-            {
-                "ok": summary["n_error"] == 0,
-                "backend": summary["backend"],
-                "stage": summary["stage"],
-                "llm_backend": summary.get("llm_backend"),
-                "n_paired": summary["n_paired"],
-                "n_ok": summary["n_ok"],
-                "n_skip": summary["n_skip"],
-                "n_error": summary["n_error"],
-                "summary": str(Path(args.work_root) / "batch_summary.json"),
-            },
-            ensure_ascii=False,
-        )
-    )
-    return 1 if summary["n_error"] else 0
+    return _emit_batch_stdout(summary, work_root)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -385,27 +480,27 @@ def main(argv: list[str] | None = None) -> int:
 
     batch_p = sub.add_parser(
         "run-batch",
-        help="Run Stage-2 over benchmark/*/Audio wavs paired with Mode-C JSONs",
+        help="Run Stage-2 over audio files recursively paired with Mode-C JSONs",
     )
     batch_p.add_argument(
         "--wav-benchmark",
         required=True,
-        help="Root .../benchmark containing {dataset}/Audio/*.wav",
+        help="Wav file or directory; directories are scanned recursively for *.wav",
     )
     batch_p.add_argument(
         "--mode-c-benchmark",
         required=True,
-        help="Root .../benchmark containing {dataset}/Audio/{stem}/mode_c.json",
+        help="mode_c.json file or directory; directories are scanned recursively for mode_c.json",
     )
     batch_p.add_argument(
         "--work-root",
         required=True,
-        help="Output root; writes work-root/{dataset}/{stem}/ plus batch_summary.json",
+        help="Output root; writes work-root/<relative-audio-path>/ plus batch_summary.json",
     )
     batch_p.add_argument(
         "--datasets",
         default=None,
-        help="Optional comma-separated dataset names under benchmark (default: all)",
+        help="Optional comma-separated top-level directory names under the audio root (default: all)",
     )
     batch_p.add_argument("--limit", type=int, default=None, help="Optional max number of paired samples")
     batch_p.add_argument(
@@ -418,13 +513,42 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Stop on first sample error (default: continue and record errors)",
     )
+    batch_p.add_argument(
+        "--skip-existing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Skip samples whose stage artifacts already exist (default: on; --no-skip-existing to rerun)",
+    )
+    batch_p.add_argument(
+        "--sample-workers",
+        type=int,
+        default=1,
+        help="Process this many samples in parallel (I/O overlap; vllm_engine generate is serialized)",
+    )
+    batch_p.add_argument(
+        "--devices",
+        default=None,
+        help="Comma-separated NPU ids (e.g. 0,1,2,3,4,5,6,7). Split into concurrent jobs of --npu-per-job cards",
+    )
+    batch_p.add_argument(
+        "--npu-per-job",
+        type=int,
+        default=2,
+        help="NPUs per concurrent shard (default 2). 8 cards → 4 jobs that all run until every wav finishes",
+    )
+    batch_p.add_argument(
+        "--shard",
+        default=None,
+        help="Process slice i/n of paired samples (set automatically by --devices)",
+    )
     _add_common_run_args(batch_p)
 
+    argv = list(sys.argv[1:] if argv is None else argv)
     args = parser.parse_args(argv)
     if args.cmd == "run":
         return _cmd_run(args)
     if args.cmd == "run-batch":
-        return _cmd_run_batch(args)
+        return _cmd_run_batch(args, argv)
     parser.error(f"unknown command {args.cmd}")
 
 

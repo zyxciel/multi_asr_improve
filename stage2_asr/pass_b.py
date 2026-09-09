@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from stage2_asr.hotwords import prompt_hotwords
 from stage2_asr.llm_retry import sleep_before_retry
 from stage2_asr.neighbors import cap_neighbors, meeting_draft
 from stage2_asr.pinyin_util import pinyin_edit_distance
@@ -229,6 +230,7 @@ def _run_pass_b_batched(
     """Snapshot meeting_draft once; judge_many in chunks (no in-pass cascade)."""
     meeting = meeting_draft(turns, out)
     batch_size = max(1, int(getattr(cfg, "pass_b_batch_size", 1) or 1))
+    hw_llm = prompt_hotwords(hotwords, cfg)
     prepared: list[dict] = []
     for i, turn in enumerate(turns):
         text = out.get(i, turn.text)
@@ -254,7 +256,7 @@ def _run_pass_b_batched(
             {
                 "hypotheses": p["hyps"],
                 "neighbor_draft": p["neighbors"],
-                "hotwords": hotwords,
+                "hotwords": hw_llm,
                 "overlap": p["overlap"],
                 "heavy_overlap": p["heavy"],
                 "unit_id": p["unit_id"],
@@ -426,6 +428,7 @@ def run_pass_b(
         )
 
     meeting = meeting_draft(turns, out)
+    hw_llm = prompt_hotwords(hotwords, cfg)
     for i, turn in enumerate(turns):
         text = out.get(i, turn.text)
         if not text:
@@ -449,7 +452,7 @@ def run_pass_b(
                 llm_judge,
                 hyps=hyps,
                 neighbors=capped,
-                hotwords=hotwords,
+                hotwords=hw_llm,
                 overlap=overlap,
                 heavy_overlap=heavy,
                 unit_id=unit_id,
@@ -466,7 +469,7 @@ def run_pass_b(
                 fallback_judge,
                 hyps=hyps,
                 neighbors=capped,
-                hotwords=hotwords,
+                hotwords=hw_llm,
                 overlap=overlap,
                 heavy_overlap=heavy,
                 unit_id=unit_id,

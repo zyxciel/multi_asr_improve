@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from stage2_asr.agreement import all_hyps_agree, normalize_for_cer, pick_best_hyp
+from stage2_asr.hotwords import prompt_hotwords
 from stage2_asr.llm_retry import sleep_before_retry
 from stage2_asr.text_map import assign_unit_text
 from stage2_asr.types import AsrUnit, Edit, Hypothesis, PipelineConfig, Turn
@@ -18,7 +19,7 @@ def _neighbor_draft(
     draft_texts: dict[int, str],
     config: PipelineConfig,
 ) -> list[dict]:
-    """Nearest turns within ±window, capped by neighbor_max_turns and ~4096-token char budget."""
+    """Nearest turns within ±window, capped by neighbor_max_turns and neighbor_char_budget."""
     center = 0.5 * (unit.start + unit.end)
     cands: list[tuple[float, int, Turn]] = []
     for i, t in enumerate(turns):
@@ -30,8 +31,7 @@ def _neighbor_draft(
         cands.append((dist, i, t))
     cands.sort(key=lambda x: x[0])
     out: list[dict] = []
-    # Design cap is 4096 tokens; approximate with ~2 chars/token.
-    char_budget = 4096 * 2
+    char_budget = int(getattr(config, "neighbor_char_budget", 8192) or 8192)
     used = 0
     for _, i, t in cands[: config.neighbor_max_turns]:
         text = draft_texts.get(i, t.text)
@@ -133,6 +133,7 @@ def run_pass_a_for_unit(
 ) -> tuple[str, dict]:
     """Return (final_text, audit_record)."""
     prefer_moss = unit.heavy_overlap
+    hotwords = prompt_hotwords(hotwords, config)
     audit: dict = {
         "unit_id": unit.unit_id,
         "heavy_overlap": unit.heavy_overlap,
@@ -250,6 +251,7 @@ def run_pass_a_batch(
     first-attempt and retry LLM calls are issued via judge_many (batched).
     """
     batch_size = max(1, int(getattr(config, "pass_a_batch_size", 1) or 1))
+    hotwords = prompt_hotwords(hotwords, config)
     written: set[int] = set()
     # Fast path: sequential (preserves per-unit draft updates between units).
     if batch_size <= 1 or len(items) <= 1 or not hasattr(llm_judge, "judge_many"):

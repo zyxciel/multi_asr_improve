@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from stage2_asr.hotwords import prompt_hotwords
 from stage2_asr.llm_retry import sleep_before_retry
 from stage2_asr.publish_itn import itn_edit_allowed
 from stage2_asr.types import PipelineConfig, Turn
@@ -516,7 +517,7 @@ def run_publish(
         try:
             raw = llm_judge.publish(
                 meeting=original_meeting,
-                hotwords=hotwords,
+                hotwords=prompt_hotwords(hotwords, cfg),
                 glossary=seed,
                 unit_id="publish_meeting",
             )

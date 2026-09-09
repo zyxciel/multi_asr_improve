@@ -13,6 +13,7 @@ Backends:
 
 import concurrent.futures
 import json
+import threading
 import time
 from typing import Any, Callable
 
@@ -31,6 +32,7 @@ from stage2_asr.publish_prompt import (
     render_eval_user_prompt,
     render_publish_user_prompt,
 )
+from stage2_asr.llm_log import current_llm_log
 from stage2_asr.llm_parse import parse_judgment_json
 from stage2_asr.runners.base import UnsupportedRunnerError
 from stage2_asr.runners.openai_compat import chat_completion, chat_completion_many
@@ -106,6 +108,7 @@ class Qwen36LlmJudge:
         self.enforce_eager = enforce_eager
         self.use_v1 = use_v1
         self.enable_thinking = bool(enable_thinking)
+        self._gen_lock = threading.Lock()
         if self.backend not in _BACKENDS:
             raise ValueError(
                 f"unsupported llm backend {backend!r}; expected {sorted(_BACKENDS)}"
@@ -394,12 +397,13 @@ class Qwen36LlmJudge:
             else:
                 rendered.append(f"System: {system}\n\nUser: {user}\n\nAssistant:")
         try:
-            texts = vllm_generate_texts(
-                engine,
-                rendered,
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
-            )
+            with self._gen_lock:
+                texts = vllm_generate_texts(
+                    engine,
+                    rendered,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                )
         except Exception as exc:  # noqa: BLE001
             return [exc] * len(prompts_meta)
 
@@ -509,8 +513,9 @@ class Qwen36LlmJudge:
         return out
 
     def _emit_log(self, event: dict[str, Any]) -> None:
-        if self.log_fn is not None:
-            self.log_fn(event)
+        fn = current_llm_log() or self.log_fn
+        if fn is not None:
+            fn(event)
 
     def _ensure_engine(self):
         if self._engine is None:
@@ -563,12 +568,13 @@ class Qwen36LlmJudge:
                     )
                 else:
                     prompt = f"System: {system}\n\nUser: {user}\n\nAssistant:"
-                text = vllm_generate_texts(
-                    engine,
-                    [prompt],
-                    temperature=self.temperature,
-                    max_tokens=tokens,
-                )[0]
+                with self._gen_lock:
+                    text = vllm_generate_texts(
+                        engine,
+                        [prompt],
+                        temperature=self.temperature,
+                        max_tokens=tokens,
+                    )[0]
             elif self.backend == "vllm":
                 if not self.base_url:
                     raise UnsupportedRunnerError(
