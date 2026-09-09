@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from stage2_asr.cli import resolve_llm_api_key
+import argparse
+
+from stage2_asr.cli import _add_common_run_args, _pipeline_config, resolve_llm_api_key
 
 
 def test_cli_batch_scale_flags_parse():
