@@ -8,5 +8,7 @@ dist/
 build/
 asr_cache/
 third_party/
+scripts/env.debug.sh
+scripts/env.prod.sh
 *.wav
 .DS_Store

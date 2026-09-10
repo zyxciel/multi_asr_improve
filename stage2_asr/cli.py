@@ -9,6 +9,14 @@ from pathlib import Path
 from stage2_asr.batch import build_runners, launch_npu_shards, run_batch
 from stage2_asr.glossary_union import union_corpus_glossary, write_corpus_glossary
 from stage2_asr.hotwords import load_hotwords
+from stage2_asr.model_paths import (
+    DEFAULT_FIRERED_ASR_MODEL_DIR,
+    DEFAULT_FIRERED_LID_MODEL_DIR,
+    DEFAULT_FIRERED_PUNC_MODEL_DIR,
+    DEFAULT_QWEN_MODEL_ID,
+    resolve_firered_model_dirs,
+    resolve_qwen_model_id,
+)
 from stage2_asr.pipeline import run_pipeline
 from stage2_asr.publish import load_glossary
 from stage2_asr.types import PipelineConfig
@@ -40,7 +48,38 @@ def _add_common_run_args(p: argparse.ArgumentParser) -> None:
         help="Comma-separated ASR models for ASR stage/cache: moss,qwen,firered",
     )
     p.add_argument("--max-asr-seconds", type=float, default=30.0)
-    p.add_argument("--qwen-model-id", default="Qwen/Qwen3-ASR-1.7B")
+    p.add_argument(
+        "--qwen-model-id",
+        default=None,
+        help=(
+            "Qwen3-ASR weights (local dir or HuggingFace id). "
+            f"Else STAGE2_QWEN_MODEL_ID, then QWEN_MODEL_ID, then {DEFAULT_QWEN_MODEL_ID}"
+        ),
+    )
+    p.add_argument(
+        "--firered-asr-model-dir",
+        default=None,
+        help=(
+            "FireRed ASR weight dir. Else STAGE2_FIRERED_ASR_MODEL_DIR / FIRERED_ASR_MODEL_DIR, "
+            f"then {DEFAULT_FIRERED_ASR_MODEL_DIR}"
+        ),
+    )
+    p.add_argument(
+        "--firered-lid-model-dir",
+        default=None,
+        help=(
+            "FireRed LID weight dir. Else STAGE2_FIRERED_LID_MODEL_DIR / FIRERED_LID_MODEL_DIR, "
+            f"then {DEFAULT_FIRERED_LID_MODEL_DIR}"
+        ),
+    )
+    p.add_argument(
+        "--firered-punc-model-dir",
+        default=None,
+        help=(
+            "FireRed Punc weight dir. Else STAGE2_FIRERED_PUNC_MODEL_DIR / FIRERED_PUNC_MODEL_DIR, "
+            f"then {DEFAULT_FIRERED_PUNC_MODEL_DIR}"
+        ),
+    )
     p.add_argument(
         "--llm-model-id",
         default="Qwen/Qwen3.6-27B",
@@ -246,6 +285,20 @@ def resolve_llm_api_key(cli_value: str | None) -> str | None:
     return os.environ.get("STAGE2_LLM_API_KEY") or os.environ.get("OPENAI_API_KEY") or None
 
 
+def _resolved_asr_kwargs(args: argparse.Namespace) -> dict:
+    asr_dir, lid_dir, punc_dir = resolve_firered_model_dirs(
+        asr_model_dir=getattr(args, "firered_asr_model_dir", None),
+        lid_model_dir=getattr(args, "firered_lid_model_dir", None),
+        punc_model_dir=getattr(args, "firered_punc_model_dir", None),
+    )
+    return {
+        "qwen_model_id": resolve_qwen_model_id(getattr(args, "qwen_model_id", None)),
+        "firered_asr_model_dir": asr_dir,
+        "firered_lid_model_dir": lid_dir,
+        "firered_punc_model_dir": punc_dir,
+    }
+
+
 def _pipeline_config(args: argparse.Namespace) -> PipelineConfig:
     glossary = None
     raw_glossary = getattr(args, "glossary", None)
@@ -293,12 +346,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
         work_dir=work_dir,
         enable_real=bool(args.enable_real),
         mock_hyps=mock_hyps,
-        qwen_model_id=args.qwen_model_id,
         llm_model_id=args.llm_model_id,
         llm_backend=args.llm_backend,
         llm_base_url=args.llm_base_url,
         llm_api_key=resolve_llm_api_key(args.llm_api_key),
         llm_timeout_s=float(args.llm_timeout_s),
+        **_resolved_asr_kwargs(args),
         **_vllm_flags(args),
     )
 
@@ -454,7 +507,6 @@ def _cmd_run_batch(args: argparse.Namespace, argv: list[str] | None = None) -> i
         enable_real=bool(args.enable_real),
         mock_hyps=mock_hyps,
         config=cfg,
-        qwen_model_id=args.qwen_model_id,
         llm_model_id=args.llm_model_id,
         continue_on_error=not bool(args.fail_fast),
         llm_backend=args.llm_backend,
@@ -464,6 +516,7 @@ def _cmd_run_batch(args: argparse.Namespace, argv: list[str] | None = None) -> i
         skip_existing=bool(getattr(args, "skip_existing", True)),
         sample_workers=max(1, int(getattr(args, "sample_workers", 1))),
         shard=shard,
+        **_resolved_asr_kwargs(args),
         **_vllm_flags(args),
     )
     return _emit_batch_stdout(summary, work_root)

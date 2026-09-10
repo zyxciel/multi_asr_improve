@@ -423,6 +423,9 @@ def build_runners(
     vllm_enforce_eager: bool = True,
     vllm_use_v1: bool | None = False,
     llm_enable_thinking: bool = False,
+    firered_asr_model_dir: str | None = None,
+    firered_lid_model_dir: str | None = None,
+    firered_punc_model_dir: str | None = None,
 ):
     """Construct ASR/LLM runners once for a batch (reuse across samples)."""
     from stage2_asr.runners.ensemble import EnsembleAsrRunner
@@ -449,11 +452,27 @@ def build_runners(
         raise ValueError("Real backend requires enable_real=True")
 
     if needs_asr:
+        from stage2_asr.model_paths import resolve_firered_model_dirs
+
+        asr_dir, lid_dir, punc_dir = resolve_firered_model_dirs(
+            asr_model_dir=firered_asr_model_dir,
+            lid_model_dir=firered_lid_model_dir,
+            punc_model_dir=firered_punc_model_dir,
+        )
+        _log(f"[batch] qwen_model_id={qwen_model_id}")
+        _log(f"[batch] firered asr={asr_dir} lid={lid_dir} punc={punc_dir}")
         asr = EnsembleAsrRunner(
             Qwen3AsrRunner(enabled=True, model_id=qwen_model_id, work_dir=work_dir),
             FireRedAsr2sRunner(
                 enabled=True,
-                config=FireRedAsr2sConfig(vad=False, lid=True, punc=True),
+                config=FireRedAsr2sConfig(
+                    vad=False,
+                    lid=True,
+                    punc=True,
+                    asr_model_dir=asr_dir,
+                    lid_model_dir=lid_dir,
+                    punc_model_dir=punc_dir,
+                ),
             ),
         )
     if needs_llm:
@@ -508,6 +527,9 @@ def run_batch(
     skip_existing: bool = True,
     sample_workers: int = 1,
     shard: str | None = None,
+    firered_asr_model_dir: str | None = None,
+    firered_lid_model_dir: str | None = None,
+    firered_punc_model_dir: str | None = None,
 ) -> dict[str, Any]:
     """Discover pairs and run Stage-2 per sample under work_root/{audio-relative-path}/."""
     cfg = config or PipelineConfig()
@@ -589,6 +611,9 @@ def run_batch(
         vllm_enforce_eager=vllm_enforce_eager,
         vllm_use_v1=vllm_use_v1,
         llm_enable_thinking=llm_enable_thinking,
+        firered_asr_model_dir=firered_asr_model_dir,
+        firered_lid_model_dir=firered_lid_model_dir,
+        firered_punc_model_dir=firered_punc_model_dir,
     )
 
     n_pairs = len(pairs)

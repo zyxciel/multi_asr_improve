@@ -17,6 +17,12 @@ Uses FireRedAsr2System with:
 
 from dataclasses import dataclass
 
+from stage2_asr.model_paths import (
+    DEFAULT_FIRERED_ASR_MODEL_DIR,
+    DEFAULT_FIRERED_LID_MODEL_DIR,
+    DEFAULT_FIRERED_PUNC_MODEL_DIR,
+)
+
 from stage2_asr.runners.base import UnsupportedRunnerError
 from stage2_asr.types import AsrUnit, Hypothesis, Turn
 
@@ -28,9 +34,9 @@ class FireRedAsr2sConfig:
     punc: bool = True
     asr: bool = True
     asr_type: str = "aed"
-    asr_model_dir: str = "pretrained_models/FireRedASR2-AED"
-    lid_model_dir: str = "pretrained_models/FireRedLID"
-    punc_model_dir: str = "pretrained_models/FireRedPunc"
+    asr_model_dir: str = DEFAULT_FIRERED_ASR_MODEL_DIR
+    lid_model_dir: str = DEFAULT_FIRERED_LID_MODEL_DIR
+    punc_model_dir: str = DEFAULT_FIRERED_PUNC_MODEL_DIR
 
 
 class FireRedAsr2sRunner:

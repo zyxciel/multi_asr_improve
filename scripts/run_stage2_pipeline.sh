@@ -5,6 +5,7 @@
 # qwen_asr / fireredasr2s / vLLM-Ascend must already be importable in PYTHON.
 #
 # Usage:
+#   export STAGE2_ENV=debug    # or prod; sources scripts/env.${STAGE2_ENV}.sh
 #   export WAV_BENCHMARK=/path/to/audio_root
 #   export MODE_C_BENCHMARK=/path/to/mode_c_root
 #   export WORK_ROOT=/path/to/stage2_out
@@ -27,6 +28,19 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+log() { printf '[stage2] %s\n' "$*" >&2; }
+die() { printf '[stage2] ERROR: %s\n' "$*" >&2; exit 1; }
+
+# Debug vs production ASR weight locations (copy scripts/env.<name>.sh.example).
+STAGE2_ENV="${STAGE2_ENV:-}"
+if [[ -n "$STAGE2_ENV" ]]; then
+  env_file="$ROOT/scripts/env.${STAGE2_ENV}.sh"
+  [[ -f "$env_file" ]] || die "STAGE2_ENV=$STAGE2_ENV but missing $env_file — copy scripts/env.${STAGE2_ENV}.sh.example and fill local Qwen/FireRed paths"
+  # shellcheck disable=SC1090
+  source "$env_file"
+  log "loaded $env_file (STAGE2_ENV=$STAGE2_ENV)"
+fi
+
 # ---------------------------------------------------------------------------
 # Paths / models (override with environment variables)
 # ---------------------------------------------------------------------------
@@ -38,6 +52,9 @@ LIMIT="${LIMIT:-}"                                # e.g. 8 for a smoke subset
 HOTWORDS="${HOTWORDS:-$ROOT/docs/hotwords.txt}"
 
 QWEN_MODEL_ID="${QWEN_MODEL_ID:-Qwen/Qwen3-ASR-1.7B}"
+FIRERED_ASR_MODEL_DIR="${FIRERED_ASR_MODEL_DIR:-}"
+FIRERED_LID_MODEL_DIR="${FIRERED_LID_MODEL_DIR:-}"
+FIRERED_PUNC_MODEL_DIR="${FIRERED_PUNC_MODEL_DIR:-}"
 LLM_MODEL_ID="${LLM_MODEL_ID:-Qwen/Qwen3.6-27B}"
 
 # LLM NPU split: 8 cards → 4 jobs × 2 NPUs. Empty DEVICES = single process.
@@ -66,9 +83,6 @@ CMD="${1:-help}"
 shift || true
 
 # ---------------------------------------------------------------------------
-log() { printf '[stage2] %s\n' "$*" >&2; }
-die() { printf '[stage2] ERROR: %s\n' "$*" >&2; exit 1; }
-
 activate_python() {
   if [[ -n "${CONDA_PREFIX:-}" && -x "${CONDA_PREFIX}/bin/python" ]]; then
     PYTHON="${CONDA_PREFIX}/bin/python"
@@ -106,6 +120,15 @@ common_batch_args() {
     --llm-model-id "$LLM_MODEL_ID"
     --sample-workers "$SAMPLE_WORKERS"
   )
+  if [[ -n "${FIRERED_ASR_MODEL_DIR:-}" ]]; then
+    args+=(--firered-asr-model-dir "$FIRERED_ASR_MODEL_DIR")
+  fi
+  if [[ -n "${FIRERED_LID_MODEL_DIR:-}" ]]; then
+    args+=(--firered-lid-model-dir "$FIRERED_LID_MODEL_DIR")
+  fi
+  if [[ -n "${FIRERED_PUNC_MODEL_DIR:-}" ]]; then
+    args+=(--firered-punc-model-dir "$FIRERED_PUNC_MODEL_DIR")
+  fi
   if [[ -n "$DATASETS" ]]; then
     args+=(--datasets "$DATASETS")
   fi
@@ -172,7 +195,9 @@ Required env for real runs:
   DEVICES           e.g. 0,1,2,3,4,5,6,7   (empty = single process)
 
 Optional:
+  STAGE2_ENV=debug|prod   sources scripts/env.<name>.sh (Qwen/FireRed local paths)
   DATASETS  LIMIT  ASR_DEVICES  NPU_PER_JOB  QWEN_MODEL_ID
+  FIRERED_ASR_MODEL_DIR  FIRERED_LID_MODEL_DIR  FIRERED_PUNC_MODEL_DIR
   PASS_A_BATCH_SIZE  PASS_B_BATCH_SIZE  POLISH_BATCH_SIZE
 EOF
 }

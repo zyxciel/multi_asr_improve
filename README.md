@@ -18,7 +18,7 @@ pip install -e ".[dev]"
 pytest -q
 ```
 
-Cluster one-shot (install → mock/pytest → dry-run → ASR → LLM, including 8-NPU split): see [`scripts/run_stage2_pipeline.sh`](scripts/run_stage2_pipeline.sh). Override `WAV_BENCHMARK`, `MODE_C_BENCHMARK`, `WORK_ROOT`, `LLM_MODEL_ID`, `DEVICES`. Real `qwen_asr` / `fireredasr2s` / vLLM-Ascend must already be in that Python env.
+Cluster one-shot (install → mock/pytest → dry-run → ASR → LLM, including 8-NPU split): see [`scripts/run_stage2_pipeline.sh`](scripts/run_stage2_pipeline.sh). Override `WAV_BENCHMARK`, `MODE_C_BENCHMARK`, `WORK_ROOT`, `LLM_MODEL_ID`, `DEVICES`. Debug vs production ASR weights: `STAGE2_ENV=debug|prod` loads `scripts/env.<name>.sh` (copy from `scripts/env.<name>.sh.example`). Direct CLI: `--qwen-model-id`, `--firered-asr-model-dir`, `--firered-lid-model-dir`, `--firered-punc-model-dir` (or `STAGE2_QWEN_MODEL_ID` / `STAGE2_FIRERED_*_MODEL_DIR`). Real `qwen_asr` / `fireredasr2s` / vLLM-Ascend must already be in that Python env.
 
 ## Mock end-to-end (no weights)
 
@@ -75,9 +75,7 @@ ASR model subsets: `moss`, `qwen`, `firered` (comma-separated via `--asr-models`
 
 HTTP vLLM auth: `--llm-api-key`, or env `STAGE2_LLM_API_KEY`, then `OPENAI_API_KEY` (never logged).
 
-FireRed system config used by the adapter:
-
-`enable_vad=False`, `enable_lid=True`, `enable_punc=True`
+FireRed system config used by the adapter: `enable_vad=False`, `enable_lid=True`, `enable_punc=True`. Weight dirs default to `pretrained_models/FireRedASR2-AED` (and LID/Punc); pass absolute paths on each machine so debug and production do not share a CWD-relative layout.
 
 ## Dataset batch mode
 

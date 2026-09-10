@@ -180,3 +180,24 @@ def test_call_with_timeout_raises_without_waiting_for_fn():
         pass
     elapsed = time.monotonic() - started
     assert elapsed < 1.0
+
+
+def test_build_runners_passes_debug_weight_paths(tmp_path: Path):
+    from stage2_asr.batch import build_runners
+
+    asr, _, _ = build_runners(
+        backend="real",
+        stage="asr",
+        work_dir=tmp_path,
+        enable_real=True,
+        mock_hyps=None,
+        qwen_model_id="/debug/Qwen3-ASR",
+        llm_model_id="unused",
+        firered_asr_model_dir="/debug/FireRedASR2-AED",
+        firered_lid_model_dir="/debug/FireRedLID",
+        firered_punc_model_dir="/debug/FireRedPunc",
+    )
+    assert asr.qwen_runner.model_id == "/debug/Qwen3-ASR"
+    assert asr.firered_runner.config.asr_model_dir == "/debug/FireRedASR2-AED"
+    assert asr.firered_runner.config.lid_model_dir == "/debug/FireRedLID"
+    assert asr.firered_runner.config.punc_model_dir == "/debug/FireRedPunc"
