@@ -159,6 +159,15 @@ Prompt size: `--neighbor-max-turns`, `--neighbor-window-seconds`, `--neighbor-ch
 
 Summary + skips/errors: `work-root/batch_summary.json`.
 
+After `--stage publish`, merge every sample `glossary.json` into three corpus lists (terms / keywords / rare_words). Same `surface` is aggregated (`n_docs`, `n_mentions` recounted from published text), not last-write-wins. Latin keys are case-folded (`GPU`/`gpu`); CJK homophones stay distinct. `rare_words` get occurrence rows (turn times, context, overlapping `crops/{unit_id}.wav`, multi-ASR hyps) for later correction.
+
+```bash
+stage2-asr union-glossary --work-root /path/to/stage2_out
+# optional: --out /path/to/corpus_glossary.json --context-chars 80
+```
+
+Writes `corpus_glossary.json` (analysis) and `corpus_glossary.seed.json` (stripped; safe to pass as `--glossary`). Do not name the output `glossary.json` inside a sample dir.
+
 ## LLM backend (vLLM / Ascend 910B)
 
 Three options:
@@ -229,7 +238,7 @@ third_party/         # optional local clones (gitignored)
 
 ## Artifacts
 
-`asr_units.json` (reloaded on `pass_a`/`pass_b`/`llm` so unit_ids stay stable), `asr_hypotheses.json` (hyps merge across `asr` and `all` re-runs), `mode_c_draft.json` (Pass A **pre-merge**, original Mode-C turn grid), `mode_c_draft_merged.json` (Pass A **post-merge**, one row per ASR unit), `mode_c_asr_final.json` (Pass B pre-merge; phonetic WER/CPWER deliverable), `mode_c_asr_final_merged.json` (Pass B post-merge), `mode_c_polished.json` (polish on the **merged** unit grid), `mode_c_published.json` / `transcript.md` / `glossary.json` (publish display pass; never overwrites the WER or polish files), `llm_edits.jsonl` (Pass A preserved when re-running `pass_b`; polish lines replaced when re-running `polish`; polish rows include `anchor` + `evidence`), `pass_stats.json` (merged across staged passes), `llm_infer.jsonl` (LLM request/response traces for Pass A/B, polish, and publish), `asr_cache/`, `crops/` (reused across ASR model runs; not rewritten if present)
+`asr_units.json` (reloaded on `pass_a`/`pass_b`/`llm` so unit_ids stay stable), `asr_hypotheses.json` (hyps merge across `asr` and `all` re-runs), `mode_c_draft.json` (Pass A **pre-merge**, original Mode-C turn grid), `mode_c_draft_merged.json` (Pass A **post-merge**, one row per ASR unit), `mode_c_asr_final.json` (Pass B pre-merge; phonetic WER/CPWER deliverable), `mode_c_asr_final_merged.json` (Pass B post-merge), `mode_c_polished.json` (polish on the **merged** unit grid), `mode_c_published.json` / `transcript.md` / `glossary.json` (publish display pass; never overwrites the WER or polish files), `corpus_glossary.json` / `corpus_glossary.seed.json` (`union-glossary` over a work-root), `llm_edits.jsonl` (Pass A preserved when re-running `pass_b`; polish lines replaced when re-running `polish`; polish rows include `anchor` + `evidence`), `pass_stats.json` (merged across staged passes), `llm_infer.jsonl` (LLM request/response traces for Pass A/B, polish, and publish), `asr_cache/`, `crops/` (reused across ASR model runs; not rewritten if present)
 
 ### Polish policy (post round-1 WER regression)
 

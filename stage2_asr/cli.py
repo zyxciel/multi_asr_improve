@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from stage2_asr.batch import build_runners, launch_npu_shards, run_batch
+from stage2_asr.glossary_union import union_corpus_glossary, write_corpus_glossary
 from stage2_asr.hotwords import load_hotwords
 from stage2_asr.pipeline import run_pipeline
 from stage2_asr.publish import load_glossary
@@ -468,6 +469,33 @@ def _cmd_run_batch(args: argparse.Namespace, argv: list[str] | None = None) -> i
     return _emit_batch_stdout(summary, work_root)
 
 
+def _cmd_union_glossary(args: argparse.Namespace) -> int:
+    work_root = Path(args.work_root)
+    if not work_root.is_dir():
+        print(f"work-root is not a directory: {work_root}", file=sys.stderr)
+        return 2
+    out = Path(args.out) if args.out else work_root / "corpus_glossary.json"
+    corpus = union_corpus_glossary(
+        work_root, context_chars=max(0, int(getattr(args, "context_chars", 80)))
+    )
+    paths = write_corpus_glossary(corpus, out)
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "n_samples": (corpus.get("meta") or {}).get("n_samples"),
+                "n_terms": len(corpus.get("terms") or []),
+                "n_keywords": len(corpus.get("keywords") or []),
+                "n_rare_words": len(corpus.get("rare_words") or []),
+                "corpus": str(paths["corpus"]),
+                "seed": str(paths["seed"]),
+            },
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="stage2-asr", description="Stage-2 multi-ASR + LLM fusion")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -543,12 +571,35 @@ def main(argv: list[str] | None = None) -> int:
     )
     _add_common_run_args(batch_p)
 
+    union_p = sub.add_parser(
+        "union-glossary",
+        help="Merge per-sample glossary.json under a work-root into corpus terms/keywords/rare_words",
+    )
+    union_p.add_argument(
+        "--work-root",
+        required=True,
+        help="Batch work root that contains sample dirs with glossary.json",
+    )
+    union_p.add_argument(
+        "--out",
+        default=None,
+        help="Corpus JSON path (default: work-root/corpus_glossary.json). Also writes <stem>.seed.json",
+    )
+    union_p.add_argument(
+        "--context-chars",
+        type=int,
+        default=80,
+        help="Left/right characters of published text stored on each rare_word occurrence",
+    )
+
     argv = list(sys.argv[1:] if argv is None else argv)
     args = parser.parse_args(argv)
     if args.cmd == "run":
         return _cmd_run(args)
     if args.cmd == "run-batch":
         return _cmd_run_batch(args, argv)
+    if args.cmd == "union-glossary":
+        return _cmd_union_glossary(args)
     parser.error(f"unknown command {args.cmd}")
 
 
